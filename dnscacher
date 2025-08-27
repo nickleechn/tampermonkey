@@ -1,94 +1,177 @@
 // ==UserScript==
-// @name        DNS Record Cacher
-// @namespace   http://tampermonkey.net/
-// @version     0.3
-// @description Caches DNS records using system DNS servers, prioritizing AAAA with fallback to A, with optimistic use and background refresh, TTL 3 days.
-// @author      Grok
-// @match       *://*/*
-// @grant       GM_setValue
-// @grant       GM_getValue
+// @name         DNS Record Cacher
+// @namespace    http://tampermonkey.net/
+// @version      0.4
+// @description  Caches DNS records using a public DNS API, prioritising AAAA records with fallback to A records. Uses optimistic cache retrieval with background refresh and a 3-day TTL.
+// @author       Grok
+// @match        *://*/*
+// @grant        GM_setValue
+// @grant        GM_getValue
 // ==/UserScript==
 
 (function() {
     'use strict';
 
-    const TTL = 3 * 24 * 60 * 60 * 1000; // 3 days in ms
-    const DOMAIN_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+$/;
+    // Configuration constants
+    const TTL = 3 * 24 * 60 * 60 * 1000; // Cache TTL set to 3 days in milliseconds
+    const DOMAIN_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+$/; // Regex for valid domain names
+    const DNS_API = 'https://dns.google/resolve'; // Public DNS-over-HTTPS API endpoint
+    const DEBOUNCE_MS = 1000; // Debounce delay for background refresh in milliseconds
 
+    // Cache for debounced fetch operations to prevent duplicate requests
+    const fetchPromises = new Map();
+
+    /**
+     * Generates a cache key for a given domain and record type.
+     * @param {string} domain - The domain name to query.
+     * @param {string} type - The DNS record type (e.g., 'AAAA' or 'A').
+     * @returns {string} The cache key.
+     */
     function getCacheKey(domain, type) {
         return `dns_cache_${domain.toLowerCase()}_${type.toUpperCase()}`;
     }
 
+    /**
+     * Retrieves cached DNS results if they are still valid.
+     * @param {string} domain - The domain name.
+     * @param {string} type - The DNS record type.
+     * @returns {Array|null} Cached results or null if expired or unavailable.
+     */
     function getCached(domain, type) {
-        const key = getCacheKey(domain, type);
-        const cached = GM_getValue(key, null);
-        if (cached && (Date.now() - cached.timestamp) < TTL) {
-            return cached.result;
-        }
-        return null;
-    }
-
-    function setCached(domain, type, result) {
-        const key = getCacheKey(domain, type);
-        GM_setValue(key, { result: result, timestamp: Date.now() });
-    }
-
-    async function fetchDNS(domain, type) {
-        if (typeof window.dnsResolve !== 'function') {
-            console.warn('System DNS resolver not available. Check your browser support.');
-            return [];
-        }
         try {
-            const result = await window.dnsResolve(domain, type);
-            return result || [];
+            const key = getCacheKey(domain, type);
+            const cached = GM_getValue(key, null);
+            if (cached && Date.now() - cached.timestamp < TTL) {
+                return cached.result;
+            }
+            return null;
         } catch (e) {
-            console.error(`System DNS resolution for ${type} failed:`, e);
+            console.error(`Failed to retrieve cache for ${domain} (${type}): ${e.message}`);
+            return null;
+        }
+    }
+
+    /**
+     * Stores DNS results in the cache with a timestamp.
+     * @param {string} domain - The domain name.
+     * @param {string} type - The DNS record type.
+     * @param {Array} result - The DNS query results to cache.
+     */
+    function setCached(domain, type, result) {
+        try {
+            const key = getCacheKey(domain, type);
+            GM_setValue(key, { result, timestamp: Date.now() });
+        } catch (e) {
+            console.error(`Failed to store cache for ${domain} (${type}): ${e.message}`);
+        }
+    }
+
+    /**
+     * Fetches DNS records from the Google DNS API.
+     * @param {string} domain - The domain name to query.
+     * @param {string} type - The DNS record type (e.g., 'AAAA' or 'A').
+     * @returns {Promise<Array>} Resolves to an array of DNS records or an empty array on failure.
+     */
+    async function fetchDNS(domain, type) {
+        try {
+            const response = await fetch(`${DNS_API}?name=${encodeURIComponent(domain)}&type=${type}`);
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status} from DNS API`);
+            }
+            const data = await response.json();
+            if (data.Status !== 0) {
+                throw new Error(`DNS query failed with status ${data.Status}`);
+            }
+            return data.Answer ? data.Answer.map(record => record.data) : [];
+        } catch (e) {
+            console.error(`DNS resolution for ${domain} (${type}) failed: ${e.message}`);
             return [];
         }
     }
 
-    window.cacheDNS = async function(domain, type = 'AAAA') {
-        if (!domain || !DOMAIN_REGEX.test(domain)) {
-            throw new Error('Valid domain required, mate. No dodgy inputs.');
+    /**
+     * Debounces DNS fetches to limit concurrent requests.
+     * @param {string} domain - The domain name.
+     * @param {string} type - The DNS record type.
+     * @returns {Promise<Array>} Resolves to DNS records.
+     */
+    function debounceFetch(domain, type) {
+        const key = `${domain}_${type}`;
+        if (fetchPromises.has(key)) {
+            return fetchPromises.get(key);
         }
-
-        // Try AAAA first (or specified type)
-        let result = getCached(domain, type);
-        if (result && (type !== 'A' || result.length > 0)) {
-            // Optimistic return, background refresh
+        const promise = new Promise((resolve) => {
             setTimeout(async () => {
                 try {
-                    const fresh = await fetchDNS(domain, type);
-                    setCached(domain, type, fresh);
+                    const result = await fetchDNS(domain, type);
+                    fetchPromises.delete(key);
+                    resolve(result);
                 } catch (e) {
-                    console.error('Background DNS refresh failed:', e);
+                    fetchPromises.delete(key);
+                    resolve([]);
                 }
-            }, 0);
+            }, DEBOUNCE_MS);
+        });
+        fetchPromises.set(key, promise);
+        return promise;
+    }
+
+    /**
+     * Caches and retrieves DNS records with optimistic cache use and background refresh.
+     * Prioritises AAAA records with fallback to A records if AAAA is empty.
+     * @param {string} domain - The domain name to resolve.
+     * @param {string} [type='AAAA'] - The DNS record type to query (default: AAAA).
+     * @returns {Promise<Array>} Resolves to an array of DNS records.
+     * @throws {Error} If the domain is invalid.
+     */
+    window.cacheDNS = async function(domain, type = 'AAAA') {
+        // Validate the domain
+        if (!domain || !DOMAIN_REGEX.test(domain)) {
+            throw new Error('A valid domain is required. Please provide a proper domain name.');
+        }
+
+        // Check for Tampermonkey storage API availability in Safari
+        if (typeof GM_setValue !== 'function' || typeof GM_getValue !== 'function') {
+            console.warn('Tampermonkey storage APIs are unavailable. Falling back to direct DNS query.');
+            return await fetchDNS(domain, type);
+        }
+
+        // Try retrieving from cache
+        let result = getCached(domain, type);
+        if (result && (type !== 'A' || result.length > 0)) {
+            // Return cached result optimistically and refresh in the background
+            debounceFetch(domain, type).then(fresh => {
+                if (fresh.length > 0) {
+                    setCached(domain, type, fresh);
+                }
+            }).catch(e => console.error(`Background refresh for ${domain} (${type}) failed: ${e.message}`));
             return result;
         }
 
-        // Fetch fresh AAAA records
+        // Fetch fresh DNS records
         result = await fetchDNS(domain, type);
-        setCached(domain, type, result);
+        if (result.length > 0) {
+            setCached(domain, type, result);
+            return result;
+        }
 
-        // If AAAA is empty and type is AAAA, fallback to A
-        if (type === 'AAAA' && result.length === 0) {
+        // Fallback to A records if AAAA is empty
+        if (type === 'AAAA') {
             const cachedA = getCached(domain, 'A');
-            if (cachedA) {
-                // Optimistic return for A, background refresh
-                setTimeout(async () => {
-                    try {
-                        const freshA = await fetchDNS(domain, 'A');
+            if (cachedA && cachedA.length > 0) {
+                // Return cached A records and refresh in the background
+                debounceFetch(domain, 'A').then(freshA => {
+                    if (freshA.length > 0) {
                         setCached(domain, 'A', freshA);
-                    } catch (e) {
-                        console.error('Background DNS refresh for A failed:', e);
                     }
-                }, 0);
+                }).catch(e => console.error(`Background refresh for ${domain} (A) failed: ${e.message}`));
                 return cachedA;
             }
             // Fetch fresh A records
             const resultA = await fetchDNS(domain, 'A');
-            setCached(domain, 'A', resultA);
+            if (resultA.length > 0) {
+                setCached(domain, 'A', resultA);
+            }
             return resultA;
         }
 
