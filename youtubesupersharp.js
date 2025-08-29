@@ -1,118 +1,195 @@
 // ==UserScript==
-// @name YouTube SuperSharp
+// @name YouTube SuperSharp Enhanced
 // @namespace http://tampermonkey.net/
-// @version 1.1
-// @description Automatically sets YouTube videos to the highest quality available, prioritizing 1080p Premium for Premium users using the player API (no UI/overlay).
+// @version 1.2
+// @description Enhanced YouTube auto quality with better debugging
 // @match https://www.youtube.com/*
 // @run-at document-idle
 // @grant none
 // ==/UserScript==
+
 (function () {
   'use strict';
-
-  let lastPlayer = null;
+  
+  let lastVideoId = null;
   let isProcessing = false;
-
-  // --- Detect Safari ---
-  const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-
-  // --- Robust player getter ---
+  const DEBUG = true; // Set to false to reduce console spam
+  
+  function log(...args) {
+    if (DEBUG) console.log('[YT SuperSharp]', ...args);
+  }
+  
+  function getVideoId() {
+    return new URLSearchParams(window.location.search).get('v');
+  }
+  
   function getPlayer() {
     try {
-      const api = document.querySelector('ytd-player')?.getPlayer?.();
-      return api || document.querySelector('#movie_player') || null;
+      // Try multiple selectors for robustness
+      const selectors = [
+        'ytd-player',
+        '#movie_player',
+        '.html5-video-player',
+        '[data-youtube-player]'
+      ];
+      
+      for (const selector of selectors) {
+        const element = document.querySelector(selector);
+        if (element?.getPlayer) {
+          return element.getPlayer();
+        }
+        if (element?.getAvailableQualityLevels) {
+          return element;
+        }
+      }
+      
+      return null;
     } catch (e) {
-      console.error('[YT Auto HQ] Error in getPlayer:', e);
+      log('Error in getPlayer:', e);
       return null;
     }
   }
-
-  // --- Set highest quality ---
-  function setHighestQualityOnce(player) {
+  
+  function setHighestQuality(player) {
     try {
-      if (!player || typeof player.getAvailableQualityLevels !== 'function') {
-        console.debug('[YT Auto HQ] No player or getAvailableQualityLevels not available');
+      if (!player) {
+        log('No player found');
         return false;
       }
-
-      // Broader state check for Safari
-      const state = player.getPlayerState && player.getPlayerState();
-      if (state === undefined || ![1, 2, 3].includes(state)) {
-        console.debug('[YT Auto HQ] Player not ready, state:', state);
+      
+      // Log available methods for debugging
+      if (DEBUG) {
+        log('Player methods:', Object.getOwnPropertyNames(player).filter(m => m.includes('quality') || m.includes('Quality')));
+      }
+      
+      if (typeof player.getAvailableQualityLevels !== 'function') {
+        log('getAvailableQualityLevels not available');
         return false;
       }
-
+      
+      const state = player.getPlayerState?.();
+      log('Player state:', state);
+      
+      // Be more permissive with player states
+      if (state !== undefined && state < 0) {
+        log('Player not ready, state:', state);
+        return false;
+      }
+      
       const levels = player.getAvailableQualityLevels();
+      log('Available qualities:', levels);
+      
       if (!Array.isArray(levels) || levels.length === 0) {
-        console.debug('[YT Auto HQ] No quality levels available');
+        log('No quality levels available');
         return false;
       }
-
-      const premium1080p = levels.find((q) => q === 'hd1080premium');
-      const validLevels = levels.filter((q) => q !== 'auto');
-      const highest = premium1080p || validLevels[0] || levels[0];
-
-      // Try quality setting with fallback
-      try {
-        if (typeof player.setPlaybackQualityRange === 'function') {
-          player.setPlaybackQualityRange(highest, highest);
-        } else if (typeof player.setPlaybackQuality === 'function') {
-          player.setPlaybackQuality(highest);
-        } else {
-          console.debug('[YT Auto HQ] No quality setting method available');
-          return false;
+      
+      // Quality priority: Premium 1080p > highest non-auto > any
+      const qualityPriority = [
+        'hd1080premium', 'hd2160', 'hd1440', 'hd1080', 
+        'hd720', 'large', 'medium', 'small'
+      ];
+      
+      let selectedQuality = null;
+      for (const quality of qualityPriority) {
+        if (levels.includes(quality)) {
+          selectedQuality = quality;
+          break;
         }
-      } catch (e) {
-        console.error('[YT Auto HQ] Error setting quality:', e);
-        return false;
       }
-
-      console.debug('[YT Auto HQ] Set quality to', highest, 'from', levels);
-      return true;
+      
+      if (!selectedQuality) {
+        const nonAutoLevels = levels.filter(q => q !== 'auto');
+        selectedQuality = nonAutoLevels[0] || levels[0];
+      }
+      
+      log('Setting quality to:', selectedQuality);
+      
+      // Try multiple setting methods
+      const methods = ['setPlaybackQualityRange', 'setPlaybackQuality'];
+      let success = false;
+      
+      for (const method of methods) {
+        if (typeof player[method] === 'function') {
+          try {
+            if (method === 'setPlaybackQualityRange') {
+              player[method](selectedQuality, selectedQuality);
+            } else {
+              player[method](selectedQuality);
+            }
+            success = true;
+            log('Quality set using', method);
+            break;
+          } catch (e) {
+            log('Error with', method, ':', e);
+          }
+        }
+      }
+      
+      return success;
+      
     } catch (e) {
-      console.error('[YT Auto HQ] Error in setHighestQualityOnce:', e);
+      log('Error in setHighestQuality:', e);
       return false;
     }
   }
-
-  // --- Retry logic with Safari-adjusted timing ---
+  
   function init() {
-    if (isProcessing) {
-      console.debug('[YT Auto HQ] Already processing, skipping');
+    const currentVideoId = getVideoId();
+    if (!currentVideoId) return;
+    
+    if (isProcessing || currentVideoId === lastVideoId) {
+      log('Skipping - processing or same video');
       return;
     }
+    
+    log('Processing video:', currentVideoId);
     isProcessing = true;
-
-    const player = getPlayer();
-    if (!player || player === lastPlayer) {
-      isProcessing = false;
-      return;
-    }
-    lastPlayer = player;
-
+    lastVideoId = currentVideoId;
+    
     let attempts = 0;
-    const maxAttempts = isSafari ? 10 : 15; // Shorter retry for Safari
-    const interval = isSafari ? 500 : 250; // Slower retries for Safari
+    const maxAttempts = 20;
+    const interval = 300;
+    
     const timer = setInterval(() => {
       attempts++;
-      if (setHighestQualityOnce(player) || attempts >= maxAttempts) {
+      const player = getPlayer();
+      
+      if (setHighestQuality(player) || attempts >= maxAttempts) {
         clearInterval(timer);
         isProcessing = false;
-        if (attempts >= maxAttempts) {
-          console.debug('[YT Auto HQ] Max attempts reached');
-        }
+        log(attempts >= maxAttempts ? 'Max attempts reached' : 'Quality set successfully');
       }
     }, interval);
   }
-
-  // --- Start with delay for Safari ---
-  function start() {
-    const delay = isSafari ? 1000 : 0; // 1s delay for Safari
-    setTimeout(init, delay);
+  
+  // Event listeners
+  function addListeners() {
+    // YouTube SPA navigation
+    document.addEventListener('yt-navigate-finish', init, { passive: true });
+    document.addEventListener('yt-page-data-updated', init, { passive: true });
+    
+    // Fallback for URL changes
+    let lastUrl = location.href;
+    new MutationObserver(() => {
+      const currentUrl = location.href;
+      if (currentUrl !== lastUrl) {
+        lastUrl = currentUrl;
+        setTimeout(init, 500);
+      }
+    }).observe(document, { subtree: true, childList: true });
   }
-
-  // Initial run and SPA event listeners
-  start();
-  document.addEventListener('yt-navigate-finish', start, { passive: true });
-  document.addEventListener('yt-page-data-updated', start, { passive: true });
+  
+  // Initialize
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      setTimeout(() => {
+        addListeners();
+        init();
+      }, 1000);
+    });
+  } else {
+    addListeners();
+    init();
+  }
 })();
