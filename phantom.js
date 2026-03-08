@@ -148,6 +148,8 @@
     }
 
     // --- Permissions API ---
+    // [GEMINI NOTE]: Replaced the raw EventTarget mock with Object.create(PermissionStatus.prototype) 
+    // to bypass strict `instanceof PermissionStatus` type-checking that broke some sites.
     if (navigator.permissions) {
         const originalQuery = navigator.permissions.query.bind(navigator.permissions);
         override(Permissions.prototype, 'query', {
@@ -162,7 +164,6 @@
                 if (desc && blockedPermissions.has(desc.name)) {
                     log(`Permissions.query: denied "${desc.name}"`);
                     
-                    // Create a more convincing PermissionStatus mock
                     const fakeStatus = Object.create(PermissionStatus.prototype || Object.prototype);
                     Object.defineProperty(fakeStatus, 'state', { value: 'denied', enumerable: true });
                     Object.defineProperty(fakeStatus, 'name', { value: desc.name, enumerable: true });
@@ -238,6 +239,9 @@
     }
 
     // --- Canvas Fingerprinting ---
+    // [GEMINI NOTE]: Added try/catch block to `poisonCanvas`. If a site draws a cross-origin image 
+    // to a canvas, it becomes "tainted". Calling `getImageData` on it throws a SecurityError. 
+    // Failing to catch this crashes the entire userscript and halts page execution.
     const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
     const originalToBlob = HTMLCanvasElement.prototype.toBlob;
     const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
@@ -285,10 +289,11 @@
             },
         });
 
+        // [GEMINI NOTE]: Previously returned a completely silent buffer. This broke web audio apps. 
+        // Now it awaits the actual render and injects subtle noise into the real audio data.
         const originalStartRendering = OfflineAudioContext.prototype.startRendering;
         override(OfflineAudioContext.prototype, 'startRendering', {
             value: async function () {
-                // Render the actual audio to avoid breaking legitimate apps, then poison it
                 const buffer = await originalStartRendering.call(this);
                 if (buffer && buffer.numberOfChannels > 0) {
                     const channel = buffer.getChannelData(0);
@@ -303,11 +308,12 @@
     }
 
     // --- WebRTC IP Leak Prevention ---
+    // [GEMINI NOTE]: Added `safeConfig` cloning. Some sites pass a frozen object to RTCPeerConnection. 
+    // Mutating `config.iceTransportPolicy` directly caused a TypeError that broke WebRTC entirely.
     if (window.RTCPeerConnection) {
         const OriginalRTC = window.RTCPeerConnection;
         window.RTCPeerConnection = class extends OriginalRTC {
             constructor(config) {
-                // Clone the config to avoid TypeErrors on frozen objects
                 const safeConfig = config ? { ...config } : {};
                 safeConfig.iceTransportPolicy = 'relay';
                 super(safeConfig);
@@ -397,7 +403,9 @@
     });
 
     // --- window.name Supercookie ---
-    // Clear on load, but leave the property completely writable to avoid breaking OAuth flows
+    // [GEMINI NOTE]: Removed the getter/setter override entirely. Hard-blocking window.name 
+    // broke OAuth flows (like Google/Facebook login) and cross-origin communication. 
+    // Simply clearing it on script load removes stale tracking data without breaking active sessions.
     if (window.name) {
         log(`Cleared window.name supercookie on load`);
         window.name = '';
@@ -444,7 +452,9 @@
 
         for (const sel of rejectSelectors) {
             const btn = document.querySelector(sel);
-            if (btn && btn.offsetParent != null) { // Fixed: Handles null and undefined (SVG compatibility)
+            // [GEMINI NOTE]: Changed strict `!== null` to `!= null` to catch both null and undefined.
+            // SVG elements return undefined for `offsetParent`, so the strict check failed on banners using SVGs.
+            if (btn && btn.offsetParent != null) { 
                 btn.click();
                 log(`Cookie banner dismissed via: ${sel}`);
                 return true;
@@ -474,7 +484,9 @@
         let attempts = 0;
         let debounceTimer;
         
-        // Fixed: Debounced MutationObserver prevents main thread lag
+        // [GEMINI NOTE]: Added a 300ms debounce. Running `querySelectorAll` across the whole document 
+        // on every single DOM node mutation locked up the main thread on heavy single-page applications. 
+        // This ensures it only checks after the DOM settles.
         const observer = new MutationObserver(() => {
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(() => {
