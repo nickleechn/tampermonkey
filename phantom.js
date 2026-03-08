@@ -254,7 +254,6 @@
     }
 
     // --- SendBeacon (tracking pings on page unload) ---
-    const originalSendBeacon = Navigator.prototype.sendBeacon;
     override(Navigator.prototype, 'sendBeacon', {
         value: function (url) {
             log(`Blocked sendBeacon to ${url}`);
@@ -311,17 +310,15 @@
 
     // --- AudioContext Fingerprinting ---
     if (window.AudioContext || window.webkitAudioContext) {
-        const ACtx = window.AudioContext || window.webkitAudioContext;
-        const originalCreateOscillator = ACtx.prototype.createOscillator;
-        const originalCreateDynamicsCompressor = ACtx.prototype.createDynamicsCompressor;
-        const originalCreateAnalyser = ACtx.prototype.createAnalyser;
-
-        // Wrap AnalyserNode to inject noise into frequency/time domain data
+        // Poison AnalyserNode frequency data with subtle noise after real analysis
+        const originalGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData;
         override(AnalyserNode.prototype, 'getFloatFrequencyData', {
             value: function (array) {
-                AnalyserNode.prototype.__proto__.__lookupGetter__ // skip if unavailable
-                    ? Float32Array.prototype.forEach.call(array, (_, i, a) => { a[i] = -100 + Math.random() * 0.1; })
-                    : null;
+                originalGetFloatFreq.call(this, array);
+                // Add imperceptible noise to poison the fingerprint
+                for (let i = 0; i < array.length; i++) {
+                    array[i] += (Math.random() - 0.5) * 0.1;
+                }
                 log('Poisoned AudioContext getFloatFrequencyData');
             },
         });
@@ -349,21 +346,13 @@
     // --- WebRTC IP Leak Prevention ---
     if (window.RTCPeerConnection) {
         const OriginalRTC = window.RTCPeerConnection;
-        window.RTCPeerConnection = function (config) {
-            // Force all connections through TURN only (no local IP exposure)
-            if (config) {
+        window.RTCPeerConnection = class extends OriginalRTC {
+            constructor(config = {}) {
                 config.iceTransportPolicy = 'relay';
-            } else {
-                config = { iceTransportPolicy: 'relay' };
+                super(config);
+                log('WebRTC forced to relay-only (no local IP leak)');
             }
-            log('WebRTC forced to relay-only (no local IP leak)');
-            return new OriginalRTC(config);
         };
-        window.RTCPeerConnection.prototype = OriginalRTC.prototype;
-        // Preserve static methods
-        Object.keys(OriginalRTC).forEach((key) => {
-            window.RTCPeerConnection[key] = OriginalRTC[key];
-        });
         // Also cover the webkit prefix
         if (window.webkitRTCPeerConnection) {
             window.webkitRTCPeerConnection = window.RTCPeerConnection;
@@ -465,8 +454,8 @@
     window.name = '';
     override(Window.prototype, 'name', {
         set: function (val) {
-            if (val !== '') {
-                log(`Blocked window.name supercookie: "${val.substring(0, 50)}..."`);
+            if (val !== '' && val != null) {
+                log(`Blocked window.name supercookie: "${String(val).substring(0, 50)}..."`);
             }
         },
         get: function () {
@@ -496,6 +485,106 @@
             return originalDocAddListener.call(this, type, listener, options);
         },
     });
+
+    // --- Cookie Consent Auto-Dismiss (reject all) ---
+    const cookieDismiss = () => {
+        // Common "reject/decline" button selectors across major CMPs
+        const rejectSelectors = [
+            // OneTrust
+            '#onetrust-reject-all-handler',
+            '.onetrust-close-btn-handler',
+            // CookieBot
+            '#CybotCookiebotDialogBodyButtonDecline',
+            '#CybotCookiebotDialogBodyLevelButtonLevelOptinDeclineAll',
+            // Quantcast / TCF
+            '.qc-cmp2-summary-buttons button[mode="secondary"]',
+            '[class*="qc-cmp"][class*="reject"]',
+            // TrustArc / TrustE
+            '.truste_overlay .pdynamicbutton .call',
+            '#truste-consent-required',
+            // Didomi
+            '#didomi-notice-disagree-button',
+            // Axeptio
+            '[data-choice="deny"]',
+            // Klaro
+            '.klaro .cm-btn-decline',
+            // Complianz
+            '.cmplz-deny',
+            // CookieYes
+            '.cky-btn-reject',
+            // Osano
+            '.osano-cm-deny',
+            // Generic patterns (broad catch-all)
+            '[data-testid="cookie-reject"]',
+            '[data-cookiefirst-action="reject"]',
+            'button[aria-label*="reject" i]',
+            'button[aria-label*="decline" i]',
+            'button[aria-label*="deny" i]',
+            'button[aria-label*="refuse" i]',
+        ];
+
+        // Generic text matching for unlabeled buttons inside cookie banners
+        const bannerSelectors = [
+            '#cookie-banner', '#cookie-consent', '#cookie-notice', '#cookie-bar',
+            '#gdpr-banner', '#gdpr-consent', '#consent-banner', '#consent-popup',
+            '[class*="cookie-banner"]', '[class*="cookie-consent"]', '[class*="cookie-notice"]',
+            '[class*="gdpr"]', '[class*="consent-banner"]', '[class*="consent-popup"]',
+            '[id*="cookie"]', '[class*="cc-banner"]', '[class*="cc_banner"]',
+            '[class*="CookieConsent"]',
+        ];
+
+        const rejectPatterns = /^(reject|decline|deny|refuse|no thanks|only necessary|only essential|essentials only|necessary only|manage|settings|preferences|customize)/i;
+
+        // Try specific selectors first
+        for (const sel of rejectSelectors) {
+            const btn = document.querySelector(sel);
+            if (btn && btn.offsetParent !== null) {
+                btn.click();
+                log(`Cookie banner dismissed via: ${sel}`);
+                return true;
+            }
+        }
+
+        // Fall back to text matching inside known banner containers
+        for (const bannerSel of bannerSelectors) {
+            const banner = document.querySelector(bannerSel);
+            if (!banner || banner.offsetParent === null) continue;
+
+            const buttons = banner.querySelectorAll('button, a[role="button"], [class*="btn"], [class*="button"]');
+            for (const btn of buttons) {
+                const text = (btn.textContent || '').trim();
+                if (rejectPatterns.test(text)) {
+                    btn.click();
+                    log(`Cookie banner dismissed via text match: "${text}"`);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    };
+
+    // Run after DOM loads, then watch for late-injected banners
+    const startCookieDismiss = () => {
+        if (cookieDismiss()) return;
+
+        let attempts = 0;
+        const observer = new MutationObserver(() => {
+            if (cookieDismiss() || ++attempts > 50) {
+                observer.disconnect();
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        // Safety timeout: stop watching after 15s
+        setTimeout(() => observer.disconnect(), 15000);
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', startCookieDismiss);
+    } else {
+        startCookieDismiss();
+    }
 
     log('All privacy-invasive APIs blocked.');
 })();
