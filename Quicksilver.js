@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Blazing-fast browsing: LRU static asset cache + Speculation Rules link prefetch/prerender + preconnect on hover. Respects Cache-Control, skips APIs, and stays out of service workers' way.
+// @version      2.1
+// @description  Blazing-fast browsing: LRU static asset cache, Speculation Rules prefetch/prerender, preconnect on hover, fallback prefetch for Firefox/Safari, font-display swap. Respects Cache-Control, skips APIs, stays out of service workers' way.
 // @author       You
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -262,8 +262,9 @@
         };
     }
 
-    // Flush metadata before page unload
-    window.addEventListener('beforeunload', flushMetadata);
+    // Flush metadata on page hide — pagehide is bfcache-safe unlike beforeunload,
+    // which can prevent instant back/forward navigation in some browsers.
+    window.addEventListener('pagehide', flushMetadata);
 
     // =========================================================================
     // PART 2: LINK PRELOADER VIA SPECULATION RULES
@@ -377,6 +378,127 @@
         initPreconnectOnHover();
     } else {
         window.addEventListener('DOMContentLoaded', initPreconnectOnHover, { once: true });
+    }
+
+    // =========================================================================
+    // PART 4: FALLBACK PREFETCH FOR NON-CHROME BROWSERS
+    // =========================================================================
+    // Firefox and Safari don't support Speculation Rules. This provides similar
+    // benefit by injecting <link rel="prefetch"> on mousedown/touchstart — the
+    // ~100ms before navigation completes is enough to start fetching the target
+    // page. Same approach as instant.page.
+
+    function initFallbackPrefetch() {
+        // Skip if Speculation Rules are supported — Part 2 handles it
+        if (HTMLScriptElement.supports && HTMLScriptElement.supports('speculationrules')) return;
+
+        const conn = navigator.connection;
+        if (conn && (conn.saveData || conn.effectiveType === 'slow-2g' || conn.effectiveType === '2g')) return;
+
+        const prefetched = new Set();
+        let currentPrefetch = null;
+
+        function prefetch(href) {
+            if (prefetched.has(href)) return;
+            // Clean up previous hint to avoid accumulation
+            if (currentPrefetch) currentPrefetch.remove();
+            const hint = document.createElement('link');
+            hint.rel = 'prefetch';
+            hint.href = href;
+            document.head.appendChild(hint);
+            currentPrefetch = hint;
+            prefetched.add(href);
+        }
+
+        function isEligible(link) {
+            if (!link || !link.href) return false;
+            try {
+                const url = new URL(link.href);
+                // Same-origin only, skip non-http, anchors, and current page
+                if (url.origin !== location.origin) return false;
+                if (!url.protocol.startsWith('http')) return false;
+                if (url.pathname + url.search === location.pathname + location.search) return false;
+            } catch (_) { return false; }
+            // Skip download/logout links
+            const href = link.getAttribute('href') || '';
+            if (/\.(pdf|zip|tar|gz|exe|dmg|pkg|mp[34]|mov|doc|xls|ppt)/i.test(href)) return false;
+            if (/download|logout|signout|log-out|sign-out/i.test(href)) return false;
+            return true;
+        }
+
+        document.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return; // left click only
+            const link = e.target.closest('a[href]');
+            if (isEligible(link)) prefetch(link.href);
+        }, { passive: true, capture: true });
+
+        document.addEventListener('touchstart', (e) => {
+            const link = e.target.closest('a[href]');
+            if (isEligible(link)) prefetch(link.href);
+        }, { passive: true, capture: true });
+    }
+
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        initFallbackPrefetch();
+    } else {
+        window.addEventListener('DOMContentLoaded', initFallbackPrefetch, { once: true });
+    }
+
+    // =========================================================================
+    // PART 5: FONT DISPLAY SWAP INJECTION
+    // =========================================================================
+    // Prevents Flash of Invisible Text (FOIT) by patching @font-face rules to
+    // use font-display: swap. Text renders immediately with a fallback font
+    // while custom fonts load, instead of showing invisible text.
+
+    function initFontDisplaySwap() {
+        function patchStyleSheets() {
+            for (const sheet of document.styleSheets) {
+                try {
+                    const rules = sheet.cssRules || sheet.rules;
+                    if (!rules) continue;
+                    for (const rule of rules) {
+                        if (rule instanceof CSSFontFaceRule) {
+                            // Only patch if font-display is not already set
+                            if (!rule.style.fontDisplay) {
+                                rule.style.fontDisplay = 'swap';
+                            }
+                        }
+                    }
+                } catch (_) {
+                    // CORS: can't access cross-origin stylesheet rules
+                }
+            }
+        }
+
+        // Patch existing stylesheets
+        patchStyleSheets();
+
+        // Patch dynamically added stylesheets via MutationObserver
+        const observer = new MutationObserver((mutations) => {
+            let hasNewStyles = false;
+            for (const m of mutations) {
+                for (const node of m.addedNodes) {
+                    if (node.tagName === 'LINK' || node.tagName === 'STYLE') {
+                        hasNewStyles = true;
+                        break;
+                    }
+                }
+                if (hasNewStyles) break;
+            }
+            if (hasNewStyles) {
+                // Defer to let the stylesheet parse
+                requestAnimationFrame(patchStyleSheets);
+            }
+        });
+
+        observer.observe(document.head, { childList: true });
+    }
+
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        initFontDisplaySwap();
+    } else {
+        window.addEventListener('DOMContentLoaded', initFontDisplaySwap, { once: true });
     }
 
 })();
