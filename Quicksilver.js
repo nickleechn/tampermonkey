@@ -2,7 +2,7 @@
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
 // @version      2.0
-// @description  Blazing-fast browsing: LRU static asset cache + Speculation Rules link prefetch/prerender + DNS prefetch. Respects Cache-Control, skips APIs, and stays out of service workers' way.
+// @description  Blazing-fast browsing: LRU static asset cache + Speculation Rules link prefetch/prerender + preconnect on hover. Respects Cache-Control, skips APIs, and stays out of service workers' way.
 // @author       You
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -101,6 +101,7 @@
             await caches.delete(CACHE_NAME);
             metadataMap.clear();
             metadataDirty = false;
+            if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
             try { localStorage.removeItem(METADATA_KEY); } catch (e) {}
             cacheHits = 0;
             cacheMisses = 0;
@@ -209,7 +210,8 @@
             }
 
             // Bypass cache for no-cache, reload, and no-store fetch modes
-            const cacheMode = args[1] && args[1].cache;
+            // Check init override first, then Request object's cache mode
+            const cacheMode = (args[1] && args[1].cache) || (args[0] instanceof Request && args[0].cache);
             const isBypass = cacheMode === 'no-cache' || cacheMode === 'reload' || cacheMode === 'no-store';
 
             if (method !== 'GET' || !isCacheableUrl(urlStr) || isBypass) {
@@ -330,44 +332,51 @@
     }
 
     // =========================================================================
-    // PART 3: DNS PREFETCH FOR EXTERNAL LINKS
+    // PART 3: PRECONNECT ON HOVER
     // =========================================================================
+    // When the user hovers over a link, inject <link rel="preconnect"> for its
+    // origin. The ~300ms hover-to-click window is enough for DNS + TCP + TLS,
+    // making the subsequent navigation feel instant. Strictly better than bulk
+    // DNS prefetch: it's just-in-time, does full connection setup, and adds
+    // zero overhead for links the user never interacts with.
 
-    function initDnsPrefetch() {
-        const seen = new Set();
+    function initPreconnectOnHover() {
+        const connected = new Set();
         const currentOrigin = location.origin;
+        const MAX_PRECONNECTS = 8; // browser limit on concurrent preconnects
 
-        // Collect unique external origins from visible links
-        const links = document.querySelectorAll('a[href]');
-        for (const link of links) {
+        function preconnect(origin) {
+            if (connected.has(origin) || origin === currentOrigin) return;
+            if (connected.size >= MAX_PRECONNECTS) {
+                // Remove the oldest hint to stay under the browser limit
+                const oldest = connected.values().next().value;
+                const oldLink = document.querySelector(`link[rel="preconnect"][href="${oldest}"]`);
+                if (oldLink) oldLink.remove();
+                connected.delete(oldest);
+            }
+            const hint = document.createElement('link');
+            hint.rel = 'preconnect';
+            hint.crossOrigin = 'anonymous';
+            hint.href = origin;
+            document.head.appendChild(hint);
+            connected.add(origin);
+        }
+
+        // Single delegated listener on document — works for SPA-injected links too
+        document.addEventListener('pointerenter', (e) => {
+            const link = e.target.closest('a[href]');
+            if (!link) return;
             try {
                 const url = new URL(link.href);
-                if (url.origin !== currentOrigin && url.protocol.startsWith('http') && !seen.has(url.origin)) {
-                    seen.add(url.origin);
-                }
-            } catch (e) {}
-        }
-
-        // Inject dns-prefetch hints (batch into a fragment to minimize reflows)
-        if (seen.size === 0) return;
-        const frag = document.createDocumentFragment();
-        for (const origin of seen) {
-            const hint = document.createElement('link');
-            hint.rel = 'dns-prefetch';
-            hint.href = origin;
-            frag.appendChild(hint);
-        }
-        document.head.appendChild(frag);
+                if (url.protocol.startsWith('http')) preconnect(url.origin);
+            } catch (_) {}
+        }, { passive: true, capture: true });
     }
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
-        if ('requestIdleCallback' in window) requestIdleCallback(initDnsPrefetch);
-        else setTimeout(initDnsPrefetch, 500);
+        initPreconnectOnHover();
     } else {
-        window.addEventListener('DOMContentLoaded', () => {
-            if ('requestIdleCallback' in window) requestIdleCallback(initDnsPrefetch);
-            else setTimeout(initDnsPrefetch, 500);
-        }, { once: true });
+        window.addEventListener('DOMContentLoaded', initPreconnectOnHover, { once: true });
     }
 
 })();
