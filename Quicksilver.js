@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Blazing-fast browsing: LRU static asset cache, Speculation Rules prefetch/prerender, preconnect on hover, fallback prefetch for Firefox/Safari, font-display swap. Respects Cache-Control, skips APIs, stays out of service workers' way.
 // @author       You
 // @match        *://*/*
@@ -45,7 +45,8 @@
         /\.m3u8(\?|$)/i, /\.mpd(\?|$)/i,
     ];
 
-    const NO_CACHE_DIRECTIVES = /\b(no-store|no-cache|private|must-revalidate)\b/i;
+    const NO_STORE = /\bno-store\b/i;
+    const FORCE_REVALIDATE = /\b(no-cache|must-revalidate)\b/i;
     const CACHEABLE_CONTENT_TYPES = /^(text\/css|text\/javascript|application\/javascript|application\/x-javascript|image\/|font\/|application\/font|application\/x-font|application\/wasm)/i;
 
     // --- In-memory metadata with debounced localStorage sync ---
@@ -86,7 +87,12 @@
         scheduleFlush();
     }
 
+    // URLs in this set have Cache-Control: no-cache or must-revalidate,
+    // so they are always treated as stale (triggering background revalidation)
+    const forceRevalidateUrls = new Set();
+
     function isFresh(url) {
+        if (forceRevalidateUrls.has(url)) return false;
         const timestamp = metadataMap.get(url);
         if (!timestamp) return false;
         return (Date.now() - timestamp) < getRevalidateTTL();
@@ -176,13 +182,16 @@
         return true;
     }
 
-    function isCacheableResponse(response) {
+    // Returns: false (uncacheable), 'revalidate' (cache but always revalidate), true (normal cache)
+    function getCacheability(response) {
         const cc = response.headers.get('Cache-Control') || '';
-        if (NO_CACHE_DIRECTIVES.test(cc)) return false;
+        if (NO_STORE.test(cc)) return false;
         const ct = response.headers.get('Content-Type') || '';
         if (ct && !CACHEABLE_CONTENT_TYPES.test(ct)) return false;
         if (response.status === 206) return false;
-        return response.ok;
+        if (!response.ok) return false;
+        if (FORCE_REVALIDATE.test(cc)) return 'revalidate';
+        return true;
     }
 
     const shouldOverrideFetch = !navigator.serviceWorker || !navigator.serviceWorker.controller;
@@ -190,17 +199,25 @@
     if (shouldOverrideFetch && typeof unsafeWindow !== 'undefined') {
         let cachePromise = null;
         function getCache() {
-            if (!cachePromise) cachePromise = caches.open(CACHE_NAME);
+            if (typeof caches === 'undefined') return Promise.reject('Cache API unavailable');
+            if (!cachePromise) cachePromise = caches.open(CACHE_NAME).catch(e => {
+                cachePromise = null; // allow retry on next call
+                throw e;
+            });
             return cachePromise;
         }
 
         const originalFetch = unsafeWindow.fetch;
 
+        // Duck-type check for Request objects — cross-realm instanceof fails
+        // between Tampermonkey sandbox and page context
+        const isRequest = (obj) => obj && typeof obj === 'object' && 'url' in obj && 'method' in obj;
+
         unsafeWindow.fetch = async function(...args) {
             let method = 'GET';
             let urlStr = '';
 
-            if (args[0] instanceof Request) {
+            if (isRequest(args[0])) {
                 method = args[0].method;
                 urlStr = args[0].url;
             } else {
@@ -211,7 +228,7 @@
 
             // Bypass cache for no-cache, reload, and no-store fetch modes
             // Check init override first, then Request object's cache mode
-            const cacheMode = (args[1] && args[1].cache) || (args[0] instanceof Request && args[0].cache);
+            const cacheMode = (args[1] && args[1].cache) || (isRequest(args[0]) && args[0].cache);
             const isBypass = cacheMode === 'no-cache' || cacheMode === 'reload' || cacheMode === 'no-store';
 
             if (method !== 'GET' || !isCacheableUrl(urlStr) || isBypass) {
@@ -229,8 +246,10 @@
                     if (!isFresh(urlStr)) {
                         originalFetch.apply(this, args)
                             .then(async (networkResponse) => {
-                                if (isCacheableResponse(networkResponse)) {
-                                    await cache.put(urlStr, networkResponse.clone()).catch(() => {});
+                                const cacheability = getCacheability(networkResponse);
+                                if (cacheability) {
+                                    if (cacheability === 'revalidate') forceRevalidateUrls.add(urlStr);
+                                    await cache.put(urlStr, networkResponse).catch(() => {});
                                     touchItem(urlStr);
                                     if (Math.random() < 0.05) triggerMaintenance();
                                 }
@@ -246,7 +265,9 @@
                 cacheMisses++;
                 const networkResponse = await originalFetch.apply(this, args);
 
-                if (isCacheableResponse(networkResponse)) {
+                const cacheability = getCacheability(networkResponse);
+                if (cacheability) {
+                    if (cacheability === 'revalidate') forceRevalidateUrls.add(urlStr);
                     cache.put(urlStr, networkResponse.clone())
                         .then(() => {
                             touchItem(urlStr);
@@ -493,6 +514,14 @@
         });
 
         observer.observe(document.head, { childList: true });
+        // Also watch body for SPAs that inject stylesheets there
+        if (document.body) {
+            observer.observe(document.body, { childList: true });
+        } else {
+            window.addEventListener('DOMContentLoaded', () => {
+                observer.observe(document.body, { childList: true });
+            }, { once: true });
+        }
     }
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
