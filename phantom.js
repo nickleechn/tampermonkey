@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Phantom
 // @namespace    https://github.com/user/phantom
-// @version      1.3
+// @version      1.4
 // @description  Automatically denies privacy-invasive browser API requests (location, camera, mic, notifications, etc.)
 // @match        *://*/*
 // @grant        none
@@ -20,7 +20,6 @@
         try {
             Object.defineProperty(obj, prop, { configurable: true, ...descriptor });
         } catch (e) {
-            // Fallback: direct assignment if defineProperty fails
             if ('value' in descriptor) obj[prop] = descriptor.value;
         }
     }
@@ -68,7 +67,7 @@
     if (window.Notification) {
         Object.defineProperty(Notification, 'permission', {
             get: () => 'denied',
-            configurable: false,
+            configurable: true,
         });
         Notification.requestPermission = function () {
             log('Blocked Notification.requestPermission');
@@ -90,7 +89,6 @@
                 return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
             },
         });
-        // writeText is left intact so copy-to-clipboard buttons still work
     }
 
     // --- Installed Related Apps ---
@@ -103,61 +101,26 @@
         });
     }
 
-    // --- Bluetooth ---
-    if (navigator.bluetooth) {
-        override(Bluetooth.prototype, 'requestDevice', {
-            value: function () {
-                log('Blocked bluetooth.requestDevice');
-                return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
-            },
-        });
-    }
+    // --- Hardware APIs (Bluetooth, USB, HID, Serial, NFC) ---
+    const hardwareApis = [
+        { obj: navigator.bluetooth, proto: window.Bluetooth?.prototype, method: 'requestDevice' },
+        { obj: navigator.usb, proto: window.USB?.prototype, method: 'requestDevice' },
+        { obj: navigator.hid, proto: window.HID?.prototype, method: 'requestDevice' },
+        { obj: navigator.serial, proto: window.Serial?.prototype, method: 'requestPort' },
+        { obj: window.NDEFReader, proto: window.NDEFReader?.prototype, method: 'scan' },
+        { obj: window.NDEFReader, proto: window.NDEFReader?.prototype, method: 'write' }
+    ];
 
-    // --- USB ---
-    if (navigator.usb) {
-        override(USB.prototype, 'requestDevice', {
-            value: function () {
-                log('Blocked usb.requestDevice');
-                return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
-            },
-        });
-    }
-
-    // --- HID ---
-    if (navigator.hid) {
-        override(HID.prototype, 'requestDevice', {
-            value: function () {
-                log('Blocked hid.requestDevice');
-                return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
-            },
-        });
-    }
-
-    // --- Serial ---
-    if (navigator.serial) {
-        override(Serial.prototype, 'requestPort', {
-            value: function () {
-                log('Blocked serial.requestPort');
-                return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
-            },
-        });
-    }
-
-    // --- NFC ---
-    if (window.NDEFReader) {
-        override(NDEFReader.prototype, 'scan', {
-            value: function () {
-                log('Blocked NDEFReader.scan');
-                return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
-            },
-        });
-        override(NDEFReader.prototype, 'write', {
-            value: function () {
-                log('Blocked NDEFReader.write');
-                return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
-            },
-        });
-    }
+    hardwareApis.forEach(({ obj, proto, method }) => {
+        if (obj && proto) {
+            override(proto, method, {
+                value: function () {
+                    log(`Blocked ${method} on hardware API`);
+                    return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
+                },
+            });
+        }
+    });
 
     // --- Battery Status ---
     if (navigator.getBattery) {
@@ -176,7 +139,6 @@
             log(`Blocked ${evt} event`);
         }, true);
     }
-    // Also block the on* property setters
     for (const prop of ['ondevicemotion', 'ondeviceorientation', 'ondeviceorientationabsolute']) {
         Object.defineProperty(window, prop, {
             set: () => log(`Blocked setting ${prop}`),
@@ -185,7 +147,7 @@
         });
     }
 
-    // --- Permissions API (report everything as denied) ---
+    // --- Permissions API ---
     if (navigator.permissions) {
         const originalQuery = navigator.permissions.query.bind(navigator.permissions);
         override(Permissions.prototype, 'query', {
@@ -199,9 +161,13 @@
                 ]);
                 if (desc && blockedPermissions.has(desc.name)) {
                     log(`Permissions.query: denied "${desc.name}"`);
-                    const fakeStatus = new EventTarget();
-                    fakeStatus.state = 'denied';
+                    
+                    // Create a more convincing PermissionStatus mock
+                    const fakeStatus = Object.create(PermissionStatus.prototype || Object.prototype);
+                    Object.defineProperty(fakeStatus, 'state', { value: 'denied', enumerable: true });
+                    Object.defineProperty(fakeStatus, 'name', { value: desc.name, enumerable: true });
                     fakeStatus.onchange = null;
+                    
                     return Promise.resolve(fakeStatus);
                 }
                 return originalQuery(desc);
@@ -253,15 +219,15 @@
         });
     }
 
-    // --- SendBeacon (tracking pings on page unload) ---
+    // --- SendBeacon ---
     override(Navigator.prototype, 'sendBeacon', {
         value: function (url) {
             log(`Blocked sendBeacon to ${url}`);
-            return true; // pretend it succeeded so callers don't retry
+            return true;
         },
     });
 
-    // --- Network Information (connection fingerprinting) ---
+    // --- Network Information ---
     if (navigator.connection) {
         override(Navigator.prototype, 'connection', {
             get: function () {
@@ -276,46 +242,42 @@
     const originalToBlob = HTMLCanvasElement.prototype.toBlob;
     const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
 
-    override(HTMLCanvasElement.prototype, 'toDataURL', {
-        value: function () {
-            // Allow small canvases (icons, UI) — only poison large ones used for fingerprinting
-            if (this.width > 16 && this.height > 16) {
-                const ctx = this.getContext('2d');
+    const poisonCanvas = (canvas) => {
+        if (canvas.width > 16 && canvas.height > 16) {
+            try {
+                const ctx = canvas.getContext('2d');
                 if (ctx) {
-                    // Add imperceptible noise to poison the fingerprint
                     const pixel = originalGetImageData.call(ctx, 0, 0, 1, 1);
                     pixel.data[0] = (pixel.data[0] + Math.floor(Math.random() * 3)) % 256;
                     ctx.putImageData(pixel, 0, 0);
-                    log('Poisoned canvas toDataURL fingerprint');
+                    log('Poisoned canvas fingerprint');
                 }
+            } catch (e) {
+                // Ignore SecurityError on tainted canvases
             }
+        }
+    };
+
+    override(HTMLCanvasElement.prototype, 'toDataURL', {
+        value: function () {
+            poisonCanvas(this);
             return originalToDataURL.apply(this, arguments);
         },
     });
 
     override(HTMLCanvasElement.prototype, 'toBlob', {
-        value: function (callback) {
-            if (this.width > 16 && this.height > 16) {
-                const ctx = this.getContext('2d');
-                if (ctx) {
-                    const pixel = originalGetImageData.call(ctx, 0, 0, 1, 1);
-                    pixel.data[0] = (pixel.data[0] + Math.floor(Math.random() * 3)) % 256;
-                    ctx.putImageData(pixel, 0, 0);
-                    log('Poisoned canvas toBlob fingerprint');
-                }
-            }
+        value: function () {
+            poisonCanvas(this);
             return originalToBlob.apply(this, arguments);
         },
     });
 
     // --- AudioContext Fingerprinting ---
     if (window.AudioContext || window.webkitAudioContext) {
-        // Poison AnalyserNode frequency data with subtle noise after real analysis
         const originalGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData;
         override(AnalyserNode.prototype, 'getFloatFrequencyData', {
             value: function (array) {
                 originalGetFloatFreq.call(this, array);
-                // Add imperceptible noise to poison the fingerprint
                 for (let i = 0; i < array.length; i++) {
                     array[i] += (Math.random() - 0.5) * 0.1;
                 }
@@ -323,22 +285,19 @@
             },
         });
 
+        const originalStartRendering = OfflineAudioContext.prototype.startRendering;
         override(OfflineAudioContext.prototype, 'startRendering', {
-            value: function () {
-                log('Blocked OfflineAudioContext.startRendering (fingerprint)');
-                return new Promise((resolve) => {
-                    // Return a silent buffer with slight noise
-                    const buffer = new AudioBuffer({
-                        length: this.length,
-                        sampleRate: this.sampleRate,
-                        numberOfChannels: this.numberOfChannels,
-                    });
+            value: async function () {
+                // Render the actual audio to avoid breaking legitimate apps, then poison it
+                const buffer = await originalStartRendering.call(this);
+                if (buffer && buffer.numberOfChannels > 0) {
                     const channel = buffer.getChannelData(0);
                     for (let i = 0; i < channel.length; i++) {
-                        channel[i] = (Math.random() - 0.5) * 1e-7; // imperceptible noise
+                        channel[i] += (Math.random() - 0.5) * 1e-7;
                     }
-                    resolve(buffer);
-                });
+                    log('Poisoned OfflineAudioContext render');
+                }
+                return buffer;
             },
         });
     }
@@ -347,24 +306,22 @@
     if (window.RTCPeerConnection) {
         const OriginalRTC = window.RTCPeerConnection;
         window.RTCPeerConnection = class extends OriginalRTC {
-            constructor(config = {}) {
-                config.iceTransportPolicy = 'relay';
-                super(config);
-                log('WebRTC forced to relay-only (no local IP leak)');
+            constructor(config) {
+                // Clone the config to avoid TypeErrors on frozen objects
+                const safeConfig = config ? { ...config } : {};
+                safeConfig.iceTransportPolicy = 'relay';
+                super(safeConfig);
+                log('WebRTC forced to relay-only');
             }
         };
-        // Also cover the webkit prefix
         if (window.webkitRTCPeerConnection) {
             window.webkitRTCPeerConnection = window.RTCPeerConnection;
         }
     }
 
     // --- WebGL Renderer Fingerprinting ---
-    const getParamBlock = new Set([
-        0x9245, // UNMASKED_VENDOR_WEBGL
-        0x9246, // UNMASKED_RENDERER_WEBGL
-    ]);
-    for (const CtxProto of [WebGLRenderingContext.prototype, WebGL2RenderingContext.prototype]) {
+    const getParamBlock = new Set([0x9245, 0x9246]);
+    for (const CtxProto of [WebGLRenderingContext.prototype, window.WebGL2RenderingContext?.prototype].filter(Boolean)) {
         const originalGetParameter = CtxProto.getParameter;
         override(CtxProto, 'getParameter', {
             value: function (param) {
@@ -375,7 +332,6 @@
                 return originalGetParameter.call(this, param);
             },
         });
-        // Block the debug extension entirely
         const originalGetExtension = CtxProto.getExtension;
         override(CtxProto, 'getExtension', {
             value: function (name) {
@@ -397,44 +353,36 @@
     };
     for (const [prop, val] of Object.entries(navSpoofs)) {
         override(Navigator.prototype, prop, {
-            get: function () {
+            get: () => {
                 log(`Spoofed navigator.${prop}`);
                 return val;
             },
         });
     }
-    // Normalize languages to a common value
     override(Navigator.prototype, 'languages', {
-        get: function () {
+        get: () => {
             log('Spoofed navigator.languages');
             return Object.freeze(['en-US', 'en']);
         },
     });
-    override(Navigator.prototype, 'language', {
-        get: function () {
-            return 'en-US';
-        },
-    });
+    override(Navigator.prototype, 'language', { get: () => 'en-US' });
 
     // --- Screen Property Normalization ---
     const screenSpoofs = {
-        width: 1920,
-        height: 1080,
-        availWidth: 1920,
-        availHeight: 1080,
-        colorDepth: 24,
-        pixelDepth: 24,
+        width: 1920, height: 1080,
+        availWidth: 1920, availHeight: 1080,
+        colorDepth: 24, pixelDepth: 24,
     };
     for (const [prop, val] of Object.entries(screenSpoofs)) {
         override(Screen.prototype, prop, {
-            get: function () {
+            get: () => {
                 log(`Spoofed screen.${prop}`);
                 return val;
             },
         });
     }
     override(Window.prototype, 'devicePixelRatio', {
-        get: function () {
+        get: () => {
             log('Spoofed devicePixelRatio');
             return 1;
         },
@@ -444,37 +392,21 @@
     const originalPerfNow = Performance.prototype.now;
     override(Performance.prototype, 'now', {
         value: function () {
-            // Reduce to 100μs precision (from 5μs) to prevent timing attacks
             return Math.round(originalPerfNow.call(this) * 10) / 10;
         },
     });
 
     // --- window.name Supercookie ---
-    // Clear on load and prevent sites from persisting data across navigations
-    window.name = '';
-    override(Window.prototype, 'name', {
-        set: function (val) {
-            if (val !== '' && val != null) {
-                log(`Blocked window.name supercookie: "${String(val).substring(0, 50)}..."`);
-            }
-        },
-        get: function () {
-            return '';
-        },
-    });
+    // Clear on load, but leave the property completely writable to avoid breaking OAuth flows
+    if (window.name) {
+        log(`Cleared window.name supercookie on load`);
+        window.name = '';
+    }
 
     // --- Visibility API ---
-    override(Document.prototype, 'hidden', {
-        get: function () {
-            return false; // always report as visible
-        },
-    });
-    override(Document.prototype, 'visibilityState', {
-        get: function () {
-            return 'visible'; // never reveal tab switching
-        },
-    });
-    // Swallow visibilitychange events
+    override(Document.prototype, 'hidden', { get: () => false });
+    override(Document.prototype, 'visibilityState', { get: () => 'visible' });
+    
     const originalDocAddListener = Document.prototype.addEventListener;
     override(Document.prototype, 'addEventListener', {
         value: function (type, listener, options) {
@@ -488,67 +420,40 @@
 
     // --- Cookie Consent Auto-Dismiss (reject all) ---
     const cookieDismiss = () => {
-        // Common "reject/decline" button selectors across major CMPs
         const rejectSelectors = [
-            // OneTrust
-            '#onetrust-reject-all-handler',
-            '.onetrust-close-btn-handler',
-            // CookieBot
-            '#CybotCookiebotDialogBodyButtonDecline',
-            '#CybotCookiebotDialogBodyLevelButtonLevelOptinDeclineAll',
-            // Quantcast / TCF
-            '.qc-cmp2-summary-buttons button[mode="secondary"]',
-            '[class*="qc-cmp"][class*="reject"]',
-            // TrustArc / TrustE
-            '.truste_overlay .pdynamicbutton .call',
-            '#truste-consent-required',
-            // Didomi
-            '#didomi-notice-disagree-button',
-            // Axeptio
-            '[data-choice="deny"]',
-            // Klaro
-            '.klaro .cm-btn-decline',
-            // Complianz
-            '.cmplz-deny',
-            // CookieYes
-            '.cky-btn-reject',
-            // Osano
-            '.osano-cm-deny',
-            // Generic patterns (broad catch-all)
-            '[data-testid="cookie-reject"]',
-            '[data-cookiefirst-action="reject"]',
-            'button[aria-label*="reject" i]',
-            'button[aria-label*="decline" i]',
-            'button[aria-label*="deny" i]',
-            'button[aria-label*="refuse" i]',
+            '#onetrust-reject-all-handler', '.onetrust-close-btn-handler',
+            '#CybotCookiebotDialogBodyButtonDecline', '#CybotCookiebotDialogBodyLevelButtonLevelOptinDeclineAll',
+            '.qc-cmp2-summary-buttons button[mode="secondary"]', '[class*="qc-cmp"][class*="reject"]',
+            '.truste_overlay .pdynamicbutton .call', '#truste-consent-required',
+            '#didomi-notice-disagree-button', '[data-choice="deny"]',
+            '.klaro .cm-btn-decline', '.cmplz-deny', '.cky-btn-reject', '.osano-cm-deny',
+            '[data-testid="cookie-reject"]', '[data-cookiefirst-action="reject"]',
+            'button[aria-label*="reject" i]', 'button[aria-label*="decline" i]',
+            'button[aria-label*="deny" i]', 'button[aria-label*="refuse" i]',
         ];
 
-        // Generic text matching for unlabeled buttons inside cookie banners
         const bannerSelectors = [
             '#cookie-banner', '#cookie-consent', '#cookie-notice', '#cookie-bar',
             '#gdpr-banner', '#gdpr-consent', '#consent-banner', '#consent-popup',
             '[class*="cookie-banner"]', '[class*="cookie-consent"]', '[class*="cookie-notice"]',
             '[class*="gdpr"]', '[class*="consent-banner"]', '[class*="consent-popup"]',
-            '[id*="cookie"]', '[class*="cc-banner"]', '[class*="cc_banner"]',
-            '[class*="CookieConsent"]',
+            '[id*="cookie"]', '[class*="cc-banner"]', '[class*="cc_banner"]', '[class*="CookieConsent"]',
         ];
 
         const rejectPatterns = /^(reject|decline|deny|refuse|no thanks|only necessary|only essential|essentials only|necessary only|manage|settings|preferences|customize)/i;
 
-        // Try specific selectors first
         for (const sel of rejectSelectors) {
             const btn = document.querySelector(sel);
-            if (btn && btn.offsetParent !== null) {
+            if (btn && btn.offsetParent != null) { // Fixed: Handles null and undefined (SVG compatibility)
                 btn.click();
                 log(`Cookie banner dismissed via: ${sel}`);
                 return true;
             }
         }
 
-        // Fall back to text matching inside known banner containers
         for (const bannerSel of bannerSelectors) {
             const banner = document.querySelector(bannerSel);
-            if (!banner || banner.offsetParent === null) continue;
+            if (!banner || banner.offsetParent == null) continue;
 
             const buttons = banner.querySelectorAll('button, a[role="button"], [class*="btn"], [class*="button"]');
             for (const btn of buttons) {
@@ -560,23 +465,26 @@
                 }
             }
         }
-
         return false;
     };
 
-    // Run after DOM loads, then watch for late-injected banners
     const startCookieDismiss = () => {
         if (cookieDismiss()) return;
 
         let attempts = 0;
+        let debounceTimer;
+        
+        // Fixed: Debounced MutationObserver prevents main thread lag
         const observer = new MutationObserver(() => {
-            if (cookieDismiss() || ++attempts > 50) {
-                observer.disconnect();
-            }
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                if (cookieDismiss() || ++attempts > 50) {
+                    observer.disconnect();
+                }
+            }, 300);
         });
         observer.observe(document.body, { childList: true, subtree: true });
 
-        // Safety timeout: stop watching after 15s
         setTimeout(() => observer.disconnect(), 15000);
     };
 
@@ -586,5 +494,5 @@
         startCookieDismiss();
     }
 
-    log('All privacy-invasive APIs blocked.');
+    log('All privacy-invasive APIs blocked and patched.');
 })();
