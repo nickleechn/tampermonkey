@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Phantom
 // @namespace    https://github.com/user/phantom
-// @version      1.4
+// @version      1.5
 // @description  Automatically denies privacy-invasive browser API requests (location, camera, mic, notifications, etc.)
 // @match        *://*/*
 // @grant        none
@@ -164,10 +164,13 @@
                 if (desc && blockedPermissions.has(desc.name)) {
                     log(`Permissions.query: denied "${desc.name}"`);
                     
-                    const fakeStatus = Object.create(PermissionStatus.prototype || Object.prototype);
+                    // Use real EventTarget for internal slots, then re-prototype
+                    // for instanceof PermissionStatus compatibility.
+                    const fakeStatus = new EventTarget();
+                    Object.setPrototypeOf(fakeStatus, PermissionStatus.prototype);
                     Object.defineProperty(fakeStatus, 'state', { value: 'denied', enumerable: true });
                     Object.defineProperty(fakeStatus, 'name', { value: desc.name, enumerable: true });
-                    fakeStatus.onchange = null;
+                    Object.defineProperty(fakeStatus, 'onchange', { value: null, writable: true, configurable: true });
                     
                     return Promise.resolve(fakeStatus);
                 }
@@ -387,7 +390,9 @@
             },
         });
     }
-    override(Window.prototype, 'devicePixelRatio', {
+    // Override on `window` directly, not `Window.prototype`, because `window`
+    // has its own property descriptor that shadows the prototype.
+    override(window, 'devicePixelRatio', {
         get: () => {
             log('Spoofed devicePixelRatio');
             return 1;
