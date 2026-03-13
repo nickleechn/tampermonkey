@@ -49,6 +49,11 @@
     const FORCE_REVALIDATE = /\b(no-cache|must-revalidate)\b/i;
     const CACHEABLE_CONTENT_TYPES = /^(text\/css|text\/javascript|application\/javascript|application\/x-javascript|image\/|font\/|application\/font|application\/x-font|application\/wasm)/i;
 
+    function getClosestLinkTarget(target) {
+        if (!(target instanceof Element)) return null;
+        return target.closest('a[href]');
+    }
+
     // --- In-memory metadata with debounced localStorage sync ---
     let metadataMap = new Map();
     let metadataDirty = false;
@@ -209,78 +214,82 @@
 
         const originalFetch = unsafeWindow.fetch;
 
-        // Duck-type check for Request objects — cross-realm instanceof fails
-        // between Tampermonkey sandbox and page context
-        const isRequest = (obj) => obj && typeof obj === 'object' && 'url' in obj && 'method' in obj;
+        if (typeof originalFetch === 'function') {
+            // Duck-type check for Request objects — cross-realm instanceof fails
+            // between Tampermonkey sandbox and page context
+            const isRequest = (obj) => obj && typeof obj === 'object' && 'url' in obj && 'method' in obj;
 
-        unsafeWindow.fetch = async function(...args) {
-            let method = 'GET';
-            let urlStr = '';
+            unsafeWindow.fetch = async function(...args) {
+                let method = 'GET';
+                let urlStr = '';
 
-            if (isRequest(args[0])) {
-                method = args[0].method;
-                urlStr = args[0].url;
-            } else {
-                method = (args[1] && args[1].method) || 'GET';
-                try { urlStr = new URL(args[0], location.href).href; }
-                catch (e) { return originalFetch.apply(this, args); }
-            }
+                if (isRequest(args[0])) {
+                    method = (args[1] && args[1].method) || args[0].method;
+                    urlStr = args[0].url;
+                } else {
+                    method = (args[1] && args[1].method) || 'GET';
+                    try { urlStr = new URL(args[0], location.href).href; }
+                    catch (e) { return originalFetch.apply(this, args); }
+                }
 
-            // Bypass cache for no-cache, reload, and no-store fetch modes
-            // Check init override first, then Request object's cache mode
-            const cacheMode = (args[1] && args[1].cache) || (isRequest(args[0]) && args[0].cache);
-            const isBypass = cacheMode === 'no-cache' || cacheMode === 'reload' || cacheMode === 'no-store';
+                method = String(method || 'GET').toUpperCase();
 
-            if (method !== 'GET' || !isCacheableUrl(urlStr) || isBypass) {
-                return originalFetch.apply(this, args);
-            }
+                // Bypass cache for no-cache, reload, and no-store fetch modes
+                // Check init override first, then Request object's cache mode
+                const cacheMode = (args[1] && args[1].cache) || (isRequest(args[0]) && args[0].cache);
+                const isBypass = cacheMode === 'no-cache' || cacheMode === 'reload' || cacheMode === 'no-store';
 
-            try {
-                const cache = await getCache();
-                const cachedResponse = await cache.match(urlStr);
+                if (method !== 'GET' || !isCacheableUrl(urlStr) || isBypass) {
+                    return originalFetch.apply(this, args);
+                }
 
-                if (cachedResponse) {
-                    cacheHits++;
-                    const responseToReturn = cachedResponse.clone();
+                try {
+                    const cache = await getCache();
+                    const cachedResponse = await cache.match(urlStr);
 
-                    if (!isFresh(urlStr)) {
-                        originalFetch.apply(this, args)
-                            .then(async (networkResponse) => {
-                                const cacheability = getCacheability(networkResponse);
-                                if (cacheability) {
-                                    if (cacheability === 'revalidate') forceRevalidateUrls.add(urlStr);
-                                    await cache.put(urlStr, networkResponse).catch(() => {});
-                                    touchItem(urlStr);
-                                    if (Math.random() < 0.05) triggerMaintenance();
-                                }
-                            })
-                            .catch(() => {});
-                    } else {
-                        touchItem(urlStr);
+                    if (cachedResponse) {
+                        cacheHits++;
+                        const responseToReturn = cachedResponse.clone();
+
+                        if (!isFresh(urlStr)) {
+                            originalFetch.apply(this, args)
+                                .then(async (networkResponse) => {
+                                    const cacheability = getCacheability(networkResponse);
+                                    if (cacheability) {
+                                        if (cacheability === 'revalidate') forceRevalidateUrls.add(urlStr);
+                                        await cache.put(urlStr, networkResponse).catch(() => {});
+                                        touchItem(urlStr);
+                                        if (Math.random() < 0.05) triggerMaintenance();
+                                    }
+                                })
+                                .catch(() => {});
+                        } else {
+                            touchItem(urlStr);
+                        }
+
+                        return responseToReturn;
                     }
 
-                    return responseToReturn;
+                    cacheMisses++;
+                    const networkResponse = await originalFetch.apply(this, args);
+
+                    const cacheability = getCacheability(networkResponse);
+                    if (cacheability) {
+                        if (cacheability === 'revalidate') forceRevalidateUrls.add(urlStr);
+                        cache.put(urlStr, networkResponse.clone())
+                            .then(() => {
+                                touchItem(urlStr);
+                                if (Math.random() < 0.05) triggerMaintenance();
+                            })
+                            .catch(() => {});
+                    }
+
+                    return networkResponse;
+                } catch (error) {
+                    return originalFetch.apply(this, args);
                 }
-
-                cacheMisses++;
-                const networkResponse = await originalFetch.apply(this, args);
-
-                const cacheability = getCacheability(networkResponse);
-                if (cacheability) {
-                    if (cacheability === 'revalidate') forceRevalidateUrls.add(urlStr);
-                    cache.put(urlStr, networkResponse.clone())
-                        .then(() => {
-                            touchItem(urlStr);
-                            if (Math.random() < 0.05) triggerMaintenance();
-                        })
-                        .catch(() => {});
-                }
-
-                return networkResponse;
-            } catch (error) {
-                return originalFetch.apply(this, args);
-            }
-        };
+            };
+        }
     }
 
     // Flush metadata on page hide — pagehide is bfcache-safe unlike beforeunload,
@@ -341,7 +350,7 @@
         const script = document.createElement('script');
         script.type = 'speculationrules';
         script.textContent = JSON.stringify(rules);
-        document.head.appendChild(script);
+        (document.head || document.documentElement).appendChild(script);
     }
 
     if (document.readyState === 'complete') {
@@ -386,7 +395,7 @@
 
         // Single delegated listener on document — works for SPA-injected links too
         document.addEventListener('pointerenter', (e) => {
-            const link = e.target.closest('a[href]');
+            const link = getClosestLinkTarget(e.target);
             if (!link) return;
             try {
                 const url = new URL(link.href);
@@ -449,12 +458,12 @@
 
         document.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return; // left click only
-            const link = e.target.closest('a[href]');
+            const link = getClosestLinkTarget(e.target);
             if (isEligible(link)) prefetch(link.href);
         }, { passive: true, capture: true });
 
         document.addEventListener('touchstart', (e) => {
-            const link = e.target.closest('a[href]');
+            const link = getClosestLinkTarget(e.target);
             if (isEligible(link)) prefetch(link.href);
         }, { passive: true, capture: true });
     }
