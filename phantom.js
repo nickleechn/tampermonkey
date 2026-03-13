@@ -20,7 +20,16 @@
         try {
             Object.defineProperty(obj, prop, { configurable: true, ...descriptor });
         } catch (e) {
-            if ('value' in descriptor) obj[prop] = descriptor.value;
+            if ('value' in descriptor) {
+                obj[prop] = descriptor.value;
+                return;
+            }
+            if ('get' in descriptor && obj.__defineGetter__) {
+                obj.__defineGetter__(prop, descriptor.get);
+            }
+            if ('set' in descriptor && obj.__defineSetter__) {
+                obj.__defineSetter__(prop, descriptor.set);
+            }
         }
     }
 
@@ -65,14 +74,15 @@
 
     // --- Notifications ---
     if (window.Notification) {
-        Object.defineProperty(Notification, 'permission', {
+        override(Notification, 'permission', {
             get: () => 'denied',
-            configurable: true,
         });
-        Notification.requestPermission = function () {
-            log('Blocked Notification.requestPermission');
-            return Promise.resolve('denied');
-        };
+        override(Notification, 'requestPermission', {
+            value: function () {
+                log('Blocked Notification.requestPermission');
+                return Promise.resolve('denied');
+            },
+        });
     }
 
     // --- Clipboard read ---
@@ -140,10 +150,9 @@
         }, true);
     }
     for (const prop of ['ondevicemotion', 'ondeviceorientation', 'ondeviceorientationabsolute']) {
-        Object.defineProperty(window, prop, {
+        override(window, prop, {
             set: () => log(`Blocked setting ${prop}`),
             get: () => null,
-            configurable: true,
         });
     }
 
@@ -181,10 +190,12 @@
 
     // --- Idle Detection ---
     if (window.IdleDetector) {
-        IdleDetector.requestPermission = function () {
-            log('Blocked IdleDetector.requestPermission');
-            return Promise.resolve('denied');
-        };
+        override(IdleDetector, 'requestPermission', {
+            value: function () {
+                log('Blocked IdleDetector.requestPermission');
+                return Promise.resolve('denied');
+            },
+        });
         override(IdleDetector.prototype, 'start', {
             value: function () {
                 log('Blocked IdleDetector.start');
@@ -227,7 +238,7 @@
     override(Navigator.prototype, 'sendBeacon', {
         value: function (url) {
             log(`Blocked sendBeacon to ${url}`);
-            return true;
+            return false;
         },
     });
 
@@ -419,17 +430,6 @@
     // --- Visibility API ---
     override(Document.prototype, 'hidden', { get: () => false });
     override(Document.prototype, 'visibilityState', { get: () => 'visible' });
-    
-    const originalDocAddListener = Document.prototype.addEventListener;
-    override(Document.prototype, 'addEventListener', {
-        value: function (type, listener, options) {
-            if (type === 'visibilitychange') {
-                log('Blocked visibilitychange listener');
-                return;
-            }
-            return originalDocAddListener.call(this, type, listener, options);
-        },
-    });
 
     // --- Cookie Consent Auto-Dismiss (reject all) ---
     const cookieDismiss = () => {
@@ -453,7 +453,7 @@
             '[id*="cookie"]', '[class*="cc-banner"]', '[class*="cc_banner"]', '[class*="CookieConsent"]',
         ];
 
-        const rejectPatterns = /^(reject|decline|deny|refuse|no thanks|only necessary|only essential|essentials only|necessary only|manage|settings|preferences|customize)/i;
+        const rejectPatterns = /^(reject|decline|deny|refuse|no thanks|only necessary|only essential|essentials only|necessary only)/i;
 
         for (const sel of rejectSelectors) {
             const btn = document.querySelector(sel);
@@ -500,7 +500,9 @@
                 }
             }, 300);
         });
-        observer.observe(document.body, { childList: true, subtree: true });
+        const target = document.body || document.documentElement;
+        if (!target) return;
+        observer.observe(target, { childList: true, subtree: true });
 
         setTimeout(() => observer.disconnect(), 15000);
     };
