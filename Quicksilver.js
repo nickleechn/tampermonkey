@@ -199,7 +199,11 @@
         return true;
     }
 
-    const shouldOverrideFetch = !navigator.serviceWorker || !navigator.serviceWorker.controller;
+    // Only override fetch if no SW is already controlling the page at document-start.
+    // If a SW registers and takes control later (controllerchange), we restore the
+    // original fetch so the SW's interception layer takes precedence.
+    const hasServiceWorker = 'serviceWorker' in navigator;
+    const shouldOverrideFetch = !hasServiceWorker || !navigator.serviceWorker.controller;
 
     if (shouldOverrideFetch && typeof unsafeWindow !== 'undefined') {
         let cachePromise = null;
@@ -289,6 +293,15 @@
                     return originalFetch.apply(this, args);
                 }
             };
+
+            // If a SW registers and takes control after document-start, restore the
+            // original fetch immediately so the SW's interception layer takes over.
+            if (hasServiceWorker) {
+                navigator.serviceWorker.addEventListener('controllerchange', () => {
+                    unsafeWindow.fetch = originalFetch;
+                    cachePromise = null;
+                }, { once: true });
+            }
         }
     }
 
