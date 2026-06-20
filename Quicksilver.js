@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Faster browsing hints plus a lightweight LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
 // @author       You
 // @match        *://*/*
-// @updateURL    https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.user.js
-// @downloadURL  https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.user.js
+// @updateURL    https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.js
+// @downloadURL  https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.js
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
 // @run-at       document-start
@@ -113,6 +113,7 @@
     ];
 
     const NO_STORE = /\bno-store\b/i;
+    const PRIVATE = /\bprivate\b/i;
     const FORCE_REVALIDATE = /\b(?:no-cache|must-revalidate)\b/i;
     const IMMUTABLE = /\bimmutable\b/i;
     const CACHEABLE_CONTENT_TYPES = /^(?:text\/css|text\/javascript|application\/javascript|application\/x-javascript|image\/|font\/|application\/font|application\/x-font|application\/wasm)/i;
@@ -271,6 +272,11 @@
         return ttlMs === Infinity || Date.now() - meta.cachedAt < ttlMs;
     }
 
+    function requiresSynchronousRevalidation(url) {
+        const meta = getMetadata(url);
+        return forceRevalidateUrls.has(url) || meta.forceRevalidate || meta.ttlMs === 0;
+    }
+
     function triggerMaintenance() {
         if ('requestIdleCallback' in window) window.requestIdleCallback(pruneCache, { timeout: 5000 });
         else setTimeout(pruneCache, 5000);
@@ -319,18 +325,36 @@
         if (!response || !response.ok || response.status === 206) return false;
 
         const cc = response.headers.get('Cache-Control') || '';
-        if (NO_STORE.test(cc)) return false;
+        if (NO_STORE.test(cc) || PRIVATE.test(cc) || FORCE_REVALIDATE.test(cc)) return false;
+        if (response.headers.has('Set-Cookie')) return false;
 
         const vary = response.headers.get('Vary') || '';
-        if (vary.trim() === '*') return false;
+        if (vary.trim()) return false;
 
         const ct = response.headers.get('Content-Type') || '';
         if (ct && !CACHEABLE_CONTENT_TYPES.test(ct)) return false;
 
+        const ttlMs = parseCacheTTL(response, cc);
+        if (ttlMs !== Infinity && (!Number.isFinite(ttlMs) || ttlMs <= 0)) return false;
+
         return {
-            ttlMs: parseCacheTTL(response, cc),
-            forceRevalidate: FORCE_REVALIDATE.test(cc)
+            ttlMs,
+            forceRevalidate: false
         };
+    }
+
+    function isReusableCachedResponse(response) {
+        if (!response || !response.ok || response.status === 206) return false;
+
+        const cc = response.headers.get('Cache-Control') || '';
+        if (NO_STORE.test(cc) || PRIVATE.test(cc) || FORCE_REVALIDATE.test(cc)) return false;
+        if (response.headers.has('Set-Cookie')) return false;
+
+        const vary = response.headers.get('Vary') || '';
+        if (vary.trim()) return false;
+
+        const ttlMs = parseCacheTTL(response, cc);
+        return ttlMs === Infinity || (Number.isFinite(ttlMs) && ttlMs > 0);
     }
 
     function headersHaveAuthorization(headers) {
@@ -378,12 +402,44 @@
 
             if (!url) return null;
 
+            const headers = init.headers || (requestLike && request.headers);
+            const credentials = init.credentials || (requestLike && request.credentials);
+            const mode = init.mode || (requestLike && request.mode);
+            const redirect = init.redirect || (requestLike && request.redirect);
+            const referrer = init.referrer || (requestLike && request.referrer);
+            const referrerPolicy = init.referrerPolicy || (requestLike && request.referrerPolicy);
+
             return {
                 url: url.href,
                 method: String(init.method || (requestLike && request.method) || 'GET').toUpperCase(),
                 cacheMode: init.cache || (requestLike && request.cache),
-                headers: init.headers || (requestLike && request.headers)
+                headers,
+                credentials,
+                mode,
+                redirect,
+                referrer,
+                referrerPolicy,
+                cacheRequest: makeCacheRequest(url.href, { headers, credentials, mode, redirect, referrer, referrerPolicy })
             };
+        }
+
+        function makeCacheRequest(url, source) {
+            if (typeof Request !== 'function') return url;
+
+            const init = { method: 'GET' };
+
+            if (source.headers) init.headers = source.headers;
+            if (source.credentials) init.credentials = source.credentials;
+            if (source.mode) init.mode = source.mode;
+            if (source.redirect) init.redirect = source.redirect;
+            if (source.referrer) init.referrer = source.referrer;
+            if (source.referrerPolicy) init.referrerPolicy = source.referrerPolicy;
+
+            try {
+                return new Request(url, init);
+            } catch (_) {
+                return new Request(url, { method: 'GET' });
+            }
         }
 
         function maybeScheduleMaintenance() {
@@ -394,19 +450,19 @@
             }
         }
 
-        async function revalidate(cache, url, thisArg, args) {
+        async function revalidate(cache, info, thisArg, args) {
             try {
                 const networkResponse = await originalFetch.apply(thisArg, args);
                 const cacheability = getCacheability(networkResponse);
                 if (!cacheability) return;
 
-                await cache.put(url, networkResponse.clone());
-                touchItem(url, cacheability);
+                await cache.put(info.cacheRequest, networkResponse.clone());
+                touchItem(info.url, cacheability);
                 maybeScheduleMaintenance();
             } catch (_) {
                 // Stale cache is still better than making page fetches fail.
             } finally {
-                inFlightRevalidations.delete(url);
+                inFlightRevalidations.delete(info.url);
             }
         }
 
@@ -421,23 +477,58 @@
                 || headersHaveAuthorization(info.headers);
 
             if (bypass) {
-                stats.bypassed += 1;
-                scheduleStatsSave();
+                if (info && info.method === 'GET' && CACHEABLE_EXTENSIONS.test(info.url)) {
+                    stats.bypassed += 1;
+                    scheduleStatsSave();
+                }
                 return originalFetch.apply(this, args);
             }
 
             try {
                 const cache = await getCache();
-                const cachedResponse = await cache.match(info.url);
+                let cachedResponse = await cache.match(info.cacheRequest);
+
+                if (cachedResponse && !isReusableCachedResponse(cachedResponse)) {
+                    await cache.delete(info.cacheRequest).catch(() => {});
+                    metadataMap.delete(info.url);
+                    forceRevalidateUrls.delete(info.url);
+                    scheduleFlush();
+                    cachedResponse = null;
+                }
 
                 if (cachedResponse) {
+                    if (isFresh(info.url)) {
+                        stats.hits += 1;
+                        scheduleStatsSave();
+                        touchItem(info.url);
+                        return cachedResponse.clone();
+                    }
+
+                    if (requiresSynchronousRevalidation(info.url)) {
+                        const networkResponse = await originalFetch.apply(this, args);
+                        const cacheability = getCacheability(networkResponse);
+                        if (cacheability) {
+                            cache.put(info.cacheRequest, networkResponse.clone())
+                                .then(() => {
+                                    touchItem(info.url, cacheability);
+                                    maybeScheduleMaintenance();
+                                })
+                                .catch(() => {});
+                        } else {
+                            cache.delete(info.cacheRequest).catch(() => {});
+                            metadataMap.delete(info.url);
+                            forceRevalidateUrls.delete(info.url);
+                            scheduleFlush();
+                        }
+                        stats.misses += 1;
+                        scheduleStatsSave();
+                        return networkResponse;
+                    }
+
                     stats.hits += 1;
                     scheduleStatsSave();
-
-                    if (isFresh(info.url)) {
-                        touchItem(info.url);
-                    } else if (!inFlightRevalidations.has(info.url)) {
-                        inFlightRevalidations.set(info.url, revalidate(cache, info.url, this, args));
+                    if (!inFlightRevalidations.has(info.url)) {
+                        inFlightRevalidations.set(info.url, revalidate(cache, info, this, args));
                     }
 
                     return cachedResponse.clone();
@@ -449,7 +540,7 @@
                 const cacheability = getCacheability(networkResponse);
 
                 if (cacheability) {
-                    cache.put(info.url, networkResponse.clone())
+                    cache.put(info.cacheRequest, networkResponse.clone())
                         .then(() => {
                             touchItem(info.url, cacheability);
                             maybeScheduleMaintenance();
@@ -531,7 +622,7 @@
                 'Estimated size: ' + sizeStr,
                 'Hits: ' + stats.hits + ' | Misses: ' + stats.misses,
                 'Hit rate: ' + hitRate + '% (of ' + total + ' cacheable fetches)',
-                'Not cached: ' + stats.bypassed + ' fetches (non-GET / API / non-asset)',
+                'Not cached: ' + stats.bypassed + ' asset-like fetches (reload/auth/skip policy)',
                 'TTL: ' + Math.round(getRevalidateTTL() / MINUTE) + ' min (' + (conn && conn.effectiveType || 'unknown') + ' connection)'
             ].join('\n'));
         });
