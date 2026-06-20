@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Faster browsing hints plus a lightweight LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
 // @author       You
 // @match        *://*/*
@@ -68,6 +68,7 @@
     const MAX_ITEMS = 1000;
     const PRUNE_CHUNK = 75;
     const METADATA_KEY = 'tm-cache-lru-metadata';
+    const STATS_KEY = 'tm-cache-stats';
     const FLUSH_DELAY = 2500;
     const TOUCH_WRITE_MIN_MS = 45 * SECOND;
     const WRITE_MAINTENANCE_INTERVAL = 25;
@@ -119,9 +120,40 @@
     let metadataMap = new Map();
     let metadataDirty = false;
     let flushTimer = null;
-    let cacheHits = 0;
-    let cacheMisses = 0;
     let cacheWritesSinceMaintenance = 0;
+
+    // Hit/miss/bypass counters persisted across page loads. In-memory counters
+    // alone always read ~0 because they reset on every navigation and the cache
+    // only ever sees window.fetch() traffic (a small slice of page loads).
+    function loadStats() {
+        try {
+            const raw = localStorage.getItem(STATS_KEY);
+            if (raw) {
+                const obj = JSON.parse(raw);
+                return {
+                    hits: Number(obj.hits) || 0,
+                    misses: Number(obj.misses) || 0,
+                    bypassed: Number(obj.bypassed) || 0
+                };
+            }
+        } catch (_) {}
+        return { hits: 0, misses: 0, bypassed: 0 };
+    }
+
+    const stats = loadStats();
+    let statsTimer = null;
+
+    function saveStats() {
+        statsTimer = null;
+        try {
+            localStorage.setItem(STATS_KEY, JSON.stringify(stats));
+        } catch (_) {}
+    }
+
+    function scheduleStatsSave() {
+        if (statsTimer) return;
+        statsTimer = setTimeout(saveStats, FLUSH_DELAY);
+    }
 
     function normalizeMetadata(value) {
         if (value && typeof value === 'object') {
@@ -388,14 +420,19 @@
                 || info.cacheMode === 'no-store'
                 || headersHaveAuthorization(info.headers);
 
-            if (bypass) return originalFetch.apply(this, args);
+            if (bypass) {
+                stats.bypassed += 1;
+                scheduleStatsSave();
+                return originalFetch.apply(this, args);
+            }
 
             try {
                 const cache = await getCache();
                 const cachedResponse = await cache.match(info.url);
 
                 if (cachedResponse) {
-                    cacheHits += 1;
+                    stats.hits += 1;
+                    scheduleStatsSave();
 
                     if (isFresh(info.url)) {
                         touchItem(info.url);
@@ -406,7 +443,8 @@
                     return cachedResponse.clone();
                 }
 
-                cacheMisses += 1;
+                stats.misses += 1;
+                scheduleStatsSave();
                 const networkResponse = await originalFetch.apply(this, args);
                 const cacheability = getCacheability(networkResponse);
 
@@ -450,8 +488,16 @@
                 localStorage.removeItem(METADATA_KEY);
             } catch (_) {}
 
-            cacheHits = 0;
-            cacheMisses = 0;
+            stats.hits = 0;
+            stats.misses = 0;
+            stats.bypassed = 0;
+            if (statsTimer) {
+                clearTimeout(statsTimer);
+                statsTimer = null;
+            }
+            try {
+                localStorage.removeItem(STATS_KEY);
+            } catch (_) {}
             alert('Quicksilver asset cache purged for this origin.');
         });
 
@@ -473,24 +519,28 @@
                 estimatedSize = sample.length ? sampleSize / sample.length * itemCount : 0;
             } catch (_) {}
 
-            const total = cacheHits + cacheMisses;
-            const hitRate = total ? (cacheHits / total * 100).toFixed(1) : 'N/A';
+            const total = stats.hits + stats.misses;
+            const hitRate = total ? (stats.hits / total * 100).toFixed(1) : 'N/A';
             const sizeStr = estimatedSize > 1048576
                 ? (estimatedSize / 1048576).toFixed(1) + ' MB'
                 : Math.round(estimatedSize / 1024) + ' KB';
 
             alert([
-                'Quicksilver Cache Stats (this page)',
+                'Quicksilver Cache Stats (cumulative, this origin)',
                 'Cached items: ' + itemCount,
                 'Estimated size: ' + sizeStr,
-                'Hits: ' + cacheHits + ' | Misses: ' + cacheMisses,
-                'Hit rate: ' + hitRate + '%',
+                'Hits: ' + stats.hits + ' | Misses: ' + stats.misses,
+                'Hit rate: ' + hitRate + '% (of ' + total + ' cacheable fetches)',
+                'Not cached: ' + stats.bypassed + ' fetches (non-GET / API / non-asset)',
                 'TTL: ' + Math.round(getRevalidateTTL() / MINUTE) + ' min (' + (conn && conn.effectiveType || 'unknown') + ' connection)'
             ].join('\n'));
         });
     }
 
-    window.addEventListener('pagehide', flushMetadata);
+    window.addEventListener('pagehide', () => {
+        flushMetadata();
+        saveStats();
+    });
 
     // =========================================================================
     // Part 2: Speculation Rules prefetch/prerender
