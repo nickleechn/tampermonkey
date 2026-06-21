@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Faster browsing hints plus a lightweight LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
 // @author       You
 // @match        *://*/*
@@ -72,6 +72,7 @@
     const FLUSH_DELAY = 2500;
     const TOUCH_WRITE_MIN_MS = 45 * SECOND;
     const WRITE_MAINTENANCE_INTERVAL = 25;
+    const HEURISTIC_MAX_TTL = 24 * HOUR;
 
     function getRevalidateTTL() {
         if (!conn) return HOUR;
@@ -145,7 +146,10 @@
     let statsTimer = null;
 
     function saveStats() {
-        statsTimer = null;
+        if (statsTimer) {
+            clearTimeout(statsTimer);
+            statsTimer = null;
+        }
         try {
             localStorage.setItem(STATS_KEY, JSON.stringify(stats));
         } catch (_) {}
@@ -312,20 +316,35 @@
         if (maxAge) return Number(maxAge[1]) * SECOND;
 
         const expires = response.headers.get('Expires');
-        if (!expires) return null;
+        if (expires) {
+            const expiresAt = Date.parse(expires);
+            if (!Number.isNaN(expiresAt)) {
+                const dateAt = Date.parse(response.headers.get('Date') || '') || Date.now();
+                return Math.max(0, expiresAt - dateAt);
+            }
+        }
 
-        const expiresAt = Date.parse(expires);
-        if (Number.isNaN(expiresAt)) return null;
+        // Heuristic freshness (RFC 7234 §4.2.2): cache for a fraction of the time
+        // since the asset last changed, capped. Lets us cache header-less assets
+        // the browser's HTTP cache would otherwise treat as always-stale.
+        const lastModified = response.headers.get('Last-Modified');
+        if (lastModified) {
+            const lastModifiedAt = Date.parse(lastModified);
+            if (!Number.isNaN(lastModifiedAt)) {
+                const dateAt = Date.parse(response.headers.get('Date') || '') || Date.now();
+                const heuristic = (dateAt - lastModifiedAt) * 0.1;
+                if (heuristic > 0) return Math.min(heuristic, HEURISTIC_MAX_TTL);
+            }
+        }
 
-        const dateAt = Date.parse(response.headers.get('Date') || '') || Date.now();
-        return Math.max(0, expiresAt - dateAt);
+        return null;
     }
 
     function getCacheability(response) {
         if (!response || !response.ok || response.status === 206) return false;
 
         const cc = response.headers.get('Cache-Control') || '';
-        if (NO_STORE.test(cc) || PRIVATE.test(cc) || FORCE_REVALIDATE.test(cc)) return false;
+        if (NO_STORE.test(cc) || PRIVATE.test(cc)) return false;
         if (response.headers.has('Set-Cookie')) return false;
 
         const vary = response.headers.get('Vary') || '';
@@ -334,12 +353,18 @@
         const ct = response.headers.get('Content-Type') || '';
         if (ct && !CACHEABLE_CONTENT_TYPES.test(ct)) return false;
 
+        // no-cache / must-revalidate assets are storable, but must be revalidated
+        // before every reuse (network-first, stale only as offline fallback).
+        const forceRevalidate = FORCE_REVALIDATE.test(cc);
         const ttlMs = parseCacheTTL(response, cc);
-        if (ttlMs !== Infinity && (!Number.isFinite(ttlMs) || ttlMs <= 0)) return false;
+
+        // TTL is irrelevant for force-revalidate entries (they always hit the
+        // network first), so only reject on a bad TTL for normal entries.
+        if (!forceRevalidate && ttlMs !== Infinity && (!Number.isFinite(ttlMs) || ttlMs <= 0)) return false;
 
         return {
             ttlMs,
-            forceRevalidate: false
+            forceRevalidate
         };
     }
 
@@ -347,11 +372,15 @@
         if (!response || !response.ok || response.status === 206) return false;
 
         const cc = response.headers.get('Cache-Control') || '';
-        if (NO_STORE.test(cc) || PRIVATE.test(cc) || FORCE_REVALIDATE.test(cc)) return false;
+        if (NO_STORE.test(cc) || PRIVATE.test(cc)) return false;
         if (response.headers.has('Set-Cookie')) return false;
 
         const vary = response.headers.get('Vary') || '';
         if (vary.trim()) return false;
+
+        // Stored no-cache/must-revalidate copies stay reusable as the stale
+        // fallback that SWR serves while a revalidation is in flight.
+        if (FORCE_REVALIDATE.test(cc)) return true;
 
         const ttlMs = parseCacheTTL(response, cc);
         return ttlMs === Infinity || (Number.isFinite(ttlMs) && ttlMs > 0);
@@ -402,17 +431,17 @@
 
             if (!url) return null;
 
-            const headers = init.headers || (requestLike && request.headers);
-            const credentials = init.credentials || (requestLike && request.credentials);
-            const mode = init.mode || (requestLike && request.mode);
-            const redirect = init.redirect || (requestLike && request.redirect);
-            const referrer = init.referrer || (requestLike && request.referrer);
-            const referrerPolicy = init.referrerPolicy || (requestLike && request.referrerPolicy);
+            const headers = init.headers || (requestLike ? request.headers : undefined);
+            const credentials = init.credentials || (requestLike ? request.credentials : undefined);
+            const mode = init.mode || (requestLike ? request.mode : undefined);
+            const redirect = init.redirect || (requestLike ? request.redirect : undefined);
+            const referrer = init.referrer || (requestLike ? request.referrer : undefined);
+            const referrerPolicy = init.referrerPolicy || (requestLike ? request.referrerPolicy : undefined);
 
             return {
                 url: url.href,
-                method: String(init.method || (requestLike && request.method) || 'GET').toUpperCase(),
-                cacheMode: init.cache || (requestLike && request.cache),
+                method: String(init.method || (requestLike ? request.method : '') || 'GET').toUpperCase(),
+                cacheMode: init.cache || (requestLike ? request.cache : undefined),
                 headers,
                 credentials,
                 mode,
@@ -505,7 +534,15 @@
                     }
 
                     if (requiresSynchronousRevalidation(info.url)) {
-                        const networkResponse = await originalFetch.apply(this, args);
+                        let networkResponse;
+                        try {
+                            networkResponse = await originalFetch.apply(this, args);
+                        } catch (_) {
+                            // Revalidation failed (offline/error): the stale copy
+                            // beats surfacing a network failure to the page.
+                            return cachedResponse.clone();
+                        }
+
                         const cacheability = getCacheability(networkResponse);
                         if (cacheability) {
                             cache.put(info.cacheRequest, networkResponse.clone())
@@ -566,7 +603,9 @@
 
     if (typeof GM_registerMenuCommand !== 'undefined') {
         GM_registerMenuCommand('Purge Asset Cache (Current Origin)', async () => {
-            await caches.delete(CACHE_NAME);
+            try {
+                await caches.delete(CACHE_NAME);
+            } catch (_) {}
             metadataMap.clear();
             forceRevalidateUrls.clear();
             metadataDirty = false;
