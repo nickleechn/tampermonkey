@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.1
+// @version      1.0.2
 // @description  Safari-friendly browsing acceleration using safe connection, navigation, and font hints.
 // @author       nickleechn
 // @match        *://*/*
@@ -97,7 +97,10 @@
         if (!link || link.hasAttribute('download') || hasUnsafeRelationship(link)) return false;
 
         const target = (link.getAttribute('target') || '').trim().toLowerCase();
-        if (target && target !== '_self') return false;
+        // With @noframes this script only runs in the top-level document, so
+        // _top is the same browsing context as _self. Google uses _top for
+        // ordinary navigation such as its Images link.
+        if (target && target !== '_self' && target !== '_top') return false;
 
         const rawHref = link.getAttribute('href') || '';
         if (!rawHref || DOWNLOAD_EXTENSION.test(rawHref)) return false;
