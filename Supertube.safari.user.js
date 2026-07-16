@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.2
+// @version      1.0.3
 // @description  Safari-friendly YouTube cleanup and automatic highest-quality selection.
 // @author       nickleechn
 // @match        https://www.youtube.com/*
@@ -68,6 +68,7 @@
     let stopped = true;
     let styleInstalled = false;
     let currentVideoKey = '';
+    let completedVideoKey = '';
     let activeScheduleKey = '';
     let menuAttempts = 0;
     let observer = null;
@@ -206,6 +207,7 @@
     async function selectHighestQuality(reason) {
         if (stopped || qualitySelectionRunning || menuAttempts >= MAX_MENU_ATTEMPTS_PER_VIDEO) return;
         const expectedVideoKey = getVideoKey();
+        if (completedVideoKey === expectedVideoKey) return;
         const player = getPlayer();
         if (!player || !getSettingsButton(player)) return;
 
@@ -235,6 +237,11 @@
             if (!choice.selected) choice.item.click();
             else closeSettings(player);
 
+            // One successful pass is enough for this video. Cancel the other
+            // delayed passes so the settings menu does not repeatedly flash.
+            completedVideoKey = expectedVideoKey;
+            clearApplyTimers();
+
         } catch (_) {
             closeSettings(player);
         } finally {
@@ -253,6 +260,7 @@
 
     function scheduleQualitySelection(reason, force) {
         const videoKey = getVideoKey();
+        if (completedVideoKey === videoKey) return;
         if (!force && activeScheduleKey === videoKey) return;
 
         clearApplyTimers();
@@ -269,6 +277,7 @@
         const changed = nextVideoKey !== currentVideoKey;
         if (changed) {
             currentVideoKey = nextVideoKey;
+            completedVideoKey = '';
             menuAttempts = 0;
             qualitySelectionRunning = false;
             attachVideoListeners();
@@ -414,6 +423,7 @@
         if (!stopped) return;
         stopped = false;
         menuAttempts = 0;
+        completedVideoKey = '';
 
         installStyles();
         installPreconnects();
