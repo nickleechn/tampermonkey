@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.1
+// @version      1.0.2
 // @description  Safari-friendly YouTube cleanup and automatic highest-quality selection.
 // @author       nickleechn
 // @match        https://www.youtube.com/*
@@ -65,7 +65,8 @@
     const cleanupCallbacks = [];
     const preconnectHints = new Set();
 
-    let stopped = false;
+    let stopped = true;
+    let styleInstalled = false;
     let currentVideoKey = '';
     let activeScheduleKey = '';
     let menuAttempts = 0;
@@ -334,14 +335,33 @@
     }
 
     function installStyles() {
-        try {
-            const result = GM.addStyle(CSS);
-            if (result && typeof result.catch === 'function') result.catch(function () {});
-        } catch (_) {
+        if (styleInstalled) return;
+
+        const installFallbackStyle = function () {
+            if (styleInstalled) return;
             const style = document.createElement('style');
             style.textContent = CSS;
             (document.head || document.documentElement).appendChild(style);
-            cleanupCallbacks.push(function () { style.remove(); });
+            styleInstalled = true;
+        };
+
+        try {
+            if (typeof GM !== 'object' || typeof GM.addStyle !== 'function') {
+                installFallbackStyle();
+                return;
+            }
+
+            const result = GM.addStyle(CSS);
+            styleInstalled = true;
+            if (result && typeof result.catch === 'function') {
+                result.catch(function () {
+                    styleInstalled = false;
+                    installFallbackStyle();
+                });
+            }
+        } catch (_) {
+            styleInstalled = false;
+            installFallbackStyle();
         }
     }
 
@@ -366,8 +386,16 @@
         clearApplyTimers();
         for (const timer of timers) window.clearTimeout(timer);
         timers.clear();
-        if (observer) observer.disconnect();
-        if (removeVideoListeners) removeVideoListeners();
+        if (observer) {
+            observer.disconnect();
+            observer = null;
+        }
+        observerTimer = 0;
+        if (removeVideoListeners) {
+            removeVideoListeners();
+            removeVideoListeners = null;
+        }
+        qualitySelectionRunning = false;
         while (cleanupCallbacks.length) cleanupCallbacks.pop()();
         for (const hint of preconnectHints) hint.remove();
         preconnectHints.clear();
@@ -382,13 +410,25 @@
         scheduleQualitySelection('startup', true);
     }
 
-    installStyles();
-    installPreconnects();
-    addListener(window, 'pagehide', cleanup, { once: true });
+    function activate() {
+        if (!stopped) return;
+        stopped = false;
+        menuAttempts = 0;
 
-    if (document.readyState === 'loading') {
-        addListener(document, 'DOMContentLoaded', start, { once: true });
-    } else {
-        start();
+        installStyles();
+        installPreconnects();
+
+        if (document.readyState === 'loading') {
+            addListener(document, 'DOMContentLoaded', start, { once: true });
+        } else {
+            start();
+        }
     }
+
+    // Safari can keep this document alive in its back/forward cache. These
+    // lifecycle listeners must survive cleanup so pageshow can reactivate the
+    // same userscript instance without duplicating per-page listeners.
+    window.addEventListener('pagehide', cleanup);
+    window.addEventListener('pageshow', activate);
+    activate();
 })();
