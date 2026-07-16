@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.0
+// @version      1.0.1
 // @description  Safari-friendly YouTube cleanup and automatic highest-quality selection.
 // @author       nickleechn
 // @match        https://www.youtube.com/*
@@ -23,6 +23,8 @@
 
     const APPLY_DELAYS_MS = [250, 1000, 2500, 5000];
     const MENU_WAIT_MS = 150;
+    const QUALITY_MENU_TIMEOUT_MS = 1500;
+    const QUALITY_MENU_POLL_MS = 75;
     const MAX_MENU_ATTEMPTS_PER_VIDEO = 4;
     const PRECONNECT_HOSTS = [
         'https://i.ytimg.com',
@@ -137,8 +139,11 @@
     }
 
     function parseQuality(item) {
-        const text = normalizeText(item.textContent);
-        const resolutionMatch = text.match(/(?:^|\s)(\d{3,4})p(?:\s|$)/i);
+        const text = normalizeText([
+            item.textContent,
+            item.getAttribute('aria-label')
+        ].filter(Boolean).join(' '));
+        const resolutionMatch = text.match(/(?:^|\s)(\d{3,4})p(?:\d{2,3})?(?=\s|$)/i);
         if (!resolutionMatch) return null;
 
         return {
@@ -157,6 +162,19 @@
             return 0;
         });
         return choices[0] || null;
+    }
+
+    async function waitForQualityChoices(player) {
+        const deadline = Date.now() + QUALITY_MENU_TIMEOUT_MS;
+        while (!stopped && Date.now() < deadline) {
+            const choices = getVisibleMenuItems(player).map(parseQuality).filter(Boolean);
+            // The parent settings menu includes one current-quality label
+            // (for example "Quality Auto (480p)"). Waiting for at least two
+            // resolutions prevents mistaking that row for the submenu.
+            if (choices.length > 1) return choices;
+            await wait(QUALITY_MENU_POLL_MS);
+        }
+        return [];
     }
 
     async function openQualityMenu(player) {
@@ -199,7 +217,15 @@
                 return;
             }
 
-            const choice = chooseHighestQuality(getVisibleMenuItems(player));
+            const qualityChoices = await waitForQualityChoices(player);
+            if (expectedVideoKey !== getVideoKey()) {
+                closeSettings(player);
+                return;
+            }
+
+            const choice = chooseHighestQuality(qualityChoices.map(function (entry) {
+                return entry.item;
+            }));
             if (!choice) {
                 closeSettings(player);
                 return;
