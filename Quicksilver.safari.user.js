@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.0
+// @version      1.0.1
 // @description  Safari-friendly browsing acceleration using safe connection, navigation, and font hints.
 // @author       nickleechn
 // @match        *://*/*
@@ -21,7 +21,6 @@
     const MAX_PRECONNECTS = 8;
     const MAX_WARMED_URLS = 64;
     const WARM_HINT_LIFETIME_MS = 15000;
-    const FONT_OBSERVER_LIFETIME_MS = 30000;
     const DOWNLOAD_EXTENSION = /\.(?:7z|apk|avi|bin|deb|dmg|docx?|exe|flv|gz|img|iso|mkv|mov|mp3|mp4|msi|pdf|pkg|pptx?|rar|rpm|tar|webm|wmv|xlsx?|zip)(?:$|[?#])/i;
     const SENSITIVE_PATH = /(?:^|[-_/])(?:account|admin|auth|cart|checkout|delete|destroy|disable|login|logout|order|payment|remove|revoke|sign[-_]?in|sign[-_]?out|unsubscribe)(?:$|[-_/])/i;
     const SENSITIVE_QUERY_KEY = /^(?:access_token|action|auth|code|delete|destroy|disable|logout|password|remove|revoke|session|signout|token|unsubscribe)$/i;
@@ -33,9 +32,9 @@
     const cleanupCallbacks = [];
     const timers = new Set();
 
-    let stopped = false;
+    let stopped = true;
     let fontObserver = null;
-    let fontPatchFrame = 0;
+    let fontPatchTimer = 0;
 
     function isSlowOrMeteredConnection() {
         return Boolean(connection && (
@@ -68,7 +67,9 @@
     }
 
     function getLink(target) {
-        return target instanceof Element ? target.closest('a[href]') : null;
+        return target && target.nodeType === 1 && typeof target.closest === 'function'
+            ? target.closest('a[href]')
+            : null;
     }
 
     function parseHttpUrl(value) {
@@ -206,7 +207,7 @@
     }
 
     function patchSameOriginFonts() {
-        fontPatchFrame = 0;
+        fontPatchTimer = 0;
         for (const sheet of document.styleSheets) {
             if (!isSameOriginStyleSheet(sheet)) continue;
             try {
@@ -216,8 +217,10 @@
     }
 
     function scheduleFontPatch() {
-        if (stopped || fontPatchFrame) return;
-        fontPatchFrame = window.requestAnimationFrame(patchSameOriginFonts);
+        if (stopped || fontPatchTimer) return;
+        // Safari may throttle requestAnimationFrame in background tabs. A
+        // zero-delay task also gives newly inserted stylesheets time to parse.
+        fontPatchTimer = schedule(patchSameOriginFonts, 0);
     }
 
     function installFontObserver() {
@@ -227,19 +230,15 @@
         fontObserver = new MutationObserver(function (mutations) {
             const hasStyleChange = mutations.some(function (mutation) {
                 return Array.from(mutation.addedNodes).some(function (node) {
-                    return node instanceof Element && (node.matches('style, link[rel~="stylesheet"]') || node.querySelector('style, link[rel~="stylesheet"]'));
+                    if (!node || node.nodeType !== 1) return false;
+                    return (typeof node.matches === 'function' && node.matches('style, link[rel~="stylesheet"]')) ||
+                        (typeof node.querySelector === 'function' && node.querySelector('style, link[rel~="stylesheet"]'));
                 });
             });
             if (hasStyleChange) scheduleFontPatch();
         });
 
         fontObserver.observe(document.documentElement, { childList: true, subtree: true });
-        schedule(function () {
-            if (fontObserver) {
-                fontObserver.disconnect();
-                fontObserver = null;
-            }
-        }, FONT_OBSERVER_LIFETIME_MS);
     }
 
     function runWhenDomReady(callback) {
@@ -258,8 +257,11 @@
         for (const timer of timers) clearTimeout(timer);
         timers.clear();
 
-        if (fontObserver) fontObserver.disconnect();
-        if (fontPatchFrame) cancelAnimationFrame(fontPatchFrame);
+        if (fontObserver) {
+            fontObserver.disconnect();
+            fontObserver = null;
+        }
+        fontPatchTimer = 0;
         for (const hint of preconnects.values()) hint.remove();
         for (const hint of warmHints) hint.remove();
 
@@ -268,10 +270,21 @@
         warmHints.clear();
     }
 
-    addListener(document, 'pointerover', handlePointerIntent, { passive: true, capture: true });
-    addListener(document, 'focusin', handleFocusIntent, true);
-    addListener(document, 'mousedown', handleMouseDown, { passive: true, capture: true });
-    addListener(document, 'touchstart', handleTouchStart, { passive: true, capture: true });
-    addListener(window, 'pagehide', cleanup, { once: true });
-    runWhenDomReady(installFontObserver);
+    function activate() {
+        if (!stopped) return;
+        stopped = false;
+
+        addListener(document, 'pointerover', handlePointerIntent, { passive: true, capture: true });
+        addListener(document, 'focusin', handleFocusIntent, true);
+        addListener(document, 'mousedown', handleMouseDown, { passive: true, capture: true });
+        addListener(document, 'touchstart', handleTouchStart, { passive: true, capture: true });
+        runWhenDomReady(installFontObserver);
+    }
+
+    // Keep lifecycle listeners outside cleanupCallbacks. Safari can preserve
+    // this document in its back/forward cache after pagehide, so pageshow must
+    // be able to reactivate the same userscript instance when it is restored.
+    window.addEventListener('pagehide', cleanup);
+    window.addEventListener('pageshow', activate);
+    activate();
 })();
