@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.2
+// @version      1.1.0
 // @description  Safari-friendly browsing acceleration using safe connection, navigation, and font hints.
 // @author       nickleechn
 // @match        *://*/*
@@ -20,28 +20,35 @@
 
     const MAX_PRECONNECTS = 8;
     const MAX_WARMED_URLS = 64;
-    const WARM_HINT_LIFETIME_MS = 15000;
+    const MAX_INFLIGHT_WARMS = 2;
     const DOWNLOAD_EXTENSION = /\.(?:7z|apk|avi|bin|deb|dmg|docx?|exe|flv|gz|img|iso|mkv|mov|mp3|mp4|msi|pdf|pkg|pptx?|rar|rpm|tar|webm|wmv|xlsx?|zip)(?:$|[?#])/i;
-    const SENSITIVE_PATH = /(?:^|[-_/])(?:account|admin|auth|cart|checkout|delete|destroy|disable|login|logout|order|payment|remove|revoke|sign[-_]?in|sign[-_]?out|unsubscribe)(?:$|[-_/])/i;
-    const SENSITIVE_QUERY_KEY = /^(?:access_token|action|auth|code|delete|destroy|disable|logout|password|remove|revoke|session|signout|token|unsubscribe)$/i;
+    // Prefer false positives over warming authenticated or mutating GETs.
+    const SENSITIVE_PATH = /(?:^|[-_/])(?:account|admin|api|auth|billing|cart|checkout|confirm|dashboard|delete|destroy|disable|edit|graphql|login|logout|messages?|order|password|payment|profile|register|remove|reset|revoke|settings|sign[-_]?in|sign[-_]?out|signup|subscribe|unsubscribe)(?:$|[-_/])/i;
+    const SENSITIVE_QUERY_KEY = /^(?:access_token|action|auth|code|delete|destroy|disable|logout|password|redirect|remove|revoke|session|signout|token|unsubscribe)$/i;
 
     const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
     const preconnects = new Map();
     const warmedUrls = new Set();
-    const warmHints = new Set();
+    const warmControllers = new Set();
     const cleanupCallbacks = [];
     const timers = new Set();
 
     let stopped = true;
     let fontObserver = null;
     let fontPatchTimer = 0;
+    let inflightWarms = 0;
 
     function isSlowOrMeteredConnection() {
-        return Boolean(connection && (
-            connection.saveData ||
-            connection.effectiveType === 'slow-2g' ||
-            connection.effectiveType === '2g'
-        ));
+        if (connection) {
+            if (connection.saveData) return true;
+            if (connection.effectiveType === 'slow-2g' || connection.effectiveType === '2g') return true;
+        }
+
+        // Safari does not expose Network Information API. Use coarse signals so
+        // warming still backs off when the tab is hidden or the browser is offline.
+        if (typeof navigator.onLine === 'boolean' && !navigator.onLine) return true;
+        if (document.visibilityState === 'hidden') return true;
+        return false;
     }
 
     function addListener(target, type, listener, options) {
@@ -67,8 +74,9 @@
     }
 
     function getLink(target) {
-        return target && target.nodeType === 1 && typeof target.closest === 'function'
-            ? target.closest('a[href]')
+        const el = target && target.nodeType === 3 ? target.parentElement : target;
+        return el && el.nodeType === 1 && typeof el.closest === 'function'
+            ? el.closest('a[href]')
             : null;
     }
 
@@ -143,27 +151,57 @@
     }
 
     function warmNavigation(link) {
-        if (stopped || isSlowOrMeteredConnection() || !isEligibleNavigation(link)) return;
+        if (stopped || isSlowOrMeteredConnection() || inflightWarms >= MAX_INFLIGHT_WARMS) return;
+        if (!isEligibleNavigation(link)) return;
 
-        const url = new URL(link.href);
+        const url = parseHttpUrl(link.href);
+        if (!url || url.origin !== location.origin) return;
         url.hash = '';
         if (warmedUrls.has(url.href)) return;
         rememberBounded(warmedUrls, url.href, MAX_WARMED_URLS);
 
-        const parent = document.head || document.documentElement;
-        if (!parent) return;
+        // Safari leaves <link rel="prefetch"> disabled. Same-origin fetch can
+        // still populate the HTTP cache ahead of the impending navigation.
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        if (controller) warmControllers.add(controller);
+        inflightWarms += 1;
 
-        const hint = document.createElement('link');
-        hint.rel = 'prefetch';
-        hint.href = url.href;
-        hint.referrerPolicy = 'strict-origin-when-cross-origin';
-        parent.appendChild(hint);
-        warmHints.add(hint);
+        const request = {
+            method: 'GET',
+            credentials: 'same-origin',
+            // Fail closed on cross-origin redirects while allowing same-origin hops.
+            mode: 'same-origin',
+            // Use cache when present; otherwise fetch and store for the click.
+            cache: 'force-cache',
+            redirect: 'follow',
+            // Chromium honors this; Safari ignores it safely.
+            priority: 'low',
+            referrerPolicy: 'strict-origin-when-cross-origin',
+            headers: {
+                Purpose: 'prefetch',
+                'Sec-Purpose': 'prefetch'
+            }
+        };
+        if (controller) request.signal = controller.signal;
 
-        schedule(function () {
-            hint.remove();
-            warmHints.delete(hint);
-        }, WARM_HINT_LIFETIME_MS);
+        Promise.resolve()
+            .then(function () {
+                return fetch(url.href, request);
+            })
+            .then(function (response) {
+                // Drain the body so the response can settle into cache/memory.
+                if (response && response.body && typeof response.body.cancel === 'function') {
+                    return response.body.cancel();
+                }
+                return response && typeof response.arrayBuffer === 'function'
+                    ? response.arrayBuffer().then(function () {})
+                    : undefined;
+            })
+            .catch(function () {})
+            .then(function () {
+                inflightWarms = Math.max(0, inflightWarms - 1);
+                if (controller) warmControllers.delete(controller);
+            });
     }
 
     function handlePointerIntent(event) {
@@ -172,9 +210,9 @@
     }
 
     function handleFocusIntent(event) {
-        const link = getLink(event.target);
-        preconnectForLink(link);
-        warmNavigation(link);
+        // Preconnect only on focus. Full document warming on every focused
+        // nav link is too aggressive for keyboard traversal.
+        preconnectForLink(getLink(event.target));
     }
 
     function handleMouseDown(event) {
@@ -265,12 +303,17 @@
             fontObserver = null;
         }
         fontPatchTimer = 0;
-        for (const hint of preconnects.values()) hint.remove();
-        for (const hint of warmHints) hint.remove();
+        for (const controller of warmControllers) {
+            try {
+                controller.abort();
+            } catch (_) {}
+        }
+        warmControllers.clear();
+        inflightWarms = 0;
 
+        for (const hint of preconnects.values()) hint.remove();
         preconnects.clear();
         warmedUrls.clear();
-        warmHints.clear();
     }
 
     function activate() {
