@@ -1,11 +1,10 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.3
+// @version      1.1.0
 // @description  Safari-friendly YouTube cleanup and automatic highest-quality selection.
 // @author       nickleechn
 // @match        https://www.youtube.com/*
-// @match        https://m.youtube.com/*
 // @match        https://www.youtube-nocookie.com/*
 // @exclude      https://www.youtube.com/live_chat*
 // @inject-into  content
@@ -23,13 +22,18 @@
 
     const APPLY_DELAYS_MS = [250, 1000, 2500, 5000];
     const MENU_WAIT_MS = 150;
-    const QUALITY_MENU_TIMEOUT_MS = 1500;
-    const QUALITY_MENU_POLL_MS = 75;
-    const MAX_MENU_ATTEMPTS_PER_VIDEO = 4;
+    const MAX_ATTEMPTS_PER_VIDEO = 4;
+    const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+    const QUALITY_ORDER = [
+        'highres', 'hd2880', 'hd2160', 'hd1440',
+        'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'
+    ];
+    const PREMIUM_RE = /\b(?:premium|enhanced bitrate)\b/i;
+    // Apex googlevideo.com does not warm the real CDN hosts (rr*---sn-*.googlevideo.com).
     const PRECONNECT_HOSTS = [
         'https://i.ytimg.com',
         'https://yt3.ggpht.com',
-        'https://googlevideo.com'
+        'https://s.ytimg.com'
     ];
     const CSS = `
         ytd-video-preview,
@@ -69,8 +73,9 @@
     let styleInstalled = false;
     let currentVideoKey = '';
     let completedVideoKey = '';
+    let premiumAttemptedKey = '';
     let activeScheduleKey = '';
-    let menuAttempts = 0;
+    let attempts = 0;
     let observer = null;
     let observerTimer = 0;
     let watchedVideo = null;
@@ -93,6 +98,13 @@
         return timer;
     }
 
+    function cancelTimer(timer) {
+        if (!timer) return;
+        window.clearTimeout(timer);
+        timers.delete(timer);
+        applyTimers.delete(timer);
+    }
+
     function scheduleApply(callback, delay) {
         const timer = schedule(function () {
             applyTimers.delete(timer);
@@ -104,7 +116,11 @@
 
     function wait(delay) {
         return new Promise(function (resolve) {
-            schedule(resolve, delay);
+            const timer = window.setTimeout(function () {
+                timers.delete(timer);
+                resolve();
+            }, delay);
+            timers.add(timer);
         });
     }
 
@@ -118,6 +134,14 @@
             return url.searchParams.get('v') || url.pathname;
         } catch (_) {
             return location.href;
+        }
+    }
+
+    function isWatchPage() {
+        try {
+            return Boolean(new URL(location.href).searchParams.get('v'));
+        } catch (_) {
+            return false;
         }
     }
 
@@ -140,6 +164,84 @@
         if (button && button.getAttribute('aria-expanded') === 'true') button.click();
     }
 
+    function getAvailableQualityLevels(player) {
+        if (!player || typeof player.getAvailableQualityLevels !== 'function') return [];
+        try {
+            const levels = player.getAvailableQualityLevels();
+            return Array.isArray(levels) ? levels.filter(Boolean) : [];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function getAvailableQualityData(player) {
+        if (!player || typeof player.getAvailableQualityData !== 'function') return [];
+        try {
+            const data = player.getAvailableQualityData();
+            return Array.isArray(data) ? data.filter(Boolean) : [];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function rankQuality(quality) {
+        const index = QUALITY_ORDER.indexOf(quality);
+        return index === -1 ? QUALITY_ORDER.length : index;
+    }
+
+    function chooseTargetQuality(levels, qualityData) {
+        const uniqueLevels = Array.from(new Set(levels)).sort(function (left, right) {
+            return rankQuality(left) - rankQuality(right);
+        });
+        if (!uniqueLevels.length) return null;
+
+        const bestQuality = uniqueLevels[0];
+        const matchingData = qualityData.filter(function (entry) {
+            return entry.quality === bestQuality;
+        });
+        const premiumData = matchingData.find(function (entry) {
+            return PREMIUM_RE.test([entry.qualityLabel, entry.label, entry.name].filter(Boolean).join(' '));
+        });
+
+        return {
+            quality: bestQuality,
+            wantsPremium1080: bestQuality === 'hd1080' && Boolean(premiumData),
+            displayLabel: (premiumData || matchingData[0] || {}).qualityLabel || ''
+        };
+    }
+
+    function persistPlayerQuality(quality) {
+        try {
+            const current = localStorage.getItem('yt-player-quality');
+            if (current) {
+                const parsed = JSON.parse(current);
+                if (parsed && parsed.data === quality) return;
+            }
+            const now = Date.now();
+            localStorage.setItem('yt-player-quality', JSON.stringify({
+                data: quality,
+                expiration: now + MONTH_MS,
+                creation: now
+            }));
+        } catch (_) {}
+    }
+
+    function applyQualityViaApi(player, quality) {
+        try {
+            if (typeof player.setPlaybackQualityRange === 'function') {
+                player.setPlaybackQualityRange(quality, quality);
+                return true;
+            }
+        } catch (_) {}
+        try {
+            if (typeof player.setPlaybackQuality === 'function') {
+                player.setPlaybackQuality(quality);
+                return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
     function parseQuality(item) {
         const text = normalizeText([
             item.textContent,
@@ -151,12 +253,12 @@
         return {
             item: item,
             resolution: Number(resolutionMatch[1]),
-            premium: /\b(?:premium|enhanced bitrate)\b/i.test(text),
+            premium: PREMIUM_RE.test(text),
             selected: item.getAttribute('aria-checked') === 'true'
         };
     }
 
-    function chooseHighestQuality(items) {
+    function chooseHighestMenuQuality(items) {
         const choices = items.map(parseQuality).filter(Boolean);
         choices.sort(function (left, right) {
             if (right.resolution !== left.resolution) return right.resolution - left.resolution;
@@ -166,19 +268,6 @@
         return choices[0] || null;
     }
 
-    async function waitForQualityChoices(player) {
-        const deadline = Date.now() + QUALITY_MENU_TIMEOUT_MS;
-        while (!stopped && Date.now() < deadline) {
-            const choices = getVisibleMenuItems(player).map(parseQuality).filter(Boolean);
-            // The parent settings menu includes one current-quality label
-            // (for example "Quality Auto (480p)"). Waiting for at least two
-            // resolutions prevents mistaking that row for the submenu.
-            if (choices.length > 1) return choices;
-            await wait(QUALITY_MENU_POLL_MS);
-        }
-        return [];
-    }
-
     async function openQualityMenu(player) {
         const settingsButton = getSettingsButton(player);
         if (!settingsButton) return false;
@@ -186,6 +275,7 @@
         if (settingsButton.getAttribute('aria-expanded') !== 'true') {
             settingsButton.click();
             await wait(MENU_WAIT_MS);
+            if (stopped) return false;
         }
 
         const menuItems = getVisibleMenuItems(player);
@@ -201,47 +291,95 @@
 
         qualityEntry.click();
         await wait(MENU_WAIT_MS);
+        return !stopped;
+    }
+
+    async function selectPremiumInMenu(player, targetLabel) {
+        if (!await openQualityMenu(player)) {
+            closeSettings(player);
+            return false;
+        }
+
+        const targetText = normalizeText(targetLabel);
+        const premiumOption = getVisibleMenuItems(player).find(function (item) {
+            const text = normalizeText(item.textContent);
+            if (!text.includes('1080p') || !PREMIUM_RE.test(text)) return false;
+            return !targetText || text.includes(targetText) || targetText.includes(text);
+        });
+
+        if (!premiumOption) {
+            closeSettings(player);
+            return false;
+        }
+
+        premiumOption.click();
+        return true;
+    }
+
+    async function selectHighestQualityViaMenu(player) {
+        if (!await openQualityMenu(player)) {
+            closeSettings(player);
+            return false;
+        }
+
+        const choice = chooseHighestMenuQuality(getVisibleMenuItems(player));
+        if (!choice) {
+            closeSettings(player);
+            return false;
+        }
+
+        if (!choice.selected) choice.item.click();
+        else closeSettings(player);
         return true;
     }
 
     async function selectHighestQuality(reason) {
-        if (stopped || qualitySelectionRunning || menuAttempts >= MAX_MENU_ATTEMPTS_PER_VIDEO) return;
+        if (stopped || qualitySelectionRunning || attempts >= MAX_ATTEMPTS_PER_VIDEO) return;
+        if (!isWatchPage()) return;
+
         const expectedVideoKey = getVideoKey();
         if (completedVideoKey === expectedVideoKey) return;
+
         const player = getPlayer();
-        if (!player || !getSettingsButton(player)) return;
+        if (!player) return;
+
+        const levels = getAvailableQualityLevels(player);
+        const choice = chooseTargetQuality(levels, getAvailableQualityData(player));
+        // Don't burn attempts while the player is still initializing.
+        if (!choice && !getSettingsButton(player)) return;
 
         qualitySelectionRunning = true;
-        menuAttempts += 1;
+        attempts += 1;
 
         try {
-            if (!await openQualityMenu(player) || expectedVideoKey !== getVideoKey()) {
-                closeSettings(player);
+            if (expectedVideoKey !== getVideoKey() || stopped) return;
+
+            if (choice) {
+                persistPlayerQuality(choice.quality);
+                const applied = applyQualityViaApi(player, choice.quality);
+                if (!applied) {
+                    // Player API unavailable — fall back to the settings menu once.
+                    if (!await selectHighestQualityViaMenu(player) || expectedVideoKey !== getVideoKey()) return;
+                } else if (
+                    choice.wantsPremium1080 &&
+                    premiumAttemptedKey !== expectedVideoKey &&
+                    getSettingsButton(player)
+                ) {
+                    premiumAttemptedKey = expectedVideoKey;
+                    await wait(700);
+                    if (stopped || expectedVideoKey !== getVideoKey()) return;
+                    await selectPremiumInMenu(player, choice.displayLabel);
+                }
+
+                completedVideoKey = expectedVideoKey;
+                clearApplyTimers();
                 return;
             }
 
-            const qualityChoices = await waitForQualityChoices(player);
-            if (expectedVideoKey !== getVideoKey()) {
-                closeSettings(player);
-                return;
-            }
+            if (!await selectHighestQualityViaMenu(player) || expectedVideoKey !== getVideoKey()) return;
 
-            const choice = chooseHighestQuality(qualityChoices.map(function (entry) {
-                return entry.item;
-            }));
-            if (!choice) {
-                closeSettings(player);
-                return;
-            }
-
-            if (!choice.selected) choice.item.click();
-            else closeSettings(player);
-
-            // One successful pass is enough for this video. Cancel the other
-            // delayed passes so the settings menu does not repeatedly flash.
             completedVideoKey = expectedVideoKey;
             clearApplyTimers();
-
         } catch (_) {
             closeSettings(player);
         } finally {
@@ -250,15 +388,13 @@
     }
 
     function clearApplyTimers() {
-        for (const timer of applyTimers) {
-            window.clearTimeout(timer);
-            timers.delete(timer);
-        }
+        for (const timer of Array.from(applyTimers)) cancelTimer(timer);
         applyTimers.clear();
         activeScheduleKey = '';
     }
 
     function scheduleQualitySelection(reason, force) {
+        if (!isWatchPage()) return;
         const videoKey = getVideoKey();
         if (completedVideoKey === videoKey) return;
         if (!force && activeScheduleKey === videoKey) return;
@@ -278,7 +414,8 @@
         if (changed) {
             currentVideoKey = nextVideoKey;
             completedVideoKey = '';
-            menuAttempts = 0;
+            premiumAttemptedKey = '';
+            attempts = 0;
             qualitySelectionRunning = false;
             attachVideoListeners();
             installObserver();
@@ -287,7 +424,7 @@
     }
 
     function attachVideoListeners() {
-        const video = document.querySelector('video');
+        const video = document.querySelector('#movie_player video, .html5-video-player video, video');
         if (!video || video === watchedVideo) return;
 
         if (removeVideoListeners) removeVideoListeners();
@@ -322,7 +459,7 @@
         if (!root) return;
 
         observer = new MutationObserver(function () {
-            if (observerTimer) window.clearTimeout(observerTimer);
+            cancelTimer(observerTimer);
             observerTimer = schedule(function () {
                 observerTimer = 0;
                 attachVideoListeners();
@@ -393,13 +530,14 @@
         stopped = true;
 
         clearApplyTimers();
-        for (const timer of timers) window.clearTimeout(timer);
+        cancelTimer(observerTimer);
+        observerTimer = 0;
+        for (const timer of Array.from(timers)) cancelTimer(timer);
         timers.clear();
         if (observer) {
             observer.disconnect();
             observer = null;
         }
-        observerTimer = 0;
         if (removeVideoListeners) {
             removeVideoListeners();
             removeVideoListeners = null;
@@ -422,8 +560,9 @@
     function activate() {
         if (!stopped) return;
         stopped = false;
-        menuAttempts = 0;
+        attempts = 0;
         completedVideoKey = '';
+        premiumAttemptedKey = '';
 
         installStyles();
         installPreconnects();
