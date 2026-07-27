@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Faster browsing hints plus a lightweight LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
 // @author       You
 // @match        *://*/*
@@ -280,6 +280,13 @@
         return forceRevalidateUrls.has(url) || getMetadata(url).forceRevalidate;
     }
 
+    function evictEntry(cache, cacheRequest, url) {
+        metadataMap.delete(url);
+        forceRevalidateUrls.delete(url);
+        scheduleFlush();
+        return cache.delete(cacheRequest).catch(() => {});
+    }
+
     function triggerMaintenance() {
         if ('requestIdleCallback' in window) window.requestIdleCallback(pruneCache, { timeout: 5000 });
         else setTimeout(pruneCache, 5000);
@@ -411,8 +418,10 @@
     }
 
     function installFetchCache() {
+        // typeof caches guard: the Cache API only exists in secure contexts, so
+        // on plain-HTTP pages the wrapper would fail (and fall back) per fetch.
         const hasServiceWorker = 'serviceWorker' in navigator;
-        if ((hasServiceWorker && navigator.serviceWorker.controller) || typeof unsafeWindow === 'undefined') return;
+        if ((hasServiceWorker && navigator.serviceWorker.controller) || typeof unsafeWindow === 'undefined' || typeof caches === 'undefined') return;
 
         const originalFetch = unsafeWindow.fetch;
         if (typeof originalFetch !== 'function') return;
@@ -421,7 +430,6 @@
         const inFlightRevalidations = new Map();
 
         const getCache = () => {
-            if (typeof caches === 'undefined') return Promise.reject(new Error('Cache API unavailable'));
             if (!cachePromise) {
                 cachePromise = caches.open(CACHE_NAME).catch(error => {
                     cachePromise = null;
@@ -449,11 +457,13 @@
             const redirect = init.redirect || (requestLike ? request.redirect : undefined);
             const referrer = init.referrer || (requestLike ? request.referrer : undefined);
             const referrerPolicy = init.referrerPolicy || (requestLike ? request.referrerPolicy : undefined);
+            const signal = init.signal || (requestLike ? request.signal : undefined);
 
             return {
                 url: url.href,
                 method: String(init.method || (requestLike ? request.method : '') || 'GET').toUpperCase(),
                 cacheMode: init.cache || (requestLike ? request.cache : undefined),
+                signal,
                 headers,
                 credentials,
                 mode,
@@ -495,13 +505,19 @@
             try {
                 const networkResponse = await originalFetch.apply(thisArg, args);
                 const cacheability = getCacheability(networkResponse);
-                if (!cacheability) return;
+                if (!cacheability) {
+                    // The server answered but no longer vouches for this asset
+                    // (gone, error, or uncacheable now). Without eviction the
+                    // stale copy would be served via SWR forever.
+                    evictEntry(cache, info.cacheRequest, info.url);
+                    return;
+                }
 
                 await cache.put(info.cacheRequest, networkResponse.clone());
                 touchItem(info.url, cacheability);
                 maybeScheduleMaintenance();
             } catch (_) {
-                // Stale cache is still better than making page fetches fail.
+                // Network failure: stale cache is still better than nothing.
             } finally {
                 inFlightRevalidations.delete(info.url);
             }
@@ -535,10 +551,7 @@
                 let cachedResponse = await cache.match(info.cacheRequest);
 
                 if (cachedResponse && !isReusableCachedResponse(cachedResponse)) {
-                    await cache.delete(info.cacheRequest).catch(() => {});
-                    metadataMap.delete(info.url);
-                    forceRevalidateUrls.delete(info.url);
-                    scheduleFlush();
+                    await evictEntry(cache, info.cacheRequest, info.url);
                     cachedResponse = null;
                 }
 
@@ -557,7 +570,9 @@
                             networkResponse = await originalFetch.apply(this, args);
                         } catch (error) {
                             // The page cancelled the request; honor abort semantics.
-                            if (error && error.name === 'AbortError') throw error;
+                            // abort(customReason) / AbortSignal.timeout() reject
+                            // with arbitrary reasons, so consult the signal too.
+                            if ((info.signal && info.signal.aborted) || (error && error.name === 'AbortError')) throw error;
                             // Revalidation failed (offline/error): the stale copy
                             // beats surfacing a network failure to the page.
                             return cachedResponse;
@@ -572,10 +587,7 @@
                                 })
                                 .catch(() => {});
                         } else {
-                            cache.delete(info.cacheRequest).catch(() => {});
-                            metadataMap.delete(info.url);
-                            forceRevalidateUrls.delete(info.url);
-                            scheduleFlush();
+                            evictEntry(cache, info.cacheRequest, info.url);
                         }
                         stats.misses += 1;
                         scheduleStatsSave();
@@ -915,7 +927,10 @@
                 for (const node of mutation.addedNodes) {
                     if (!(node instanceof Element)) continue;
 
-                    if (node.matches('link, style')) {
+                    // Stylesheet links only: matching every <link> would make
+                    // icons, preconnects and prefetches (including the hints
+                    // this script injects) schedule full stylesheet rescans.
+                    if (node.matches('link[rel~="stylesheet"], style')) {
                         const tryPatch = () => {
                             if (!node.sheet || !patchSheet(node.sheet)) scheduleScan();
                         };
@@ -927,7 +942,7 @@
                         } else {
                             window.requestAnimationFrame(tryPatch);
                         }
-                    } else if (node.querySelector('link, style')) {
+                    } else if (node.querySelector('link[rel~="stylesheet"], style')) {
                         needsScan = true;
                     }
                 }
