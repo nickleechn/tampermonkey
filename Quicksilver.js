@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  Faster browsing hints plus a lightweight LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
 // @author       You
 // @match        *://*/*
@@ -277,8 +277,7 @@
     }
 
     function requiresSynchronousRevalidation(url) {
-        const meta = getMetadata(url);
-        return forceRevalidateUrls.has(url) || meta.forceRevalidate || meta.ttlMs === 0;
+        return forceRevalidateUrls.has(url) || getMetadata(url).forceRevalidate;
     }
 
     function triggerMaintenance() {
@@ -340,12 +339,15 @@
         return null;
     }
 
+    // Caveat on both checks below: Set-Cookie is a forbidden response header
+    // (never visible to JS in any browser), and Vary is not CORS-safelisted, so
+    // on cross-origin responses headers.get('Vary') returns null even when the
+    // server sent it. no-store/private are the only reliable signals here.
     function getCacheability(response) {
         if (!response || !response.ok || response.status === 206) return false;
 
         const cc = response.headers.get('Cache-Control') || '';
         if (NO_STORE.test(cc) || PRIVATE.test(cc)) return false;
-        if (response.headers.has('Set-Cookie')) return false;
 
         const vary = response.headers.get('Vary') || '';
         if (vary.trim()) return false;
@@ -373,7 +375,6 @@
 
         const cc = response.headers.get('Cache-Control') || '';
         if (NO_STORE.test(cc) || PRIVATE.test(cc)) return false;
-        if (response.headers.has('Set-Cookie')) return false;
 
         const vary = response.headers.get('Vary') || '';
         if (vary.trim()) return false;
@@ -386,13 +387,24 @@
         return ttlMs === Infinity || (Number.isFinite(ttlMs) && ttlMs > 0);
     }
 
-    function headersHaveAuthorization(headers) {
+    // Requests carrying any of these need the real network semantics: Range
+    // expects a 206 slice and the conditional headers expect a possible 304 —
+    // serving a full cached 200 would break both.
+    const BYPASS_REQUEST_HEADERS = ['authorization', 'range', 'if-none-match', 'if-modified-since'];
+
+    function hasBypassHeader(headers) {
         if (!headers) return false;
 
         try {
-            if (typeof headers.get === 'function') return Boolean(headers.get('Authorization'));
-            if (Array.isArray(headers)) return headers.some(([key]) => String(key).toLowerCase() === 'authorization');
-            if (typeof headers === 'object') return Object.keys(headers).some(key => key.toLowerCase() === 'authorization' && headers[key]);
+            if (typeof headers.get === 'function') {
+                return BYPASS_REQUEST_HEADERS.some(name => Boolean(headers.get(name)));
+            }
+            if (Array.isArray(headers)) {
+                return headers.some(([key]) => BYPASS_REQUEST_HEADERS.includes(String(key).toLowerCase()));
+            }
+            if (typeof headers === 'object') {
+                return Object.keys(headers).some(key => BYPASS_REQUEST_HEADERS.includes(key.toLowerCase()) && headers[key]);
+            }
         } catch (_) {}
 
         return false;
@@ -503,7 +515,7 @@
                 || info.cacheMode === 'no-cache'
                 || info.cacheMode === 'reload'
                 || info.cacheMode === 'no-store'
-                || headersHaveAuthorization(info.headers);
+                || hasBypassHeader(info.headers);
 
             if (bypass) {
                 if (info && info.method === 'GET' && CACHEABLE_EXTENSIONS.test(info.url)) {
@@ -513,6 +525,11 @@
                 return originalFetch.apply(this, args);
             }
 
+            // Failures of our own cache machinery fall back to a plain fetch,
+            // but once the real network request has been issued its outcome
+            // (including AbortError) must propagate as-is — retrying here would
+            // fire the same request twice.
+            let networkAttempted = false;
             try {
                 const cache = await getCache();
                 let cachedResponse = await cache.match(info.cacheRequest);
@@ -530,17 +547,20 @@
                         stats.hits += 1;
                         scheduleStatsSave();
                         touchItem(info.url);
-                        return cachedResponse.clone();
+                        return cachedResponse;
                     }
 
                     if (requiresSynchronousRevalidation(info.url)) {
                         let networkResponse;
                         try {
+                            networkAttempted = true;
                             networkResponse = await originalFetch.apply(this, args);
-                        } catch (_) {
+                        } catch (error) {
+                            // The page cancelled the request; honor abort semantics.
+                            if (error && error.name === 'AbortError') throw error;
                             // Revalidation failed (offline/error): the stale copy
                             // beats surfacing a network failure to the page.
-                            return cachedResponse.clone();
+                            return cachedResponse;
                         }
 
                         const cacheability = getCacheability(networkResponse);
@@ -568,11 +588,12 @@
                         inFlightRevalidations.set(info.url, revalidate(cache, info, this, args));
                     }
 
-                    return cachedResponse.clone();
+                    return cachedResponse;
                 }
 
                 stats.misses += 1;
                 scheduleStatsSave();
+                networkAttempted = true;
                 const networkResponse = await originalFetch.apply(this, args);
                 const cacheability = getCacheability(networkResponse);
 
@@ -586,7 +607,8 @@
                 }
 
                 return networkResponse;
-            } catch (_) {
+            } catch (error) {
+                if (networkAttempted) throw error;
                 return originalFetch.apply(this, args);
             }
         };
@@ -716,10 +738,13 @@
                 },
                 eagerness: 'moderate'
             }],
+            // Speculation rules only ever match <a>/<area> elements, so a
+            // link[rel=next] selector would be dead; ~= handles multi-token
+            // rel values like "next nofollow".
             prerender: [{
                 where: {
                     and: [
-                        { selector_matches: "a[rel='next'], link[rel='next']" },
+                        { selector_matches: "a[rel~='next']" },
                         { not: { selector_matches: excludeSelectors } }
                     ]
                 },
@@ -742,17 +767,16 @@
     // =========================================================================
 
     function initPreconnectOnIntent() {
-        const connected = new Set();
+        const connected = new Map();
         const currentOrigin = location.origin;
         const maxPreconnects = 8;
         let lastLink = null;
 
         function removeOldestPreconnect() {
-            const oldest = connected.values().next().value;
+            const oldest = connected.keys().next().value;
             if (!oldest) return;
 
-            const escapedOldest = String(oldest).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-            const oldLink = document.querySelector('link[rel="preconnect"][href="' + escapedOldest + '"]');
+            const oldLink = connected.get(oldest);
             if (oldLink) oldLink.remove();
             connected.delete(oldest);
         }
@@ -761,12 +785,15 @@
             if (!document.head || connected.has(origin) || origin === currentOrigin) return;
             if (connected.size >= maxPreconnects) removeOldestPreconnect();
 
+            // No crossorigin attribute: hovered links lead to document
+            // navigations, which reuse the credentialed non-CORS connection.
+            // An anonymous preconnect would warm a connection navigations
+            // never use.
             const hint = document.createElement('link');
             hint.rel = 'preconnect';
-            hint.crossOrigin = 'anonymous';
             hint.href = origin;
             document.head.appendChild(hint);
-            connected.add(origin);
+            connected.set(origin, hint);
         }
 
         function maybePreconnect(target) {
@@ -889,9 +916,17 @@
                     if (!(node instanceof Element)) continue;
 
                     if (node.matches('link, style')) {
-                        window.requestAnimationFrame(() => {
+                        const tryPatch = () => {
                             if (!node.sheet || !patchSheet(node.sheet)) scheduleScan();
-                        });
+                        };
+
+                        // A <link>'s sheet only exists once the stylesheet has
+                        // loaded, which is after this mutation fires.
+                        if (node.matches('link') && !node.sheet) {
+                            node.addEventListener('load', tryPatch, { once: true });
+                        } else {
+                            window.requestAnimationFrame(tryPatch);
+                        }
                     } else if (node.querySelector('link, style')) {
                         needsScan = true;
                     }
