@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.0.1
 // @description  Chrome-only: aggressive Speculation Rules prefetch/prerender plus a high-hit-rate LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
 // @author       You
 // @match        *://*/*
@@ -483,13 +483,14 @@
 
     function stripSignalFromArgs(args) {
         const request = args[0];
-        const init = args[1] ? Object.assign({}, args[1]) : {};
-        delete init.signal;
+        // signal: null is required — omitting the key lets new Request(input)
+        // copy input.signal, which would keep SWR/coalesce coupled to the
+        // caller's AbortSignal.
+        const init = Object.assign({}, args[1] || {}, { signal: null });
 
         if (request && typeof request === 'object' && 'url' in request && 'method' in request) {
             try {
-                const next = new Request(request, init);
-                return [next];
+                return [new Request(request, init)];
             } catch (_) {
                 return [request.url, Object.assign({
                     method: request.method,
@@ -503,7 +504,7 @@
             }
         }
 
-        return args.length > 1 ? [request, init] : [request];
+        return [request, init];
     }
 
     function installFetchCache() {
