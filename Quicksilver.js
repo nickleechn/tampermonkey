@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.0.2
 // @description  Chrome-only: aggressive Speculation Rules prefetch/prerender plus a high-hit-rate LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
 // @author       You
 // @match        *://*/*
@@ -548,6 +548,10 @@
             const redirect = init.redirect || (requestLike ? request.redirect : undefined);
             const referrer = init.referrer || (requestLike ? request.referrer : undefined);
             const referrerPolicy = init.referrerPolicy || (requestLike ? request.referrerPolicy : undefined);
+            const integrity = init.integrity || (requestLike ? request.integrity : undefined);
+            const keepalive = Object.prototype.hasOwnProperty.call(init, 'keepalive')
+                ? init.keepalive
+                : (requestLike ? request.keepalive : undefined);
             const signal = init.signal || (requestLike ? request.signal : undefined);
 
             return {
@@ -561,8 +565,37 @@
                 redirect,
                 referrer,
                 referrerPolicy,
+                integrity,
+                keepalive,
                 cacheRequest: makeCacheRequest(url.href, { headers, credentials, mode, redirect, referrer, referrerPolicy })
             };
+        }
+
+        function makeNetworkKey(info) {
+            let headers;
+            try {
+                headers = Array.from(new Headers(info.headers || undefined).entries())
+                    .sort(([aKey, aValue], [bKey, bValue]) => {
+                        const keyOrder = aKey.localeCompare(bKey);
+                        return keyOrder || aValue.localeCompare(bValue);
+                    });
+            } catch (_) {
+                // If the headers cannot be normalized, do not risk sharing the
+                // request with a semantically different caller.
+                return null;
+            }
+
+            return JSON.stringify([
+                info.url,
+                info.credentials || '',
+                info.mode || '',
+                info.redirect || '',
+                info.referrer || '',
+                info.referrerPolicy || '',
+                info.integrity || '',
+                Boolean(info.keepalive),
+                headers
+            ]);
         }
 
         function makeCacheRequest(url, source) {
@@ -626,33 +659,67 @@
         }
 
         // Shared network flight ignores per-caller AbortSignals so one abort
-        // cannot cancel siblings; callers re-check their own signal after.
+        // cannot cancel siblings; each caller races its own signal separately.
         function coalesceNetwork(thisArg, args, info) {
-            const existing = inFlightNetwork.get(info.url);
+            const networkKey = makeNetworkKey(info);
+            if (!networkKey) {
+                return originalFetch.apply(thisArg, stripSignalFromArgs(args));
+            }
+
+            const existing = inFlightNetwork.get(networkKey);
             if (existing) {
                 return existing.then(response => response.clone());
             }
 
             const pending = originalFetch.apply(thisArg, stripSignalFromArgs(args)).then(response => {
-                inFlightNetwork.delete(info.url);
+                inFlightNetwork.delete(networkKey);
                 return response;
             }, error => {
-                inFlightNetwork.delete(info.url);
+                inFlightNetwork.delete(networkKey);
                 throw error;
             });
 
-            inFlightNetwork.set(info.url, pending);
+            inFlightNetwork.set(networkKey, pending);
             return pending.then(response => response.clone());
+        }
+
+        function getAbortReason(signal) {
+            if (signal && 'reason' in signal && signal.reason !== undefined) {
+                return signal.reason;
+            }
+            if (typeof DOMException === 'function') {
+                return new DOMException('Aborted', 'AbortError');
+            }
+            const err = new Error('Aborted');
+            err.name = 'AbortError';
+            return err;
         }
 
         function throwIfAborted(signal) {
             if (!signal || !signal.aborted) return;
-            if (typeof DOMException === 'function') {
-                throw new DOMException(signal.reason && signal.reason.message || 'Aborted', 'AbortError');
-            }
-            const err = new Error('Aborted');
-            err.name = 'AbortError';
-            throw err;
+            throw getAbortReason(signal);
+        }
+
+        function waitForCaller(promise, signal) {
+            if (!signal) return promise;
+            if (signal.aborted) return Promise.reject(getAbortReason(signal));
+
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const finish = (fn, value) => {
+                    if (settled) return;
+                    settled = true;
+                    signal.removeEventListener('abort', onAbort);
+                    fn(value);
+                };
+                const onAbort = () => finish(reject, getAbortReason(signal));
+
+                signal.addEventListener('abort', onAbort, { once: true });
+                promise.then(
+                    value => finish(resolve, value),
+                    error => finish(reject, error)
+                );
+            });
         }
 
         async function revalidate(cache, info, thisArg, args) {
@@ -663,7 +730,7 @@
                     // The server answered but no longer vouches for this asset
                     // (gone, error, or uncacheable now). Without eviction the
                     // stale copy would be served via SWR forever.
-                    evictEntry(cache, info.cacheRequest, info.url);
+                    await evictEntry(cache, info.cacheRequest, info.url);
                     return;
                 }
 
@@ -680,9 +747,9 @@
             const bypass = !info
                 || info.method !== 'GET'
                 || !isCacheableUrl(info.url)
-                || info.cacheMode === 'no-cache'
-                || info.cacheMode === 'reload'
-                || info.cacheMode === 'no-store'
+                // Preserve native semantics for every explicit non-default
+                // Request.cache mode, especially force-cache/only-if-cached.
+                || (info.cacheMode && info.cacheMode !== 'default')
                 || hasBypassHeader(info.headers);
 
             if (bypass) {
@@ -692,6 +759,8 @@
                 }
                 return originalFetch.apply(this, args);
             }
+
+            throwIfAborted(info.signal);
 
             // Failures of our own cache machinery fall back to a plain fetch,
             // but once the real network request has been issued its outcome
@@ -709,6 +778,7 @@
 
                 if (cachedResponse) {
                     if (isFresh(info.url)) {
+                        throwIfAborted(info.signal);
                         stats.hits += 1;
                         scheduleStatsSave();
                         touchItem(info.url);
@@ -719,7 +789,7 @@
                         let networkResponse;
                         try {
                             networkAttempted = true;
-                            networkResponse = await coalesceNetwork(this, args, info);
+                            networkResponse = await waitForCaller(coalesceNetwork(this, args, info), info.signal);
                             throwIfAborted(info.signal);
                         } catch (error) {
                             // The page cancelled the request; honor abort semantics.
@@ -735,7 +805,7 @@
                         if (cacheability) {
                             storeResponse(cache, info, networkResponse, cacheability).catch(() => {});
                         } else {
-                            evictEntry(cache, info.cacheRequest, info.url);
+                            await evictEntry(cache, info.cacheRequest, info.url);
                         }
                         stats.revalidations += 1;
                         scheduleStatsSave();
@@ -748,13 +818,14 @@
                         inFlightRevalidations.set(info.url, revalidate(cache, info, this, args));
                     }
 
+                    throwIfAborted(info.signal);
                     return cachedResponse;
                 }
 
                 stats.misses += 1;
                 scheduleStatsSave();
                 networkAttempted = true;
-                const networkResponse = await coalesceNetwork(this, args, info);
+                const networkResponse = await waitForCaller(coalesceNetwork(this, args, info), info.signal);
                 throwIfAborted(info.signal);
                 const cacheability = getCacheability(networkResponse, networkResponse.url || info.url);
 

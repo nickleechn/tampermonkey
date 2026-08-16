@@ -54,6 +54,13 @@
       return false;
     }
 
+    async function requestCount(name) {
+      const url = new URL(`./dynamic/count?name=${encodeURIComponent(name)}&t=${Date.now()}`, location.href);
+      const response = await fetch(url, { cache: 'no-store' });
+      const payload = await response.json();
+      return Number(payload.count) || 0;
+    }
+
     try {
       // 1) Chromium gate — script should have run (menu cmds registered)
       if (Array.isArray(window.__QS_MENU__) && window.__QS_MENU__.length >= 1) {
@@ -157,17 +164,69 @@
       if (dns && pre) pass('dns-preconnect', 'example.com warmed');
       else fail('dns-preconnect', `dns=${dns} preconnect=${pre}`);
 
-      // 8) Coalescing — parallel identical fetches
-      const plain = new URL('./assets/plain.js', location.href).href;
+      // 8) Coalescing — prove that two identical callers cause one request.
+      const coalesceUrl = new URL('./dynamic/coalesce.js', location.href).href;
       await caches.delete('tm-smart-lru-v3').catch(() => {});
-      // Re-open by fetching once after delete — coalescing test
       const [a, b] = await Promise.all([
-        fetch(plain, { credentials: 'same-origin' }),
-        fetch(plain, { credentials: 'same-origin' })
+        fetch(coalesceUrl, { credentials: 'same-origin' }),
+        fetch(coalesceUrl, { credentials: 'same-origin' })
       ]);
       const [at, bt] = await Promise.all([a.text(), b.text()]);
-      if (a.ok && b.ok && at === bt) pass('coalesce-parallel', 'parallel GETs ok');
-      else fail('coalesce-parallel', `a=${a.status} b=${b.status}`);
+      const coalesceCount = await requestCount('coalesce');
+      if (a.ok && b.ok && at === bt && coalesceCount === 1) {
+        pass('coalesce-parallel', 'one network request for two callers');
+      } else {
+        fail('coalesce-parallel', `a=${a.status} b=${b.status} requests=${coalesceCount}`);
+      }
+
+      // 9) Requests with different headers must never share a flight. The
+      // response declares Vary, but coalescing happens before that is known.
+      const variantUrl = new URL('./dynamic/variant.js', location.href).href;
+      const [variantA, variantB] = await Promise.all([
+        fetch(variantUrl, { headers: { 'X-QS-Variant': 'A' } }),
+        fetch(variantUrl, { headers: { 'X-QS-Variant': 'B' } })
+      ]);
+      const [variantAText, variantBText] = await Promise.all([variantA.text(), variantB.text()]);
+      if (variantAText.includes('"A"') && variantBText.includes('"B"')) {
+        pass('coalesce-request-isolation', 'different headers kept separate');
+      } else {
+        fail('coalesce-request-isolation', `A=${variantAText.trim()} B=${variantBText.trim()}`);
+      }
+
+      // 10) Detaching the shared network flight must not delay an individual
+      // caller's AbortSignal rejection until the slow response completes.
+      const slowUrl = new URL(`./dynamic/slow.js?t=${Date.now()}`, location.href).href;
+      const controller = new AbortController();
+      const abortStartedAt = performance.now();
+      const slowFetch = fetch(slowUrl, { signal: controller.signal });
+      setTimeout(() => controller.abort(), 50);
+      try {
+        await slowFetch;
+        fail('abort-promptly', 'fetch resolved after abort');
+      } catch (error) {
+        const abortElapsed = performance.now() - abortStartedAt;
+        if (controller.signal.aborted && abortElapsed < 500) {
+          pass('abort-promptly', `rejected in ${Math.round(abortElapsed)}ms`);
+        } else {
+          fail('abort-promptly', `elapsed=${Math.round(abortElapsed)}ms error=${String(error)}`);
+        }
+      }
+
+      // 11) Preserve native only-if-cached semantics: a unique cache miss must
+      // not be converted into a network request by the userscript wrapper.
+      const cacheModeBefore = await requestCount('cache-mode');
+      const cacheModeUrl = new URL(`./dynamic/cache-mode.js?t=${Date.now()}`, location.href).href;
+      try {
+        const onlyCached = await fetch(cacheModeUrl, { mode: 'same-origin', cache: 'only-if-cached' });
+        await onlyCached.arrayBuffer();
+      } catch (_) {}
+      await sleep(100);
+      const cacheModeAfter = await requestCount('cache-mode');
+      if (cacheModeAfter === cacheModeBefore) {
+        pass('native-cache-mode', 'only-if-cached caused no network request');
+      } else {
+        fail('native-cache-mode', `requests before=${cacheModeBefore} after=${cacheModeAfter}`);
+      }
 
     } catch (err) {
       fail('harness-exception', String(err && err.stack || err));

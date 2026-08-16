@@ -10,6 +10,8 @@ import tempfile
 import time
 import urllib.request
 
+from harness_server import start_server
+
 PORT = int(os.environ.get('QS_TEST_PORT', '8765'))
 DEBUG_PORT = int(os.environ.get('QS_DEBUG_PORT', '9335'))
 CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
@@ -19,7 +21,18 @@ HARNESS = f'http://127.0.0.1:{PORT}/test/quicksilver-chrome/index.html'
 def main() -> int:
     import websocket
 
-    urllib.request.urlopen(HARNESS, timeout=2)
+    server = start_server(PORT)
+
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(HARNESS, timeout=0.2)
+            break
+        except Exception:
+            time.sleep(0.05)
+    else:
+        print('FAIL: harness server did not start')
+        server.shutdown()
+        return 2
 
     profile = tempfile.mkdtemp(prefix='qs-chrome-profile-')
     chrome = subprocess.Popen([
@@ -110,6 +123,7 @@ def main() -> int:
         except Exception:
             chrome.kill()
         shutil.rmtree(profile, ignore_errors=True)
+        server.shutdown()
 
 
 if __name__ == '__main__':
