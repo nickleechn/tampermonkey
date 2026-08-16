@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      3.0.2
+// @version      3.0.3
 // @description  Chrome-only: aggressive Speculation Rules prefetch/prerender plus a high-hit-rate LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
 // @author       You
 // @match        *://*/*
@@ -281,6 +281,10 @@
         }
 
         metadataMap.set(url, next);
+        // A throttled touch still changed in-memory LRU state. Mark it dirty so
+        // pagehide persists it even when we deliberately avoid scheduling a
+        // localStorage write for every cache hit.
+        metadataDirty = true;
         if (shouldPersist) scheduleFlush();
     }
 
@@ -481,12 +485,12 @@
         return false;
     }
 
-    function stripSignalFromArgs(args) {
+    function replaceSignalInArgs(args, signal) {
         const request = args[0];
-        // signal: null is required — omitting the key lets new Request(input)
-        // copy input.signal, which would keep SWR/coalesce coupled to the
-        // caller's AbortSignal.
-        const init = Object.assign({}, args[1] || {}, { signal: null });
+        // Supplying the key is required — omitting it lets new Request(input)
+        // copy input.signal. Background revalidation passes null; shared
+        // network flights pass their own controller signal.
+        const init = Object.assign({}, args[1] || {}, { signal });
 
         if (request && typeof request === 'object' && 'url' in request && 'method' in request) {
             try {
@@ -507,6 +511,12 @@
         return [request, init];
     }
 
+    function stripSignalFromArgs(args) {
+        return replaceSignalInArgs(args, null);
+    }
+
+    let fetchCachePromise = null;
+
     function installFetchCache() {
         // typeof caches guard: the Cache API only exists in secure contexts, so
         // on plain-HTTP pages the wrapper would fail (and fall back) per fetch.
@@ -516,18 +526,17 @@
         const originalFetch = unsafeWindow.fetch;
         if (typeof originalFetch !== 'function') return;
 
-        let cachePromise = null;
         const inFlightRevalidations = new Map();
         const inFlightNetwork = new Map();
 
         const getCache = () => {
-            if (!cachePromise) {
-                cachePromise = caches.open(CACHE_NAME).catch(error => {
-                    cachePromise = null;
+            if (!fetchCachePromise) {
+                fetchCachePromise = caches.open(CACHE_NAME).catch(error => {
+                    fetchCachePromise = null;
                     throw error;
                 });
             }
-            return cachePromise;
+            return fetchCachePromise;
         };
 
         const isRequestLike = obj => obj && typeof obj === 'object' && 'url' in obj && 'method' in obj;
@@ -552,7 +561,9 @@
             const keepalive = Object.prototype.hasOwnProperty.call(init, 'keepalive')
                 ? init.keepalive
                 : (requestLike ? request.keepalive : undefined);
-            const signal = init.signal || (requestLike ? request.signal : undefined);
+            const signal = Object.prototype.hasOwnProperty.call(init, 'signal')
+                ? init.signal
+                : (requestLike ? request.signal : undefined);
 
             return {
                 url: url.href,
@@ -627,60 +638,103 @@
 
         async function storeResponse(cache, info, networkResponse, cacheability) {
             const finalUrl = networkResponse.url || info.url;
-            let storeRequest = info.cacheRequest;
-            let storeUrl = info.url;
-
             if (networkResponse.redirected && finalUrl && finalUrl !== info.url) {
                 if (!isCacheableUrl(finalUrl)) {
                     await evictEntry(cache, info.cacheRequest, info.url);
                     return;
                 }
-                storeUrl = finalUrl;
-                storeRequest = makeCacheRequest(finalUrl, {
-                    headers: info.headers,
-                    credentials: info.credentials,
-                    mode: info.mode,
-                    redirect: info.redirect,
-                    referrer: info.referrer,
-                    referrerPolicy: info.referrerPolicy
-                });
-                if (storeUrl !== info.url) {
-                    await evictEntry(cache, info.cacheRequest, info.url);
-                }
             }
 
             try {
-                await cache.put(storeRequest, networkResponse.clone());
-                touchItem(storeUrl, cacheability);
+                // Cache under the URL the caller will request again. A cached
+                // Response may retain its final redirected URL; Cache API keys
+                // do not need to match response.url.
+                await cache.put(info.cacheRequest, networkResponse.clone());
+                touchItem(info.url, cacheability);
                 maybeScheduleMaintenance();
             } catch (_) {
                 // Redirected / opaque / quota failures: skip store.
             }
         }
 
-        // Shared network flight ignores per-caller AbortSignals so one abort
-        // cannot cancel siblings; each caller races its own signal separately.
+        function waitForNetworkFlight(flight, signal) {
+            flight.waiters += 1;
+
+            return new Promise((resolve, reject) => {
+                let callerSettled = false;
+
+                const release = (aborted, reason) => {
+                    if (callerSettled) return;
+                    callerSettled = true;
+                    if (signal) signal.removeEventListener('abort', onAbort);
+                    flight.waiters = Math.max(0, flight.waiters - 1);
+
+                    if (aborted && flight.waiters === 0 && !flight.settled) {
+                        // Remove immediately so a new caller does not join a
+                        // flight whose shared controller is already aborted.
+                        if (inFlightNetwork.get(flight.key) === flight) {
+                            inFlightNetwork.delete(flight.key);
+                        }
+                        flight.controller.abort(reason);
+                    }
+                };
+
+                const onAbort = () => {
+                    const reason = getAbortReason(signal);
+                    release(true, reason);
+                    reject(reason);
+                };
+
+                if (signal && signal.aborted) {
+                    onAbort();
+                    return;
+                }
+
+                if (signal) signal.addEventListener('abort', onAbort, { once: true });
+                flight.promise.then(response => {
+                    release(false);
+                    resolve(response.clone());
+                }, error => {
+                    release(false);
+                    reject(error);
+                });
+            });
+        }
+
+        // Callers with semantically identical requests share one controller.
+        // One abort only releases that caller; all callers aborting cancels the
+        // underlying request and lets a later caller create a fresh flight.
         function coalesceNetwork(thisArg, args, info) {
             const networkKey = makeNetworkKey(info);
             if (!networkKey) {
-                return originalFetch.apply(thisArg, stripSignalFromArgs(args));
+                return originalFetch.apply(thisArg, args);
             }
 
-            const existing = inFlightNetwork.get(networkKey);
-            if (existing) {
-                return existing.then(response => response.clone());
+            let flight = inFlightNetwork.get(networkKey);
+            if (!flight) {
+                const controller = new AbortController();
+                flight = {
+                    key: networkKey,
+                    controller,
+                    waiters: 0,
+                    settled: false,
+                    promise: null
+                };
+
+                flight.promise = originalFetch.apply(
+                    thisArg,
+                    replaceSignalInArgs(args, controller.signal)
+                ).finally(() => {
+                    flight.settled = true;
+                    if (inFlightNetwork.get(networkKey) === flight) {
+                        inFlightNetwork.delete(networkKey);
+                    }
+                });
+
+                inFlightNetwork.set(networkKey, flight);
             }
 
-            const pending = originalFetch.apply(thisArg, stripSignalFromArgs(args)).then(response => {
-                inFlightNetwork.delete(networkKey);
-                return response;
-            }, error => {
-                inFlightNetwork.delete(networkKey);
-                throw error;
-            });
-
-            inFlightNetwork.set(networkKey, pending);
-            return pending.then(response => response.clone());
+            return waitForNetworkFlight(flight, info.signal);
         }
 
         function getAbortReason(signal) {
@@ -698,28 +752,6 @@
         function throwIfAborted(signal) {
             if (!signal || !signal.aborted) return;
             throw getAbortReason(signal);
-        }
-
-        function waitForCaller(promise, signal) {
-            if (!signal) return promise;
-            if (signal.aborted) return Promise.reject(getAbortReason(signal));
-
-            return new Promise((resolve, reject) => {
-                let settled = false;
-                const finish = (fn, value) => {
-                    if (settled) return;
-                    settled = true;
-                    signal.removeEventListener('abort', onAbort);
-                    fn(value);
-                };
-                const onAbort = () => finish(reject, getAbortReason(signal));
-
-                signal.addEventListener('abort', onAbort, { once: true });
-                promise.then(
-                    value => finish(resolve, value),
-                    error => finish(reject, error)
-                );
-            });
         }
 
         async function revalidate(cache, info, thisArg, args) {
@@ -789,7 +821,7 @@
                         let networkResponse;
                         try {
                             networkAttempted = true;
-                            networkResponse = await waitForCaller(coalesceNetwork(this, args, info), info.signal);
+                            networkResponse = await coalesceNetwork(this, args, info);
                             throwIfAborted(info.signal);
                         } catch (error) {
                             // The page cancelled the request; honor abort semantics.
@@ -825,7 +857,7 @@
                 stats.misses += 1;
                 scheduleStatsSave();
                 networkAttempted = true;
-                const networkResponse = await waitForCaller(coalesceNetwork(this, args, info), info.signal);
+                const networkResponse = await coalesceNetwork(this, args, info);
                 throwIfAborted(info.signal);
                 const cacheability = getCacheability(networkResponse, networkResponse.url || info.url);
 
@@ -843,7 +875,7 @@
         if (hasServiceWorker) {
             navigator.serviceWorker.addEventListener('controllerchange', () => {
                 unsafeWindow.fetch = originalFetch;
-                cachePromise = null;
+                fetchCachePromise = null;
                 inFlightNetwork.clear();
                 inFlightRevalidations.clear();
             }, { once: true });
@@ -884,6 +916,7 @@
             try {
                 await caches.delete(CACHE_NAME);
             } catch (_) {}
+            fetchCachePromise = null;
             metadataMap.clear();
             forceRevalidateUrls.clear();
             metadataDirty = false;
