@@ -88,6 +88,30 @@ class HarnessHandler(SimpleHTTPRequestHandler):
             )
             return
 
+        if parsed.path == base + 'slow-shared.js':
+            self.increment('coalesce-abort')
+            time.sleep(0.45)
+            self.send_bytes(
+                b'window.__qsSlowShared = true;\n',
+                'application/javascript',
+                Cache_Control='max-age=60',
+            )
+            return
+
+        if parsed.path == base + 'redirect.js':
+            self.increment('redirect')
+            self.send_response(302)
+            self.send_header('Location', base + 'redirect-target.js')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+
+        if parsed.path == base + 'redirect-target.js':
+            request_number = self.increment('redirect-target')
+            body = f'window.__qsRedirectTarget = {request_number};\n'.encode()
+            self.send_bytes(body, 'application/javascript', Cache_Control='max-age=60')
+            return
+
         if parsed.path == base + 'cache-mode.js':
             self.increment('cache-mode')
             self.send_bytes(

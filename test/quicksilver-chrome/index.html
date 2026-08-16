@@ -28,6 +28,7 @@
       window.__QS_MENU__ = window.__QS_MENU__ || [];
       window.__QS_MENU__.push({ label, fn });
     };
+    window.alert = function () {};
   </script>
   <script src="/Quicksilver.js"></script>
   <script type="module">
@@ -84,7 +85,9 @@
 
       // Clear prior harness cache for deterministic miss→hit
       try {
-        await caches.delete('tm-smart-lru-v3');
+        const setupCache = await caches.open('tm-smart-lru-v3');
+        const setupKeys = await setupCache.keys();
+        await Promise.all(setupKeys.map(request => setupCache.delete(request)));
         localStorage.removeItem('tm-cache-lru-metadata');
         localStorage.removeItem('tm-cache-stats');
       } catch (_) {}
@@ -127,6 +130,22 @@
         fail('fingerprint-immutable-ttl', 'missing metadata');
       }
 
+      // 4b) A throttled cache-hit touch must still persist on pagehide even
+      // when it deliberately does not schedule another localStorage timer.
+      const touchBefore = Number(entry && entry.touchedAt) || 0;
+      const touchedResponse = await fetch(assetUrl, { credentials: 'same-origin' });
+      await touchedResponse.arrayBuffer();
+      window.dispatchEvent(new Event('pagehide'));
+      await sleep(50);
+      let touchedMeta = {};
+      try { touchedMeta = JSON.parse(localStorage.getItem('tm-cache-lru-metadata') || '{}'); } catch (_) {}
+      const touchAfter = Number(touchedMeta[assetUrl] && touchedMeta[assetUrl].touchedAt) || 0;
+      if (touchBefore > 0 && touchAfter > touchBefore) {
+        pass('metadata-throttled-touch', `persisted ${touchAfter - touchBefore}ms newer touch`);
+      } else {
+        fail('metadata-throttled-touch', `before=${touchBefore} after=${touchAfter}`);
+      }
+
       // 5) Idle warm / speculation — wait for speculationrules script
       const gotSpec = await waitFor(() => !!document.querySelector('script[type="speculationrules"]'), 10000);
       if (gotSpec) {
@@ -166,7 +185,8 @@
 
       // 8) Coalescing — prove that two identical callers cause one request.
       const coalesceUrl = new URL('./dynamic/coalesce.js', location.href).href;
-      await caches.delete('tm-smart-lru-v3').catch(() => {});
+      const coalesceCache = await caches.open('tm-smart-lru-v3');
+      await coalesceCache.delete(coalesceUrl).catch(() => {});
       const [a, b] = await Promise.all([
         fetch(coalesceUrl, { credentials: 'same-origin' }),
         fetch(coalesceUrl, { credentials: 'same-origin' })
@@ -212,6 +232,53 @@
         }
       }
 
+      // 10b) Aborting one of two coalesced callers must reject only that
+      // caller while its sibling receives the single shared response.
+      const sharedSlowUrl = new URL(`./dynamic/slow-shared.js?t=${Date.now()}`, location.href).href;
+      const sharedController = new AbortController();
+      const sharedAbortStartedAt = performance.now();
+      const abortingCaller = fetch(sharedSlowUrl, { signal: sharedController.signal }).then(
+        response => ({ resolved: true, response }),
+        error => ({ resolved: false, error, elapsed: performance.now() - sharedAbortStartedAt })
+      );
+      const siblingCaller = fetch(sharedSlowUrl);
+      setTimeout(() => sharedController.abort(), 50);
+      const [abortedCallerResult, siblingResponse] = await Promise.all([abortingCaller, siblingCaller]);
+      const siblingBody = await siblingResponse.text();
+      const sharedRequestCount = await requestCount('coalesce-abort');
+      if (!abortedCallerResult.resolved
+          && sharedController.signal.aborted
+          && abortedCallerResult.elapsed < 500
+          && siblingResponse.ok
+          && siblingBody.includes('__qsSlowShared')
+          && sharedRequestCount === 1) {
+        pass('coalesce-abort-isolation', `abort=${Math.round(abortedCallerResult.elapsed)}ms requests=1`);
+      } else {
+        fail(
+          'coalesce-abort-isolation',
+          `resolved=${abortedCallerResult.resolved} elapsed=${Math.round(abortedCallerResult.elapsed || 0)} sibling=${siblingResponse.status} requests=${sharedRequestCount}`
+        );
+      }
+
+      // 10c) An explicitly null RequestInit.signal detaches the signal carried
+      // by the input Request instead of accidentally inheriting it.
+      const detachUrl = new URL(`./dynamic/slow-shared.js?detached=${Date.now()}`, location.href).href;
+      const inheritedController = new AbortController();
+      const requestWithSignal = new Request(detachUrl, { signal: inheritedController.signal });
+      const detachedFetch = fetch(requestWithSignal, { signal: null });
+      setTimeout(() => inheritedController.abort(), 50);
+      try {
+        const detachedResponse = await detachedFetch;
+        const detachedBody = await detachedResponse.text();
+        if (detachedResponse.ok && detachedBody.includes('__qsSlowShared')) {
+          pass('explicit-null-signal', 'input Request signal was detached');
+        } else {
+          fail('explicit-null-signal', `status=${detachedResponse.status}`);
+        }
+      } catch (error) {
+        fail('explicit-null-signal', `unexpected rejection: ${error && error.name || error}`);
+      }
+
       // 11) Preserve native only-if-cached semantics: a unique cache miss must
       // not be converted into a network request by the userscript wrapper.
       const cacheModeBefore = await requestCount('cache-mode');
@@ -226,6 +293,53 @@
         pass('native-cache-mode', 'only-if-cached caused no network request');
       } else {
         fail('native-cache-mode', `requests before=${cacheModeBefore} after=${cacheModeAfter}`);
+      }
+
+      // 12) A followed redirect must be cached under the original request URL,
+      // because that is the key subsequent callers will look up.
+      const redirectBefore = await requestCount('redirect');
+      const redirectTargetBefore = await requestCount('redirect-target');
+      const redirectUrl = new URL(`./dynamic/redirect.js?t=${Date.now()}`, location.href).href;
+      const redirectFirst = await fetch(redirectUrl);
+      const redirectFirstBody = await redirectFirst.text();
+      const redirectStored = await waitFor(async () => {
+        const currentCache = await caches.open('tm-smart-lru-v3');
+        return Boolean(await currentCache.match(redirectUrl));
+      }, 3000, 50);
+      const redirectSecond = await fetch(redirectUrl);
+      const redirectSecondBody = await redirectSecond.text();
+      const redirectAfter = await requestCount('redirect');
+      const redirectTargetAfter = await requestCount('redirect-target');
+      if (redirectStored
+          && redirectFirst.ok
+          && redirectSecond.ok
+          && redirectFirstBody === redirectSecondBody
+          && redirectAfter === redirectBefore + 1
+          && redirectTargetAfter === redirectTargetBefore + 1) {
+        pass('redirect-original-key', 'second original-URL fetch served from Cache API');
+      } else {
+        fail(
+          'redirect-original-key',
+          `stored=${redirectStored} redirectRequests=${redirectAfter - redirectBefore} targetRequests=${redirectTargetAfter - redirectTargetBefore}`
+        );
+      }
+
+      // 13) Purging must invalidate the memoized Cache handle. Otherwise later
+      // writes can disappear into the deleted Cache object until page reload.
+      const purgeCommand = (window.__QS_MENU__ || []).find(command => command.label.startsWith('Purge Asset Cache'));
+      if (purgeCommand) {
+        await purgeCommand.fn();
+        const afterPurgeUrl = new URL(`./dynamic/coalesce.js?after-purge=${Date.now()}`, location.href).href;
+        const afterPurgeResponse = await fetch(afterPurgeUrl);
+        await afterPurgeResponse.text();
+        const afterPurgeStored = await waitFor(async () => {
+          const currentCache = await caches.open('tm-smart-lru-v3');
+          return Boolean(await currentCache.match(afterPurgeUrl));
+        }, 3000, 50);
+        if (afterPurgeStored) pass('purge-cache-handle-reset', 'new writes remain visible after purge');
+        else fail('purge-cache-handle-reset', 'post-purge write used a deleted Cache handle');
+      } else {
+        fail('purge-cache-handle-reset', 'purge menu command not registered');
       }
 
     } catch (err) {
