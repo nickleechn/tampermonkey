@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      3.0.3
-// @description  Chrome-only: aggressive Speculation Rules prefetch/prerender plus a high-hit-rate LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and backs off on slow/data-saver connections.
+// @version      3.1.0
+// @description  Chrome-only: connection-tiered Speculation Rules prefetch/prerender, learned LCP preload + origin preconnect, media priority hints, and a high-hit-rate LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and degrades gracefully on slow connections.
 // @author       You
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.js
@@ -31,8 +31,76 @@
     const conn = navigator.connection;
     const supportsSpeculationRules = Boolean(HTMLScriptElement.supports && HTMLScriptElement.supports('speculationrules'));
 
+    // The Prioritized Task Scheduling API exposes `scheduler` as a Window
+    // global, not on navigator (navigator.scheduling is a different API with
+    // isInputPending), so the previous navigator.scheduler probe never matched
+    // and every caller silently fell through to requestIdleCallback.
+    const taskScheduler = (window.scheduler && typeof window.scheduler.postTask === 'function')
+        ? window.scheduler
+        : null;
+
+    // Bandwidth is zero-sum on a constrained link: every speculative byte we
+    // spend is a byte the current page does not get. A single slow/not-slow
+    // flag is too coarse for that trade-off, so features below read a tier.
+    // Always call getConnectionTier() rather than caching it — effectiveType
+    // changes as the radio state changes mid-page.
+    const TIER_SLOW = 1;
+    const TIER_MODERATE = 2;
+    const TIER_FAST = 3;
+
+    function getConnectionTier() {
+        if (!conn) return TIER_FAST;
+        if (conn.saveData) return TIER_SLOW;
+
+        switch (conn.effectiveType) {
+            case 'slow-2g':
+            case '2g': return TIER_SLOW;
+            case '3g': return TIER_MODERATE;
+        }
+
+        // effectiveType buckets coarsely and rounds up; rtt/downlink catch a
+        // '4g' label sitting on a congested or high-latency link.
+        if (Number.isFinite(conn.rtt) && conn.rtt > 0) {
+            if (conn.rtt >= 600) return TIER_SLOW;
+            if (conn.rtt >= 270) return TIER_MODERATE;
+        }
+        if (Number.isFinite(conn.downlink) && conn.downlink > 0 && conn.downlink < 0.7) return TIER_SLOW;
+
+        return TIER_FAST;
+    }
+
     function isSlowOrMeteredConnection() {
-        return Boolean(conn && (conn.saveData || conn.effectiveType === 'slow-2g' || conn.effectiveType === '2g'));
+        return getConnectionTier() === TIER_SLOW;
+    }
+
+    function postBackgroundTask(fn, timeout) {
+        const deadline = Number.isFinite(timeout) ? timeout : 3000;
+        let ran = false;
+
+        const run = () => {
+            if (ran) return;
+            ran = true;
+            fn();
+        };
+
+        if (taskScheduler) {
+            try {
+                // postTask rejects if the task is aborted; nothing here passes a
+                // signal, but an unhandled rejection would still surface.
+                const task = taskScheduler.postTask(run, { priority: 'background' });
+                if (task && typeof task.catch === 'function') task.catch(() => {});
+                // Unlike requestIdleCallback's timeout, 'background' priority
+                // carries no deadline at all — a busy page can starve it for as
+                // long as it stays busy. Everything queued here is optional but
+                // not indefinitely postponable (speculation rules, quota
+                // pruning), so keep the guarantee the idle path always had.
+                setTimeout(run, deadline);
+                return;
+            } catch (_) {}
+        }
+
+        if ('requestIdleCallback' in window) window.requestIdleCallback(run, { timeout: deadline });
+        else setTimeout(run, Math.min(deadline, 750));
     }
 
     function runWhenDomReady(fn) {
@@ -44,15 +112,7 @@
     }
 
     function runWhenLoadedIdle(fn) {
-        const runIdle = () => {
-            if (navigator.scheduler && typeof navigator.scheduler.postTask === 'function') {
-                navigator.scheduler.postTask(fn, { priority: 'background', delay: 0 });
-            } else if ('requestIdleCallback' in window) {
-                window.requestIdleCallback(fn, { timeout: 3000 });
-            } else {
-                setTimeout(fn, 750);
-            }
-        };
+        const runIdle = () => postBackgroundTask(fn, 3000);
 
         if (document.readyState === 'complete') runIdle();
         else window.addEventListener('load', runIdle, { once: true });
@@ -84,15 +144,13 @@
     const WRITE_MAINTENANCE_INTERVAL = 25;
     const HEURISTIC_MAX_TTL = 24 * HOUR;
 
+    // Revalidation costs a round trip, which is exactly what hurts on a bad
+    // link, so stale-tolerance scales with how expensive the network is.
+    // (Every branch of the previous switch returned the same 2h constant.)
     function getRevalidateTTL() {
-        if (!conn) return 2 * HOUR;
-        if (conn.saveData) return 2 * HOUR;
-
-        switch (conn.effectiveType) {
-            case '4g': return 2 * HOUR;
-            case '3g': return 2 * HOUR;
-            case '2g':
-            case 'slow-2g': return 2 * HOUR;
+        switch (getConnectionTier()) {
+            case TIER_SLOW: return 12 * HOUR;
+            case TIER_MODERATE: return 6 * HOUR;
             default: return 2 * HOUR;
         }
     }
@@ -292,6 +350,10 @@
         const meta = getMetadata(url);
         if (forceRevalidateUrls.has(url) || meta.forceRevalidate || !meta.cachedAt) return false;
 
+        // Offline: treat any stored copy as fresh. Revalidating would spend a
+        // guaranteed-failing round trip before falling back to this same copy.
+        if (navigator.onLine === false) return true;
+
         const ttlMs = meta.ttlMs === Infinity
             ? Infinity
             : (Number.isFinite(meta.ttlMs) && meta.ttlMs !== null ? meta.ttlMs : getRevalidateTTL());
@@ -310,25 +372,52 @@
         return cache.delete(cacheRequest).catch(() => {});
     }
 
-    function triggerMaintenance() {
-        if (navigator.scheduler && typeof navigator.scheduler.postTask === 'function') {
-            navigator.scheduler.postTask(pruneCache, { priority: 'background' });
-        } else if ('requestIdleCallback' in window) {
-            window.requestIdleCallback(pruneCache, { timeout: 5000 });
-        } else {
-            setTimeout(pruneCache, 5000);
+    // MAX_ITEMS bounds entry count, not bytes. An image-heavy origin can hit
+    // the storage quota well under 2000 entries, and once quota is exhausted
+    // every cache.put() throws — including the browser's own eviction-sensitive
+    // storage. Back off before that happens.
+    const STORAGE_CHECK_INTERVAL = 5 * MINUTE;
+    const STORAGE_PRESSURE_RATIO = 0.8;
+    let storagePressure = false;
+    let storageCheckedAt = 0;
+
+    async function underStoragePressure() {
+        if (!navigator.storage || typeof navigator.storage.estimate !== 'function') return false;
+
+        const now = Date.now();
+        if (storageCheckedAt && now - storageCheckedAt < STORAGE_CHECK_INTERVAL) return storagePressure;
+        storageCheckedAt = now;
+
+        try {
+            const estimate = await navigator.storage.estimate();
+            const quota = Number(estimate && estimate.quota) || 0;
+            const usage = Number(estimate && estimate.usage) || 0;
+            storagePressure = quota > 0 && usage / quota > STORAGE_PRESSURE_RATIO;
+        } catch (_) {
+            storagePressure = false;
         }
+
+        return storagePressure;
     }
 
-    async function pruneCache() {
+    function triggerMaintenance(targetMax) {
+        const limit = Number.isFinite(targetMax) ? targetMax : MAX_ITEMS;
+        // requestIdleCallback invokes its callback with an IdleDeadline, so the
+        // limit has to be bound here rather than passed through.
+        postBackgroundTask(() => pruneCache(limit), 5000);
+    }
+
+    async function pruneCache(targetMax) {
+        const limit = Number.isFinite(targetMax) ? targetMax : MAX_ITEMS;
+
         try {
             const cache = await caches.open(CACHE_NAME);
             const keys = await cache.keys();
-            if (keys.length <= MAX_ITEMS) return;
+            if (keys.length <= limit) return;
 
             const toDelete = keys
                 .sort((a, b) => (getMetadata(a.url).touchedAt || 0) - (getMetadata(b.url).touchedAt || 0))
-                .slice(0, Math.max(PRUNE_CHUNK, keys.length - MAX_ITEMS));
+                .slice(0, Math.max(PRUNE_CHUNK, keys.length - limit));
 
             await Promise.all(toDelete.map(req => {
                 metadataMap.delete(req.url);
@@ -475,7 +564,8 @@
                 return BYPASS_REQUEST_HEADERS.some(name => Boolean(headers.get(name)));
             }
             if (Array.isArray(headers)) {
-                return headers.some(([key]) => BYPASS_REQUEST_HEADERS.includes(String(key).toLowerCase()));
+                return headers.some(([key, value]) =>
+                    BYPASS_REQUEST_HEADERS.includes(String(key).toLowerCase()) && Boolean(value));
             }
             if (typeof headers === 'object') {
                 return Object.keys(headers).some(key => BYPASS_REQUEST_HEADERS.includes(key.toLowerCase()) && headers[key]);
@@ -645,6 +735,14 @@
                 }
             }
 
+            if (await underStoragePressure()) {
+                // Prune hard rather than storing more: half the entry budget is
+                // a blunt but effective way to release quota before the browser
+                // starts evicting on our behalf.
+                triggerMaintenance(Math.floor(MAX_ITEMS / 2));
+                return;
+            }
+
             try {
                 // Cache under the URL the caller will request again. A cached
                 // Response may retain its final redirected URL; Cache API keys
@@ -767,6 +865,8 @@
                 }
 
                 await storeResponse(cache, info, networkResponse, cacheability);
+                stats.revalidations += 1;
+                scheduleStatsSave();
             } catch (_) {
                 // Network failure: stale cache is still better than nothing.
             } finally {
@@ -847,7 +947,19 @@
                     stats.hits += 1;
                     scheduleStatsSave();
                     if (!inFlightRevalidations.has(info.url)) {
-                        inFlightRevalidations.set(info.url, revalidate(cache, info, this, args));
+                        // The caller already has its bytes. On a constrained
+                        // link, issuing the revalidation now would compete with
+                        // the page's own critical requests for the same pipe.
+                        if (getConnectionTier() === TIER_FAST) {
+                            inFlightRevalidations.set(info.url, revalidate(cache, info, this, args));
+                        } else {
+                            // Placeholder keeps a second hit from queueing a
+                            // duplicate before the deferred task runs.
+                            inFlightRevalidations.set(info.url, null);
+                            postBackgroundTask(() => {
+                                inFlightRevalidations.set(info.url, revalidate(cache, info, this, args));
+                            }, 5000);
+                        }
                     }
 
                     throwIfAborted(info.signal);
@@ -884,8 +996,13 @@
 
     installFetchCache();
 
+    const IDLE_WARM_LIMIT = 40;
+
     function initIdleCacheWarm() {
-        if (typeof caches === 'undefined' || isSlowOrMeteredConnection()) return;
+        // Warming re-fetches assets the parser already loaded, purely to copy
+        // them into the Cache API. That is a reasonable trade on an idle fast
+        // link and a bad one on anything slower.
+        if (typeof caches === 'undefined' || getConnectionTier() !== TIER_FAST) return;
         if (typeof unsafeWindow === 'undefined' || typeof unsafeWindow.fetch !== 'function') return;
 
         const urls = new Set();
@@ -896,6 +1013,7 @@
             if (url.origin !== location.origin) continue;
             if (!isCacheableUrl(url.href)) continue;
             urls.add(url.href);
+            if (urls.size >= IDLE_WARM_LIMIT) break;
         }
 
         let chain = Promise.resolve();
@@ -939,8 +1057,22 @@
             }
             try {
                 localStorage.removeItem(STATS_KEY);
+                localStorage.removeItem(LEARN_LCP_KEY);
+                localStorage.removeItem(LEARN_ORIGINS_KEY);
+                localStorage.removeItem(LEARN_VITALS_KEY);
             } catch (_) {}
-            alert('Quicksilver asset cache purged for this origin.');
+            learnedLcpUrl = null;
+            alert('Quicksilver asset cache and learned hints purged for this origin.');
+        });
+
+        GM_registerMenuCommand('Toggle Aggressive Rendering (content-visibility)', () => {
+            const next = contentVisibilityEnabled() ? '0' : '1';
+            try {
+                localStorage.setItem(CV_FLAG_KEY, next);
+            } catch (_) {}
+            alert('Aggressive rendering ' + (next === '1' ? 'enabled' : 'disabled')
+                + ' for this origin. Reload to apply.\n\nSkips layout/paint for offscreen '
+                + 'sections. Disable if sticky headers or in-page anchors misbehave.');
         });
 
         GM_registerMenuCommand('Show Cache Stats', async () => {
@@ -963,6 +1095,23 @@
 
             const total = stats.hits + stats.misses;
             const hitRate = total ? (stats.hits / total * 100).toFixed(1) : 'N/A';
+
+            // Cache hit rate measures the machinery; LCP measures whether any
+            // of this actually made the page faster.
+            const vitals = readStore(LEARN_VITALS_KEY);
+            const samples = (vitals && Array.isArray(vitals.lcp) ? vitals.lcp : []).filter(Number.isFinite);
+            let lcpStr = 'no samples yet';
+            if (samples.length) {
+                const sorted = samples.slice().sort((a, b) => a - b);
+                const median = sorted[Math.floor(sorted.length / 2)];
+                lcpStr = Math.round(median) + ' ms (median of ' + sorted.length + ')';
+            }
+
+            const tierName = { 1: 'slow', 2: 'moderate', 3: 'fast' }[getConnectionTier()] || 'unknown';
+            const lcpStore = readStore(LEARN_LCP_KEY);
+            const learnedPages = lcpStore ? Object.keys(lcpStore).length : 0;
+            const originStore = readStore(LEARN_ORIGINS_KEY);
+            const learnedOrigins = (originStore && Array.isArray(originStore.origins)) ? originStore.origins.length : 0;
             const sizeStr = estimatedSize > 1048576
                 ? (estimatedSize / 1048576).toFixed(1) + ' MB'
                 : Math.round(estimatedSize / 1024) + ' KB';
@@ -975,7 +1124,12 @@
                 'Revalidations: ' + stats.revalidations,
                 'Hit rate: ' + hitRate + '% (of ' + total + ' cacheable fetches)',
                 'Not cached: ' + stats.bypassed + ' asset-like fetches (reload/auth/skip policy)',
-                'TTL: ' + Math.round(getRevalidateTTL() / MINUTE) + ' min (' + (conn && conn.effectiveType || 'unknown') + ' connection)'
+                '',
+                'LCP: ' + lcpStr,
+                'Learned: ' + learnedPages + ' page(s), ' + learnedOrigins + ' origin(s)',
+                'Preloading LCP here: ' + (learnedLcpUrl ? 'yes' : 'no'),
+                'Tier: ' + tierName + ' (' + (conn && conn.effectiveType || 'unknown') + ')',
+                'TTL: ' + Math.round(getRevalidateTTL() / MINUTE) + ' min'
             ].join('\n'));
         });
     }
@@ -989,8 +1143,24 @@
     // Part 2: Speculation Rules prefetch/prerender (Chrome, aggressive)
     // =========================================================================
 
+    // Tracking parameters never change the response body, so a prefetch of
+    // /post should still satisfy a click on /post?utm_source=x. Without this
+    // hint every campaign-tagged link discards its own prefetch.
+    const NO_VARY_SEARCH_PARAMS = [
+        'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+        'gclid', 'gbraid', 'wbraid', 'fbclid', 'msclkid', 'yclid', 'igshid',
+        'mc_cid', 'mc_eid', '_ga', '_gl'
+    ];
+    const EXPECTS_NO_VARY_SEARCH = 'params=(' + NO_VARY_SEARCH_PARAMS.map(p => '"' + p + '"').join(' ') + ')';
+
+    // Above this many links, blanket-eager prefetch stops being a head start
+    // and becomes self-inflicted congestion: Chrome will happily run dozens of
+    // prefetches against the same connection the current page is still using.
+    const EAGER_PREFETCH_LINK_BUDGET = 40;
+
     function initSpeculationRules() {
-        if (!supportsSpeculationRules || isSlowOrMeteredConnection()) return;
+        const tier = getConnectionTier();
+        if (!supportsSpeculationRules || tier === TIER_SLOW) return;
 
         // Path-segment excludes — avoid substring traps like href*='order'→border.
         const excludeSelectors = [
@@ -1005,27 +1175,42 @@
             ...DOWNLOAD_EXTENSIONS.map(ext => "a[href$='" + ext + "' i]")
         ].join(', ');
 
+        const eligibleLinks = {
+            and: [
+                { href_matches: '/*' },
+                { not: { href_matches: SENSITIVE_PATH_PATTERNS } },
+                { not: { selector_matches: excludeSelectors } }
+            ]
+        };
+
+        let linkCount = 0;
+        try {
+            linkCount = document.querySelectorAll('a[href]').length;
+        } catch (_) {}
+
+        // 'moderate' is hover-triggered: nearly the same perceived win as
+        // 'eager' on a link-dense page, at a fraction of the bytes.
+        const prefetchEagerness = (tier === TIER_FAST && linkCount <= EAGER_PREFETCH_LINK_BUDGET)
+            ? 'eager'
+            : 'moderate';
+
         const rules = {
             prefetch: [{
-                where: {
-                    and: [
-                        { href_matches: '/*' },
-                        { not: { href_matches: SENSITIVE_PATH_PATTERNS } },
-                        { not: { selector_matches: excludeSelectors } }
-                    ]
-                },
-                eagerness: 'eager'
-            }],
-            prerender: [
+                where: eligibleLinks,
+                eagerness: prefetchEagerness,
+                expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
+            }]
+        };
+
+        // Prerender downloads *and* executes the target page. That is the right
+        // trade only when the connection can absorb it; on 3g the same budget
+        // is better spent finishing the page the user is actually looking at.
+        if (tier === TIER_FAST) {
+            rules.prerender = [
                 {
-                    where: {
-                        and: [
-                            { href_matches: '/*' },
-                            { not: { href_matches: SENSITIVE_PATH_PATTERNS } },
-                            { not: { selector_matches: excludeSelectors } }
-                        ]
-                    },
-                    eagerness: 'moderate'
+                    where: eligibleLinks,
+                    eagerness: 'moderate',
+                    expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
                 },
                 // Speculation rules only ever match <a>/<area> elements, so a
                 // link[rel=next] selector would be dead; ~= handles multi-token
@@ -1038,10 +1223,11 @@
                             { not: { href_matches: SENSITIVE_PATH_PATTERNS } }
                         ]
                     },
-                    eagerness: 'immediate'
+                    eagerness: 'immediate',
+                    expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
                 }
-            ]
-        };
+            ];
+        }
 
         try {
             const script = document.createElement('script');
@@ -1119,11 +1305,14 @@
     // Part 4: pointerdown prefetch supplement (Chrome gaps / older builds)
     // =========================================================================
 
-    function initPointerdownPrefetch() {
-        if (isSlowOrMeteredConnection()) return;
+    const POINTERDOWN_MEMO_LIMIT = 100;
 
-        const prefetched = new Set();
-        let currentPrefetch = null;
+    function initPointerdownPrefetch() {
+        if (getConnectionTier() === TIER_SLOW) return;
+
+        const speculated = new Set();
+        let currentHint = null;
+        let currentRuleScript = null;
 
         function isEligible(link) {
             if (!link || !link.href) return false;
@@ -1142,23 +1331,52 @@
             return true;
         }
 
-        function prefetch(href) {
-            if (!document.head || prefetched.has(href)) return;
+        // A URL-scoped speculation rule beats <link rel=prefetch> here: the
+        // navigation consults the speculation-rules prefetch cache, and on a
+        // fast link prerender hands over an already-rendered page instead of
+        // just bytes. Only one is kept alive at a time — Chrome caps concurrent
+        // prerenders, and a rule for a link the user moved past is pure cost.
+        function speculate(href) {
+            const action = getConnectionTier() === TIER_FAST ? 'prerender' : 'prefetch';
+            const rules = {};
+            rules[action] = [{ urls: [href], eagerness: 'immediate' }];
 
-            if (currentPrefetch) currentPrefetch.remove();
+            const script = document.createElement('script');
+            script.type = 'speculationrules';
+            script.textContent = JSON.stringify(rules);
 
+            if (currentRuleScript) currentRuleScript.remove();
+            (document.head || document.documentElement).appendChild(script);
+            currentRuleScript = script;
+        }
+
+        function prefetchHint(href) {
             const hint = document.createElement('link');
             hint.rel = 'prefetch';
             hint.href = href;
-            document.head.appendChild(hint);
-            currentPrefetch = hint;
-            prefetched.add(href);
+
+            if (currentHint) currentHint.remove();
+            (document.head || document.documentElement).appendChild(hint);
+            currentHint = hint;
+        }
+
+        function warm(href) {
+            if (speculated.has(href)) return;
+            // Unbounded on an infinite-scroll page; the memo only exists to
+            // stop repeat pointerdowns on the same link.
+            if (speculated.size >= POINTERDOWN_MEMO_LIMIT) speculated.clear();
+            speculated.add(href);
+
+            try {
+                if (supportsSpeculationRules) speculate(href);
+                else prefetchHint(href);
+            } catch (_) {}
         }
 
         document.addEventListener('pointerdown', e => {
             if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
             const link = getClosestLinkTarget(e.target);
-            if (isEligible(link)) prefetch(link.href);
+            if (isEligible(link)) warm(link.href);
         }, { passive: true, capture: true });
     }
 
@@ -1171,6 +1389,12 @@
     function initFontDisplaySwap() {
         if (typeof CSSFontFaceRule === 'undefined') return;
 
+        // `swap` still repaints and reflows when the webfont finally arrives —
+        // on a slow link that can be several seconds after first paint, which
+        // is the worst of both worlds. `optional` renders the fallback and
+        // never swaps, so text is stable from the first frame.
+        const displayValue = getConnectionTier() === TIER_SLOW ? 'optional' : 'swap';
+
         function patchSheet(sheet) {
             try {
                 const rules = sheet.cssRules || sheet.rules;
@@ -1178,7 +1402,7 @@
 
                 for (const rule of rules) {
                     if (rule instanceof CSSFontFaceRule && !rule.style.fontDisplay) {
-                        rule.style.fontDisplay = 'swap';
+                        rule.style.fontDisplay = displayValue;
                     }
                 }
 
@@ -1245,4 +1469,467 @@
     }
 
     runWhenDomReady(initFontDisplaySwap);
+
+    // =========================================================================
+    // Part 6: cross-visit learning (LCP preload + critical-origin preconnect)
+    // =========================================================================
+    //
+    // Everything above this point is reactive: it can only speed up a resource
+    // once the page has already revealed that it wants it. The largest single
+    // win left is starting the two things that gate first paint — the hero
+    // image and the third-party connections — before the parser discovers
+    // them. We cannot know those on a cold visit, but we saw them last time.
+
+    const LEARN_LCP_KEY = 'tm-qs-lcp';
+    const LEARN_ORIGINS_KEY = 'tm-qs-origins';
+    const LEARN_VITALS_KEY = 'tm-qs-vitals';
+    const LEARN_LCP_MAX_ENTRIES = 60;
+    const LEARN_ORIGIN_MAX_ENTRIES = 8;
+    const LEARN_VITALS_SAMPLES = 12;
+    const LEARN_MAX_AGE = 14 * 24 * HOUR;
+    // Act only on the third sighting: a page redesign should cost one wasted
+    // preload, not one on every visit until the record ages out.
+    const LEARN_MIN_SIGHTINGS = 2;
+    const LEARN_EARLY_RESOURCE_MS = 4000;
+    const FONT_EXTENSION = /\.(?:woff2?|ttf|otf|eot)(?:[?#]|$)/i;
+
+    let learnedLcpUrl = null;
+
+    function readStore(key) {
+        try {
+            const raw = localStorage.getItem(key);
+            if (!raw) return null;
+            const value = JSON.parse(raw);
+            return (value && typeof value === 'object') ? value : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function writeStore(key, value) {
+        try {
+            localStorage.setItem(key, JSON.stringify(value));
+        } catch (_) {}
+    }
+
+    function appendToHead(node) {
+        if (document.head) {
+            document.head.appendChild(node);
+            return;
+        }
+
+        const root = document.documentElement;
+        if (!root) return;
+
+        // document-start can run before <head> exists. Resource hints are only
+        // reliably processed once they are in the document, so wait for it.
+        const observer = new MutationObserver(() => {
+            if (!document.head) return;
+            observer.disconnect();
+            document.head.appendChild(node);
+        });
+        observer.observe(root, { childList: true });
+    }
+
+    // A responsive hero served via srcset resolves to a different candidate at
+    // a different width or DPR, so a record is only reusable at a similar
+    // viewport — otherwise the preload fetches a variant the page never uses.
+    function viewportBucket() {
+        const width = Math.round((window.innerWidth || 0) / 160) * 160;
+        const dpr = Math.round(window.devicePixelRatio || 1);
+        return width + 'x' + dpr;
+    }
+
+    function pageKey() {
+        // Exact pathname, deliberately not a normalised /post/* pattern: two
+        // articles under the same route have different hero images, and
+        // preloading the wrong one spends scarce bytes on an unused image.
+        return location.pathname.slice(0, 200);
+    }
+
+    function capStore(store, limit) {
+        const entries = Object.entries(store)
+            .sort((a, b) => (Number(b[1] && b[1].at) || 0) - (Number(a[1] && a[1].at) || 0))
+            .slice(0, limit);
+        return Object.fromEntries(entries);
+    }
+
+    function applyLearnedHints() {
+        const tier = getConnectionTier();
+
+        const lcpStore = readStore(LEARN_LCP_KEY);
+        const record = lcpStore && lcpStore[pageKey()];
+
+        if (
+            record
+            && typeof record.url === 'string'
+            && (Number(record.seen) || 0) >= LEARN_MIN_SIGHTINGS
+            && record.vw === viewportBucket()
+            && Date.now() - (Number(record.at) || 0) < LEARN_MAX_AGE
+        ) {
+            learnedLcpUrl = record.url;
+
+            try {
+                const link = document.createElement('link');
+                link.rel = 'preload';
+                link.as = 'image';
+                link.href = record.url;
+                link.setAttribute('fetchpriority', 'high');
+                // The preload has to match how the element will fetch it. A
+                // mismatched CORS mode produces a second request rather than a
+                // warm cache entry, which is worse than not preloading at all.
+                if (record.cors) link.crossOrigin = record.cors;
+                appendToHead(link);
+            } catch (_) {}
+        }
+
+        const originStore = readStore(LEARN_ORIGINS_KEY);
+        const origins = (originStore && Array.isArray(originStore.origins)) ? originStore.origins : [];
+        const budget = tier === TIER_SLOW ? 2 : (tier === TIER_MODERATE ? 3 : 4);
+
+        let used = 0;
+        for (const entry of origins) {
+            if (used >= budget) break;
+            if (!entry || typeof entry.o !== 'string') continue;
+            if ((Number(entry.n) || 0) < LEARN_MIN_SIGHTINGS) continue;
+            if (entry.o === location.origin) continue;
+
+            try {
+                const hint = document.createElement('link');
+                hint.rel = 'preconnect';
+                hint.href = entry.o;
+                // Fonts and other CSS-initiated subresources fetch in CORS mode
+                // and will not reuse an uncredentialed-mismatched connection.
+                if (entry.c) hint.crossOrigin = 'anonymous';
+                appendToHead(hint);
+                used += 1;
+            } catch (_) {}
+        }
+    }
+
+    function initLearning() {
+        let latestLcp = null;
+
+        try {
+            const observer = new PerformanceObserver(list => {
+                for (const entry of list.getEntries()) {
+                    // LCP is reported repeatedly as larger candidates appear;
+                    // the final one wins. Text LCP has no url — nothing to
+                    // preload there, so those entries are ignored.
+                    if (entry && entry.url) latestLcp = entry;
+                }
+            });
+            observer.observe({ type: 'largest-contentful-paint', buffered: true });
+        } catch (_) {}
+
+        function persistLcp() {
+            if (!latestLcp || !latestLcp.url) return;
+
+            const url = toUrl(latestLcp.url);
+            if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) return;
+
+            const store = readStore(LEARN_LCP_KEY) || {};
+            const key = pageKey();
+            const previous = store[key];
+            const bucket = viewportBucket();
+            const element = latestLcp.element;
+            const cors = (element && element.crossOrigin) ? element.crossOrigin : null;
+            const sameTarget = Boolean(previous && previous.url === url.href && previous.vw === bucket);
+
+            store[key] = {
+                url: url.href,
+                cors,
+                vw: bucket,
+                at: Date.now(),
+                // A changed target resets confidence rather than accumulating
+                // it, so a redesigned page stops being preloaded immediately.
+                seen: sameTarget ? Math.min(Number(previous.seen) || 0, 50) + 1 : 1
+            };
+
+            writeStore(LEARN_LCP_KEY, capStore(store, LEARN_LCP_MAX_ENTRIES));
+
+            const vitals = readStore(LEARN_VITALS_KEY) || {};
+            const samples = Array.isArray(vitals.lcp) ? vitals.lcp.filter(Number.isFinite) : [];
+            samples.push(Math.round(latestLcp.startTime));
+            writeStore(LEARN_VITALS_KEY, { lcp: samples.slice(-LEARN_VITALS_SAMPLES) });
+        }
+
+        function persistOrigins() {
+            let entries;
+            try {
+                entries = performance.getEntriesByType('resource') || [];
+            } catch (_) {
+                return;
+            }
+
+            const observed = new Map();
+            for (const entry of entries) {
+                // Only resources needed early are worth a preconnect; a lazily
+                // loaded widget's origin is not on the critical path.
+                if (!entry || entry.startTime > LEARN_EARLY_RESOURCE_MS) continue;
+
+                const url = toUrl(entry.name);
+                if (!url || url.origin === location.origin) continue;
+                if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
+
+                const needsCors = entry.initiatorType === 'css' || FONT_EXTENSION.test(url.pathname);
+                const existing = observed.get(url.origin);
+
+                if (existing) {
+                    existing.cors = existing.cors || needsCors;
+                    existing.first = Math.min(existing.first, entry.startTime);
+                } else {
+                    observed.set(url.origin, { origin: url.origin, cors: needsCors, first: entry.startTime });
+                }
+            }
+
+            if (!observed.size) return;
+
+            const store = readStore(LEARN_ORIGINS_KEY) || {};
+            const previous = Array.isArray(store.origins) ? store.origins : [];
+            const merged = new Map();
+
+            for (const entry of previous) {
+                if (!entry || typeof entry.o !== 'string') continue;
+                merged.set(entry.o, {
+                    o: entry.o,
+                    c: Boolean(entry.c),
+                    n: Number(entry.n) || 0,
+                    t: Number(entry.t) || 0
+                });
+            }
+
+            for (const info of observed.values()) {
+                const existing = merged.get(info.origin);
+                if (existing) {
+                    existing.n += 1;
+                    existing.c = existing.c || info.cors;
+                    existing.t = Math.min(existing.t || info.first, info.first);
+                } else {
+                    merged.set(info.origin, { o: info.origin, c: info.cors, n: 1, t: info.first });
+                }
+            }
+
+            // Most consistently used first, ties broken by how early the origin
+            // is needed — that is the order a preconnect budget should spend in.
+            const ranked = Array.from(merged.values())
+                .sort((a, b) => (b.n - a.n) || (a.t - b.t))
+                .slice(0, LEARN_ORIGIN_MAX_ENTRIES);
+
+            writeStore(LEARN_ORIGINS_KEY, { origins: ranked, at: Date.now() });
+        }
+
+        let persisted = false;
+        function persist() {
+            if (persisted) return;
+            persisted = true;
+            persistLcp();
+        }
+
+        // LCP is only final once the page is backgrounded or torn down.
+        // pagehide alone misses tab switches that never unload.
+        window.addEventListener('pagehide', persist);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') persist();
+        });
+
+        runWhenLoadedIdle(persistOrigins);
+    }
+
+    applyLearnedHints();
+    initLearning();
+
+    // =========================================================================
+    // Part 7: priority hints and lazy media
+    // =========================================================================
+    //
+    // Caveat worth knowing: for images the HTML parser discovers, Chrome's
+    // preload scanner may have already started the fetch before a userscript
+    // can touch the element, and neither loading=lazy nor fetchpriority
+    // retroactively cancels or reorders an in-flight request. The reliable win
+    // is script-inserted media — infinite scroll, SPA route changes, lazy
+    // widgets — which is also where the runaway byte counts usually are.
+
+    const MEDIA_EAGER_IMAGE_COUNT = 4;
+    const MEDIA_SCAN_BUDGET = 300;
+    const BELOW_FOLD_FACTOR = 1.5;
+
+    function initMediaPriority() {
+        const tunedImages = new WeakSet();
+        let imagesSeen = 0;
+        let lastPath = location.pathname;
+
+        // A client-side route change starts a new page as far as the user is
+        // concerned; without resetting, every image of every subsequent route
+        // would be lazy-loaded including its hero.
+        function syncRoute() {
+            if (location.pathname === lastPath) return;
+            lastPath = location.pathname;
+            imagesSeen = 0;
+        }
+
+        function foldLimit() {
+            return (window.innerHeight || document.documentElement.clientHeight || 0) * BELOW_FOLD_FACTOR;
+        }
+
+        function isLcpCandidate(img) {
+            if (!learnedLcpUrl) return false;
+            return img.currentSrc === learnedLcpUrl || img.src === learnedLcpUrl;
+        }
+
+        // Runs during parsing, so it must not read layout — getBoundingClientRect
+        // here would force a synchronous layout per image and return zeros
+        // anyway. Document order is the only signal available this early.
+        function tuneEarly(img) {
+            // MutationObserver records are delivered asynchronously, so a
+            // container's subtree is already populated by the time we see the
+            // record for the container itself. Every image inside therefore
+            // arrives twice — once via the container scan and once via its own
+            // record — which burns the eager budget at double rate and lazies
+            // images that should have stayed eager.
+            if (tunedImages.has(img)) return;
+            tunedImages.add(img);
+
+            imagesSeen += 1;
+            if (img.hasAttribute('loading') || img.hasAttribute('fetchpriority')) return;
+            if (!img.hasAttribute('decoding')) img.setAttribute('decoding', 'async');
+            if (imagesSeen <= MEDIA_EAGER_IMAGE_COUNT || isLcpCandidate(img)) return;
+
+            // Chrome still loads a lazy image immediately when it is inside (or
+            // near) the viewport, so a mis-classified above-fold image costs
+            // little, while a genuinely below-fold one costs nothing at all.
+            img.setAttribute('loading', 'lazy');
+            img.setAttribute('fetchpriority', 'low');
+        }
+
+        // Second pass, once layout exists: catches images the early pass had no
+        // ordering signal for and anything inserted after parsing.
+        function tuneWithLayout(el, limit) {
+            if (el.hasAttribute('loading') || el.hasAttribute('fetchpriority')) return;
+
+            const rect = el.getBoundingClientRect();
+            // No box yet (display:none, detached, not laid out): guessing here
+            // would deprioritise something that is about to become the hero.
+            if (rect.width === 0 && rect.height === 0) return;
+            if (rect.top <= limit) return;
+
+            const isImage = el.tagName === 'IMG';
+            if (isImage && isLcpCandidate(el)) return;
+
+            el.setAttribute('loading', 'lazy');
+            // fetchpriority has no meaning on <iframe>; loading=lazy is the
+            // whole lever there.
+            if (isImage) el.setAttribute('fetchpriority', 'low');
+        }
+
+        function tuneVideo(video) {
+            if (getConnectionTier() === TIER_FAST) return;
+            if (video.hasAttribute('preload') || video.autoplay) return;
+            // Only before playback starts; changing preload mid-playback would
+            // fight the media element rather than help it.
+            if (!video.paused || video.currentTime > 0) return;
+            video.setAttribute('preload', 'none');
+        }
+
+        function scanWithLayout() {
+            const limit = foldLimit();
+            let budget = MEDIA_SCAN_BUDGET;
+
+            try {
+                for (const img of document.images) {
+                    if (budget-- <= 0) break;
+                    tuneWithLayout(img, limit);
+                }
+                for (const frame of document.querySelectorAll('iframe')) {
+                    if (budget-- <= 0) break;
+                    tuneWithLayout(frame, limit);
+                }
+                for (const video of document.querySelectorAll('video')) {
+                    if (budget-- <= 0) break;
+                    tuneVideo(video);
+                }
+            } catch (_) {}
+        }
+
+        const root = document.documentElement;
+        if (root) {
+            // Handled synchronously rather than batched into a frame: the whole
+            // point is to touch the element before the fetch starts.
+            const observer = new MutationObserver(mutations => {
+                for (const mutation of mutations) {
+                    for (const node of mutation.addedNodes) {
+                        if (!(node instanceof Element)) continue;
+
+                        try {
+                            syncRoute();
+                            if (node.tagName === 'IMG') tuneEarly(node);
+                            else if (node.tagName === 'VIDEO') tuneVideo(node);
+                            else if (node.firstElementChild) {
+                                for (const img of node.querySelectorAll('img')) tuneEarly(img);
+                                for (const video of node.querySelectorAll('video')) tuneVideo(video);
+                            }
+                        } catch (_) {}
+                    }
+                }
+            });
+            observer.observe(root, { childList: true, subtree: true });
+        }
+
+        runWhenDomReady(scanWithLayout);
+        runWhenLoadedIdle(scanWithLayout);
+    }
+
+    initMediaPriority();
+
+    // =========================================================================
+    // Part 8: content-visibility (opt-in)
+    // =========================================================================
+    //
+    // Skipping layout and paint for offscreen sections is often a bigger win
+    // than any network change on a low-end device, but it interacts badly with
+    // sticky positioning, in-page anchors and some virtualised lists — so it
+    // stays behind a per-origin toggle rather than defaulting on.
+
+    const CV_FLAG_KEY = 'tm-qs-content-visibility';
+    const CV_MIN_HEIGHT = 300;
+    const CV_MAX_ELEMENTS = 60;
+
+    function contentVisibilityEnabled() {
+        try {
+            return localStorage.getItem(CV_FLAG_KEY) === '1';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function initContentVisibility() {
+        if (!contentVisibilityEnabled()) return;
+        if (typeof CSS === 'undefined' || !CSS.supports || !CSS.supports('content-visibility', 'auto')) return;
+
+        const container = document.querySelector('main, [role="main"], article') || document.body;
+        if (!container) return;
+
+        const limit = (window.innerHeight || 0) * BELOW_FOLD_FACTOR;
+        const candidates = [];
+
+        // Measure everything first, then write: interleaving would thrash
+        // layout once per section.
+        for (const child of container.children) {
+            if (candidates.length >= CV_MAX_ELEMENTS) break;
+            if (child.tagName === 'SCRIPT' || child.tagName === 'STYLE' || child.tagName === 'LINK') continue;
+
+            const rect = child.getBoundingClientRect();
+            if (rect.top <= limit || rect.height < CV_MIN_HEIGHT) continue;
+            candidates.push([child, rect.height]);
+        }
+
+        for (const [child, height] of candidates) {
+            // contain-intrinsic-size is what keeps the scrollbar and any
+            // in-page anchor offsets stable while the section is skipped.
+            child.style.setProperty('content-visibility', 'auto');
+            child.style.setProperty('contain-intrinsic-size', 'auto ' + Math.round(height) + 'px');
+        }
+    }
+
+    runWhenLoadedIdle(initContentVisibility);
 })();

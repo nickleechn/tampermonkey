@@ -159,19 +159,72 @@
         } else {
           fail('speculation-rules', raw.slice(0, 200));
         }
+
+        // Tracking params must not invalidate a speculation: every document
+        // rule carries the No-Vary-Search hint.
+        const allRules = [...(rules.prefetch || []), ...(rules.prerender || [])];
+        const nvs = allRules.every(r => typeof r.expects_no_vary_search === 'string'
+          && r.expects_no_vary_search.includes('utm_source'));
+        if (allRules.length && nvs) {
+          pass('speculation-no-vary-search', `${allRules.length} rules carry the hint`);
+        } else {
+          fail('speculation-no-vary-search', raw.slice(0, 200));
+        }
       } else {
         fail('speculation-rules', 'script[type=speculationrules] not injected in time');
       }
 
-      // 6) pointerdown prefetch supplement
+      // 6) pointerdown supplement — a URL-scoped speculation rule where the
+      // API exists, falling back to <link rel=prefetch> where it does not.
       const safe = document.getElementById('safe-link');
       safe.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, pointerType: 'mouse' }));
       await sleep(100);
-      const prefetchLink = document.querySelector('link[rel="prefetch"]');
-      if (prefetchLink && prefetchLink.href.includes('next.html')) {
-        pass('pointerdown-prefetch', prefetchLink.href);
+
+      const urlScoped = [...document.querySelectorAll('script[type="speculationrules"]')]
+        .map(el => { try { return JSON.parse(el.textContent); } catch (_) { return null; } })
+        .filter(Boolean)
+        .flatMap(rules => [...(rules.prefetch || []), ...(rules.prerender || [])])
+        .find(rule => Array.isArray(rule.urls)
+          && rule.urls.some(u => String(u).includes('next.html'))
+          && rule.eagerness === 'immediate');
+      const legacyLink = document.querySelector('link[rel="prefetch"]');
+
+      if (urlScoped) {
+        pass('pointerdown-prefetch', `url-scoped ${urlScoped.urls[0]}`);
+      } else if (legacyLink && legacyLink.href.includes('next.html')) {
+        pass('pointerdown-prefetch', `legacy ${legacyLink.href}`);
       } else {
-        fail('pointerdown-prefetch', `found=${prefetchLink && prefetchLink.href}`);
+        fail('pointerdown-prefetch', `no url-scoped rule; link=${legacyLink && legacyLink.href}`);
+      }
+
+      // 6b) Media priority — images beyond the eager budget are lazied as they
+      // are inserted, without waiting for layout. Deliberately positioned
+      // in-viewport so the layout pass (which lazies anything below the fold)
+      // cannot mask a broken ordering heuristic.
+      const mediaHost = document.createElement('div');
+      mediaHost.style.cssText = 'position:absolute; top:0; left:0;';
+      document.body.appendChild(mediaHost);
+      const inserted = [];
+      for (let i = 0; i < 8; i++) {
+        const img = document.createElement('img');
+        img.src = `./assets/pixel.png?i=${i}`;
+        img.width = 10;
+        img.height = 10;
+        mediaHost.appendChild(img);
+        inserted.push(img);
+      }
+      await sleep(150);
+      const lazyFlags = inserted.map(img => img.getAttribute('loading') === 'lazy');
+      // The first MEDIA_EAGER_IMAGE_COUNT (4) images of a page are the ones
+      // that might be the hero, so they must keep default loading.
+      const eagerHead = lazyFlags.slice(0, 4).every(v => v === false);
+      const lazyTail = lazyFlags.slice(4).every(v => v === true);
+      const lowPriority = inserted.slice(4).every(img => img.getAttribute('fetchpriority') === 'low');
+      if (eagerHead && lazyTail && lowPriority) {
+        pass('media-priority', 'first 4 eager, rest lazy + deprioritised');
+      } else {
+        const dump = inserted.map(img => img.getAttribute('loading') || '-').join(' ');
+        fail('media-priority', `flags=${JSON.stringify(lazyFlags)} dump=${dump}`);
       }
 
       // 7) preconnect/dns-prefetch on hover of external
