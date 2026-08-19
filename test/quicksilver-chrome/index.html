@@ -30,6 +30,28 @@
     };
     window.alert = function () {};
   </script>
+  <script>
+    // Simulate a third visit: seed what Quicksilver would have learned on the
+    // two previous ones, before it runs at document-start. Without GM_* shims
+    // the script falls back to localStorage, which is what we can seed here.
+    (function () {
+      const bucket = Math.round((window.innerWidth || 0) / 160) * 160
+        + 'x' + Math.round(window.devicePixelRatio || 1);
+      window.__QS_SEEDED_LCP__ = new URL('./assets/hero.png', location.href).href;
+      window.__QS_SEEDED_ORIGIN__ = 'https://learned-cdn.example';
+      localStorage.setItem('tm-qs-lcp', JSON.stringify({
+        [location.pathname]: {
+          url: window.__QS_SEEDED_LCP__,
+          cors: null, srcset: null, sizes: null,
+          vw: bucket, at: Date.now(), seen: 2
+        }
+      }));
+      localStorage.setItem('tm-qs-origins', JSON.stringify({
+        origins: [{ o: window.__QS_SEEDED_ORIGIN__, c: true, n: 3, t: 120, u: Date.now() }],
+        at: Date.now()
+      }));
+    })();
+  </script>
   <script src="/Quicksilver.js"></script>
   <script type="module">
     const out = document.getElementById('results');
@@ -197,34 +219,59 @@
         fail('pointerdown-prefetch', `no url-scoped rule; link=${legacyLink && legacyLink.href}`);
       }
 
-      // 6b) Media priority — images beyond the eager budget are lazied as they
-      // are inserted, without waiting for layout. Deliberately positioned
-      // in-viewport so the layout pass (which lazies anything below the fold)
-      // cannot mask a broken ordering heuristic.
+      // 6b) Media priority — late-inserted media is classified by layout, not
+      // by document order. An above-fold image must keep default loading (it
+      // could be the LCP); a below-fold one must be lazied and deprioritised.
       const mediaHost = document.createElement('div');
-      mediaHost.style.cssText = 'position:absolute; top:0; left:0;';
+      mediaHost.style.cssText = 'position:absolute; left:0; top:0; width:100px;';
       document.body.appendChild(mediaHost);
-      const inserted = [];
-      for (let i = 0; i < 8; i++) {
+
+      function addImage(host, i) {
         const img = document.createElement('img');
         img.src = `./assets/pixel.png?i=${i}`;
         img.width = 10;
         img.height = 10;
-        mediaHost.appendChild(img);
-        inserted.push(img);
+        host.appendChild(img);
+        return img;
       }
-      await sleep(150);
-      const lazyFlags = inserted.map(img => img.getAttribute('loading') === 'lazy');
-      // The first MEDIA_EAGER_IMAGE_COUNT (4) images of a page are the ones
-      // that might be the hero, so they must keep default loading.
-      const eagerHead = lazyFlags.slice(0, 4).every(v => v === false);
-      const lazyTail = lazyFlags.slice(4).every(v => v === true);
-      const lowPriority = inserted.slice(4).every(img => img.getAttribute('fetchpriority') === 'low');
-      if (eagerHead && lazyTail && lowPriority) {
-        pass('media-priority', 'first 4 eager, rest lazy + deprioritised');
+
+      const aboveFold = [0, 1, 2].map(i => addImage(mediaHost, i));
+
+      const belowHost = document.createElement('div');
+      belowHost.style.cssText = 'position:absolute; left:0; top:20000px; width:100px;';
+      document.body.appendChild(belowHost);
+      const belowFold = [3, 4, 5].map(i => addImage(belowHost, i));
+
+      // Two frames plus slack: classification is batched into requestAnimationFrame.
+      await sleep(250);
+
+      const aboveUntouched = aboveFold.every(img => !img.hasAttribute('loading') && !img.hasAttribute('fetchpriority'));
+      const belowLazied = belowFold.every(img => img.getAttribute('loading') === 'lazy'
+        && img.getAttribute('fetchpriority') === 'low');
+
+      if (aboveUntouched && belowLazied) {
+        pass('media-priority', 'above-fold untouched, below-fold lazy + deprioritised');
       } else {
-        const dump = inserted.map(img => img.getAttribute('loading') || '-').join(' ');
-        fail('media-priority', `flags=${JSON.stringify(lazyFlags)} dump=${dump}`);
+        const dump = [...aboveFold, ...belowFold]
+          .map(img => `${img.getAttribute('loading') || '-'}:${img.getAttribute('fetchpriority') || '-'}`)
+          .join(' ');
+        fail('media-priority', `above=${aboveUntouched} below=${belowLazied} dump=${dump}`);
+      }
+
+      // 6c) Cross-visit learning — the seeded record must produce a
+      // high-priority image preload and a crossorigin preconnect, both at
+      // document-start rather than on resource discovery.
+      const preload = [...document.querySelectorAll('link[rel="preload"][as="image"]')]
+        .find(l => l.href === window.__QS_SEEDED_LCP__);
+      const learnedPreconnect = [...document.querySelectorAll('link[rel="preconnect"]')]
+        .find(l => l.href.startsWith(window.__QS_SEEDED_ORIGIN__));
+
+      if (preload && preload.getAttribute('fetchpriority') === 'high'
+          && learnedPreconnect && learnedPreconnect.crossOrigin === 'anonymous') {
+        pass('learned-hints', 'LCP preload + crossorigin preconnect injected');
+      } else {
+        fail('learned-hints', `preload=${!!preload} fp=${preload && preload.getAttribute('fetchpriority')} `
+          + `preconnect=${!!learnedPreconnect} cors=${learnedPreconnect && learnedPreconnect.crossOrigin}`);
       }
 
       // 7) preconnect/dns-prefetch on hover of external

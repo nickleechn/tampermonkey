@@ -8,6 +8,9 @@
 // @updateURL    https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.js
 // @downloadURL  https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.js
 // @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
 // @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
@@ -27,6 +30,18 @@
     const SECOND = 1000;
     const MINUTE = 60 * SECOND;
     const HOUR = 60 * MINUTE;
+
+    // Ad-heavy pages carry 20+ cross-origin frames. Running the learning,
+    // media and rendering passes in each one charges their setup cost to the
+    // very page load this script exists to speed up, for hints that are
+    // near-useless inside a 300x250 frame.
+    const isTopFrame = (() => {
+        try {
+            return window.top === window.self;
+        } catch (_) {
+            return false;
+        }
+    })();
 
     const conn = navigator.connection;
     const supportsSpeculationRules = Boolean(HTMLScriptElement.supports && HTMLScriptElement.supports('speculationrules'));
@@ -67,10 +82,6 @@
         if (Number.isFinite(conn.downlink) && conn.downlink > 0 && conn.downlink < 0.7) return TIER_SLOW;
 
         return TIER_FAST;
-    }
-
-    function isSlowOrMeteredConnection() {
-        return getConnectionTier() === TIER_SLOW;
     }
 
     function postBackgroundTask(fn, timeout) {
@@ -400,19 +411,34 @@
         return storagePressure;
     }
 
-    function triggerMaintenance(targetMax) {
-        const limit = Number.isFinite(targetMax) ? targetMax : MAX_ITEMS;
+    let prunePending = false;
+
+    function triggerMaintenance(targetRatio) {
+        // Under storage pressure every cacheable response would otherwise queue
+        // its own prune, so one page load can schedule dozens of full cache
+        // enumerations that each free nothing.
+        if (prunePending) return;
+        prunePending = true;
+
         // requestIdleCallback invokes its callback with an IdleDeadline, so the
-        // limit has to be bound here rather than passed through.
-        postBackgroundTask(() => pruneCache(limit), 5000);
+        // ratio has to be bound here rather than passed through.
+        postBackgroundTask(() => pruneCache(targetRatio), 5000);
     }
 
-    async function pruneCache(targetMax) {
-        const limit = Number.isFinite(targetMax) ? targetMax : MAX_ITEMS;
+    async function pruneCache(targetRatio) {
+        prunePending = false;
 
         try {
             const cache = await caches.open(CACHE_NAME);
             const keys = await cache.keys();
+
+            // Quota pressure is about bytes, not entry count: a cache of 300
+            // large images can exhaust the quota while sitting far below
+            // MAX_ITEMS, where a count-based target would free nothing at all.
+            const limit = Number.isFinite(targetRatio)
+                ? Math.floor(keys.length * targetRatio)
+                : MAX_ITEMS;
+
             if (keys.length <= limit) return;
 
             const toDelete = keys
@@ -739,7 +765,7 @@
                 // Prune hard rather than storing more: half the entry budget is
                 // a blunt but effective way to release quota before the browser
                 // starts evicting on our behalf.
-                triggerMaintenance(Math.floor(MAX_ITEMS / 2));
+                triggerMaintenance(0.5);
                 return;
             }
 
@@ -1057,10 +1083,10 @@
             }
             try {
                 localStorage.removeItem(STATS_KEY);
-                localStorage.removeItem(LEARN_LCP_KEY);
-                localStorage.removeItem(LEARN_ORIGINS_KEY);
-                localStorage.removeItem(LEARN_VITALS_KEY);
             } catch (_) {}
+            deleteStore(LEARN_LCP_KEY);
+            deleteStore(LEARN_ORIGINS_KEY);
+            deleteStore(LEARN_VITALS_KEY);
             learnedLcpUrl = null;
             alert('Quicksilver asset cache and learned hints purged for this origin.');
         });
@@ -1072,7 +1098,8 @@
             } catch (_) {}
             alert('Aggressive rendering ' + (next === '1' ? 'enabled' : 'disabled')
                 + ' for this origin. Reload to apply.\n\nSkips layout/paint for offscreen '
-                + 'sections. Disable if sticky headers or in-page anchors misbehave.');
+                + 'sections. Disable if dropdowns or tooltips appear clipped at a section '
+                + 'edge, or if sticky headers or in-page anchors misbehave.');
         });
 
         GM_registerMenuCommand('Show Cache Stats', async () => {
@@ -1305,14 +1332,28 @@
     // Part 4: pointerdown prefetch supplement (Chrome gaps / older builds)
     // =========================================================================
 
-    const POINTERDOWN_MEMO_LIMIT = 100;
-
     function initPointerdownPrefetch() {
         if (getConnectionTier() === TIER_SLOW) return;
 
-        const speculated = new Set();
+        // Deliberately not a growing memo of every link ever warmed: only one
+        // speculation is installed at a time, and removing a rules script
+        // cancels its prefetch/prerender outright. A Set would make a second
+        // pointerdown on an earlier link a silent no-op after its rule had
+        // already been torn down.
+        let currentHref = null;
         let currentHint = null;
         let currentRuleScript = null;
+        let rulesBlocked = false;
+
+        // Inline speculation-rules scripts need CSP 'inline-speculation-rules'.
+        // On a strict-CSP origin every pointerdown would otherwise be a blocked
+        // script plus a violation report, with no fallback ever reached.
+        document.addEventListener('securitypolicyviolation', event => {
+            if (event && typeof event.violatedDirective === 'string'
+                && event.violatedDirective.indexOf('script-src') === 0) {
+                rulesBlocked = true;
+            }
+        });
 
         function isEligible(link) {
             if (!link || !link.href) return false;
@@ -1361,14 +1402,11 @@
         }
 
         function warm(href) {
-            if (speculated.has(href)) return;
-            // Unbounded on an infinite-scroll page; the memo only exists to
-            // stop repeat pointerdowns on the same link.
-            if (speculated.size >= POINTERDOWN_MEMO_LIMIT) speculated.clear();
-            speculated.add(href);
+            if (currentHref === href) return;
+            currentHref = href;
 
             try {
-                if (supportsSpeculationRules) speculate(href);
+                if (supportsSpeculationRules && !rulesBlocked) speculate(href);
                 else prefetchHint(href);
             } catch (_) {}
         }
@@ -1495,12 +1533,53 @@
 
     let learnedLcpUrl = null;
 
+    // localStorage would put a durable visit log somewhere every script on the
+    // origin can read — including analytics and ad tags, which run in the top
+    // origin's context and would inherit history from before they were present.
+    // Extension storage is invisible to the page. It is shared across origins
+    // though, so keys are namespaced and the origin set is bounded.
+    const LEARN_INDEX_KEY = 'tm-qs-origin-index';
+    const LEARN_MAX_ORIGINS = 150;
+    const hasGmStorage = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+
+    function storeKey(key) {
+        return hasGmStorage ? key + '::' + location.origin : key;
+    }
+
+    function rawRead(key) {
+        try {
+            return hasGmStorage ? GM_getValue(key, null) : localStorage.getItem(key);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function rawWrite(key, raw) {
+        try {
+            if (hasGmStorage) GM_setValue(key, raw);
+            else localStorage.setItem(key, raw);
+        } catch (_) {}
+    }
+
+    function rawDelete(key) {
+        try {
+            if (hasGmStorage) {
+                if (typeof GM_deleteValue === 'function') GM_deleteValue(key);
+                else GM_setValue(key, '');
+            } else {
+                localStorage.removeItem(key);
+            }
+        } catch (_) {}
+    }
+
     function readStore(key) {
         try {
-            const raw = localStorage.getItem(key);
-            if (!raw) return null;
+            const raw = rawRead(storeKey(key));
+            if (!raw || typeof raw !== 'string') return null;
             const value = JSON.parse(raw);
-            return (value && typeof value === 'object') ? value : null;
+            // Anything here may have been written by a hostile origin (in the
+            // localStorage fallback) or by an older schema.
+            return (value && typeof value === 'object' && !Array.isArray(value)) ? value : null;
         } catch (_) {
             return null;
         }
@@ -1508,7 +1587,42 @@
 
     function writeStore(key, value) {
         try {
-            localStorage.setItem(key, JSON.stringify(value));
+            rawWrite(storeKey(key), JSON.stringify(value));
+        } catch (_) {}
+        touchOriginIndex();
+    }
+
+    function deleteStore(key) {
+        rawDelete(storeKey(key));
+    }
+
+    // Extension storage is not scoped per origin and nothing else would ever
+    // evict it, so the set of origins we hold data for is capped explicitly.
+    function touchOriginIndex() {
+        if (!hasGmStorage) return;
+
+        let index;
+        try {
+            const raw = rawRead(LEARN_INDEX_KEY);
+            index = raw ? JSON.parse(raw) : null;
+        } catch (_) {
+            index = null;
+        }
+        if (!Array.isArray(index)) index = [];
+
+        const now = Date.now();
+        const kept = index.filter(entry => entry && typeof entry.o === 'string' && entry.o !== location.origin);
+        kept.push({ o: location.origin, at: now });
+        kept.sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0));
+
+        for (const evicted of kept.slice(LEARN_MAX_ORIGINS)) {
+            for (const key of [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_VITALS_KEY]) {
+                rawDelete(key + '::' + evicted.o);
+            }
+        }
+
+        try {
+            rawWrite(LEARN_INDEX_KEY, JSON.stringify(kept.slice(0, LEARN_MAX_ORIGINS)));
         } catch (_) {}
     }
 
@@ -1579,6 +1693,21 @@
                 // mismatched CORS mode produces a second request rather than a
                 // warm cache entry, which is worse than not preloading at all.
                 if (record.cors) link.crossOrigin = record.cors;
+                // Replaying srcset/sizes lets the browser resolve the same
+                // candidate the <img> will, instead of us betting on the
+                // viewport bucket still matching.
+                if (record.srcset) {
+                    link.setAttribute('imagesrcset', record.srcset);
+                    if (record.sizes) link.setAttribute('imagesizes', record.sizes);
+                }
+                // A hero that 404s or was removed should stop being preloaded
+                // rather than cost a request a day for two weeks.
+                link.addEventListener('error', () => {
+                    const current = readStore(LEARN_LCP_KEY);
+                    if (!current || !current[pageKey()]) return;
+                    delete current[pageKey()];
+                    writeStore(LEARN_LCP_KEY, current);
+                }, { once: true });
                 appendToHead(link);
             } catch (_) {}
         }
@@ -1593,6 +1722,8 @@
             if (!entry || typeof entry.o !== 'string') continue;
             if ((Number(entry.n) || 0) < LEARN_MIN_SIGHTINGS) continue;
             if (entry.o === location.origin) continue;
+            const updatedAt = Number(entry.u) || 0;
+            if (updatedAt && Date.now() - updatedAt > LEARN_MAX_AGE) continue;
 
             try {
                 const hint = document.createElement('link');
@@ -1616,29 +1747,57 @@
                     // LCP is reported repeatedly as larger candidates appear;
                     // the final one wins. Text LCP has no url — nothing to
                     // preload there, so those entries are ignored.
-                    if (entry && entry.url) latestLcp = entry;
+                    if (!entry || !entry.url) continue;
+
+                    // Snapshot now, not at pagehide: entry.element is null once
+                    // the element leaves the document, which is routine for
+                    // carousels and SPA route changes, and reading crossOrigin
+                    // as null then is exactly the CORS-mode mismatch that turns
+                    // the preload into a second full download.
+                    const element = entry.element;
+                    latestLcp = {
+                        url: entry.url,
+                        startTime: entry.startTime,
+                        cors: (element && element.crossOrigin) || null,
+                        srcset: (element && element.getAttribute) ? element.getAttribute('srcset') : null,
+                        sizes: (element && element.getAttribute) ? element.getAttribute('sizes') : null
+                    };
                 }
             });
             observer.observe({ type: 'largest-contentful-paint', buffered: true });
         } catch (_) {}
 
         function persistLcp() {
-            if (!latestLcp || !latestLcp.url) return;
+            const key = pageKey();
+
+            if (!latestLcp || !latestLcp.url) {
+                // No image LCP this visit: redesigned to a text headline, or
+                // the hero is gone. Returning early would leave the old record
+                // authoritative for the full LEARN_MAX_AGE, preloading an image
+                // the page no longer references against the real LCP.
+                const existing = readStore(LEARN_LCP_KEY);
+                if (!existing || !existing[key]) return;
+
+                const seen = (Number(existing[key].seen) || 0) - 1;
+                if (seen <= 0) delete existing[key];
+                else existing[key] = Object.assign({}, existing[key], { seen });
+                writeStore(LEARN_LCP_KEY, existing);
+                return;
+            }
 
             const url = toUrl(latestLcp.url);
             if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) return;
 
             const store = readStore(LEARN_LCP_KEY) || {};
-            const key = pageKey();
             const previous = store[key];
             const bucket = viewportBucket();
-            const element = latestLcp.element;
-            const cors = (element && element.crossOrigin) ? element.crossOrigin : null;
             const sameTarget = Boolean(previous && previous.url === url.href && previous.vw === bucket);
 
             store[key] = {
                 url: url.href,
-                cors,
+                cors: latestLcp.cors,
+                srcset: latestLcp.srcset,
+                sizes: latestLcp.sizes,
                 vw: bucket,
                 at: Date.now(),
                 // A changed target resets confidence rather than accumulating
@@ -1689,13 +1848,21 @@
             const previous = Array.isArray(store.origins) ? store.origins : [];
             const merged = new Map();
 
+            const now = Date.now();
             for (const entry of previous) {
                 if (!entry || typeof entry.o !== 'string') continue;
+                // Without aging, a CDN that mattered a year ago outranks a
+                // currently-critical origin forever and keeps costing a
+                // DNS+TCP+TLS handshake on every visit.
+                const updatedAt = Number(entry.u) || 0;
+                if (updatedAt && now - updatedAt > LEARN_MAX_AGE) continue;
+
                 merged.set(entry.o, {
                     o: entry.o,
                     c: Boolean(entry.c),
                     n: Number(entry.n) || 0,
-                    t: Number(entry.t) || 0
+                    t: Number(entry.t) || 0,
+                    u: updatedAt
                 });
             }
 
@@ -1705,8 +1872,9 @@
                     existing.n += 1;
                     existing.c = existing.c || info.cors;
                     existing.t = Math.min(existing.t || info.first, info.first);
+                    existing.u = now;
                 } else {
-                    merged.set(info.origin, { o: info.origin, c: info.cors, n: 1, t: info.first });
+                    merged.set(info.origin, { o: info.origin, c: info.cors, n: 1, t: info.first, u: now });
                 }
             }
 
@@ -1719,10 +1887,23 @@
             writeStore(LEARN_ORIGINS_KEY, { origins: ranked, at: Date.now() });
         }
 
+        let sawLoad = document.readyState === 'complete';
+        let hiddenBeforeLoad = document.visibilityState === 'hidden';
+        window.addEventListener('load', () => { sawLoad = true; }, { once: true });
+
         let persisted = false;
         function persist() {
             if (persisted) return;
             persisted = true;
+
+            // LCP is finalised when the page is backgrounded. A user who tabs
+            // away at 800ms finalises it on whatever had painted — often the
+            // logo. That wrong value is *consistent* across such visits, so the
+            // seen>=2 gate endorses it instead of filtering it out, and the
+            // script trains itself to preload the logo and shield it from
+            // lazying while the real hero stays eligible for fetchpriority=low.
+            if (!sawLoad || hiddenBeforeLoad) return;
+
             persistLcp();
         }
 
@@ -1730,14 +1911,18 @@
         // pagehide alone misses tab switches that never unload.
         window.addEventListener('pagehide', persist);
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'hidden') persist();
+            if (document.visibilityState !== 'hidden') return;
+            if (!sawLoad) hiddenBeforeLoad = true;
+            persist();
         });
 
         runWhenLoadedIdle(persistOrigins);
     }
 
-    applyLearnedHints();
-    initLearning();
+    if (isTopFrame) {
+        applyLearnedHints();
+        initLearning();
+    }
 
     // =========================================================================
     // Part 7: priority hints and lazy media
@@ -1750,66 +1935,45 @@
     // is script-inserted media — infinite scroll, SPA route changes, lazy
     // widgets — which is also where the runaway byte counts usually are.
 
-    const MEDIA_EAGER_IMAGE_COUNT = 4;
     const MEDIA_SCAN_BUDGET = 300;
     const BELOW_FOLD_FACTOR = 1.5;
 
     function initMediaPriority() {
         const tunedImages = new WeakSet();
-        let imagesSeen = 0;
-        let lastPath = location.pathname;
-
-        // A client-side route change starts a new page as far as the user is
-        // concerned; without resetting, every image of every subsequent route
-        // would be lazy-loaded including its hero.
-        function syncRoute() {
-            if (location.pathname === lastPath) return;
-            lastPath = location.pathname;
-            imagesSeen = 0;
-        }
+        let pending = null;
 
         function foldLimit() {
             return (window.innerHeight || document.documentElement.clientHeight || 0) * BELOW_FOLD_FACTOR;
         }
 
+        // A responsive hero has no resolved currentSrc until layout runs, and
+        // may never expose the learned URL through .src at all, so match on
+        // every candidate the element could resolve to.
         function isLcpCandidate(img) {
             if (!learnedLcpUrl) return false;
-            return img.currentSrc === learnedLcpUrl || img.src === learnedLcpUrl;
+            if (img.currentSrc === learnedLcpUrl || img.src === learnedLcpUrl) return true;
+
+            const srcset = img.getAttribute('srcset');
+            if (!srcset) return false;
+
+            return srcset.split(',').some(candidate => {
+                const href = candidate.trim().split(/\s+/)[0];
+                if (!href) return false;
+                const url = toUrl(href);
+                return Boolean(url) && url.href === learnedLcpUrl;
+            });
         }
 
-        // Runs during parsing, so it must not read layout — getBoundingClientRect
-        // here would force a synchronous layout per image and return zeros
-        // anyway. Document order is the only signal available this early.
-        function tuneEarly(img) {
-            // MutationObserver records are delivered asynchronously, so a
-            // container's subtree is already populated by the time we see the
-            // record for the container itself. Every image inside therefore
-            // arrives twice — once via the container scan and once via its own
-            // record — which burns the eager budget at double rate and lazies
-            // images that should have stayed eager.
-            if (tunedImages.has(img)) return;
-            tunedImages.add(img);
-
-            imagesSeen += 1;
-            if (img.hasAttribute('loading') || img.hasAttribute('fetchpriority')) return;
-            if (!img.hasAttribute('decoding')) img.setAttribute('decoding', 'async');
-            if (imagesSeen <= MEDIA_EAGER_IMAGE_COUNT || isLcpCandidate(img)) return;
-
-            // Chrome still loads a lazy image immediately when it is inside (or
-            // near) the viewport, so a mis-classified above-fold image costs
-            // little, while a genuinely below-fold one costs nothing at all.
-            img.setAttribute('loading', 'lazy');
-            img.setAttribute('fetchpriority', 'low');
-        }
-
-        // Second pass, once layout exists: catches images the early pass had no
-        // ordering signal for and anything inserted after parsing.
+        // Every decision here needs layout. Guessing from document order was
+        // tried and is actively harmful: on markup that opens with a logo and
+        // a few nav icons, the hero is image five, and lazy + fetchpriority=low
+        // on the LCP element is the best-documented way to make a page slower.
         function tuneWithLayout(el, limit) {
             if (el.hasAttribute('loading') || el.hasAttribute('fetchpriority')) return;
 
             const rect = el.getBoundingClientRect();
-            // No box yet (display:none, detached, not laid out): guessing here
-            // would deprioritise something that is about to become the hero.
+            // No box yet (display:none, detached, mid-parse): leave it alone
+            // rather than deprioritise something about to become the hero.
             if (rect.width === 0 && rect.height === 0) return;
             if (rect.top <= limit) return;
 
@@ -1823,12 +1987,14 @@
         }
 
         function tuneVideo(video) {
-            if (getConnectionTier() === TIER_FAST) return;
+            // rtt >= 270ms lands ordinary 4G in the moderate tier, and
+            // preload="none" leaves duration NaN until play, which breaks
+            // custom players that build their scrubber on loadedmetadata.
+            // "metadata" still avoids downloading the media body.
+            if (getConnectionTier() !== TIER_SLOW) return;
             if (video.hasAttribute('preload') || video.autoplay) return;
-            // Only before playback starts; changing preload mid-playback would
-            // fight the media element rather than help it.
             if (!video.paused || video.currentTime > 0) return;
-            video.setAttribute('preload', 'none');
+            video.setAttribute('preload', 'metadata');
         }
 
         function scanWithLayout() {
@@ -1851,22 +2017,47 @@
             } catch (_) {}
         }
 
+        // Late-inserted media (infinite scroll, SPA routes) is where the real
+        // byte savings are, and by then layout is available. Batching into a
+        // frame also collapses the duplicate delivery a subtree observer sees
+        // for a container and each of its children.
+        function flushPending() {
+            const batch = pending;
+            pending = null;
+            if (!batch) return;
+
+            const limit = foldLimit();
+            for (const el of batch) {
+                try {
+                    if (el.tagName === 'VIDEO') tuneVideo(el);
+                    else tuneWithLayout(el, limit);
+                } catch (_) {}
+            }
+        }
+
+        function enqueue(el) {
+            if (tunedImages.has(el)) return;
+            tunedImages.add(el);
+
+            if (!pending) {
+                pending = new Set();
+                window.requestAnimationFrame(flushPending);
+            }
+            if (pending.size < MEDIA_SCAN_BUDGET) pending.add(el);
+        }
+
         const root = document.documentElement;
         if (root) {
-            // Handled synchronously rather than batched into a frame: the whole
-            // point is to touch the element before the fetch starts.
             const observer = new MutationObserver(mutations => {
                 for (const mutation of mutations) {
                     for (const node of mutation.addedNodes) {
                         if (!(node instanceof Element)) continue;
 
                         try {
-                            syncRoute();
-                            if (node.tagName === 'IMG') tuneEarly(node);
-                            else if (node.tagName === 'VIDEO') tuneVideo(node);
+                            const tag = node.tagName;
+                            if (tag === 'IMG' || tag === 'VIDEO' || tag === 'IFRAME') enqueue(node);
                             else if (node.firstElementChild) {
-                                for (const img of node.querySelectorAll('img')) tuneEarly(img);
-                                for (const video of node.querySelectorAll('video')) tuneVideo(video);
+                                for (const el of node.querySelectorAll('img, video, iframe')) enqueue(el);
                             }
                         } catch (_) {}
                     }
@@ -1879,7 +2070,7 @@
         runWhenLoadedIdle(scanWithLayout);
     }
 
-    initMediaPriority();
+    if (isTopFrame) initMediaPriority();
 
     // =========================================================================
     // Part 8: content-visibility (opt-in)
@@ -1931,5 +2122,5 @@
         }
     }
 
-    runWhenLoadedIdle(initContentVisibility);
+    if (isTopFrame) runWhenLoadedIdle(initContentVisibility);
 })();
