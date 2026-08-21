@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      3.1.0
-// @description  Chrome-only: connection-tiered Speculation Rules prefetch/prerender, learned LCP preload + origin preconnect, media priority hints, and a high-hit-rate LRU static asset cache. Respects Cache-Control, avoids sensitive links/APIs, and degrades gracefully on slow connections.
+// @version      4.0.0
+// @description  Chrome-only: connection-tiered Speculation Rules prefetch/prerender, learned LCP preload + origin preconnect, navigation-transition prediction, media priority hints, and opt-in content-visibility. Avoids sensitive links and degrades gracefully on slow connections.
 // @author       You
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.js
@@ -14,6 +14,32 @@
 // @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
+
+// 4.0.0 — two changes worth knowing about, both driven by measurement rather
+// than taste.
+//
+// The optimistic fetch cache (Part 1, roughly half the script) is gone. It
+// could only ever intercept requests the page made through window.fetch, and a
+// real page makes almost none. instagram.com issues 42 resource requests:
+// 31 parser-discovered <link>, 8 XMLHttpRequest, 2 CSS-initiated, 1 beacon —
+// and 0 fetch. Nothing available to a userscript or an extension caches page
+// subresources either; a Chrome extension's declarativeNetRequest rule that
+// rewrites Cache-Control is applied to responses on their way *out* of the HTTP
+// cache, not on their way in. The browser's own cache is the only thing
+// positioned to do that job, and it already does it. Removing the wrapper also
+// removes the only part of this script that could serve a site stale
+// JavaScript.
+//
+// Learning no longer waits for pagehide. That was the one moment the LCP was
+// certainly final, but a single-page app may never reach it — and if it does,
+// location.pathname has usually moved on, so the record landed under the wrong
+// route. The route is now captured with the observation and finalised when the
+// LCP settles: shortly after load, on a client-side route change, or at
+// pagehide, whichever comes first.
+//
+// New in 4.0.0: Part 9 learns which page you actually go to from here and
+// prerenders it, which is aimed at app shells where "prefetch every link" has
+// almost nothing to work with.
 
 (function () {
     'use strict';
@@ -141,34 +167,6 @@
         }
     }
 
-    // =========================================================================
-    // Part 1: optimistic static asset cache
-    // =========================================================================
-
-    const CACHE_NAME = 'tm-smart-lru-v3';
-    const MAX_ITEMS = 2000;
-    const PRUNE_CHUNK = 100;
-    const METADATA_KEY = 'tm-cache-lru-metadata';
-    const STATS_KEY = 'tm-cache-stats';
-    const FLUSH_DELAY = 2500;
-    const TOUCH_WRITE_MIN_MS = 45 * SECOND;
-    const WRITE_MAINTENANCE_INTERVAL = 25;
-    const HEURISTIC_MAX_TTL = 24 * HOUR;
-
-    // Revalidation costs a round trip, which is exactly what hurts on a bad
-    // link, so stale-tolerance scales with how expensive the network is.
-    // (Every branch of the previous switch returned the same 2h constant.)
-    function getRevalidateTTL() {
-        switch (getConnectionTier()) {
-            case TIER_SLOW: return 12 * HOUR;
-            case TIER_MODERATE: return 6 * HOUR;
-            default: return 2 * HOUR;
-        }
-    }
-
-    const CACHEABLE_EXTENSIONS = /\.(?:js|css|woff2?|ttf|otf|eot|png|jpe?g|gif|svg|ico|webp|avif|bmp|wasm)(?:[?#]|$)/i;
-    // webpack/vite/parcel-style fingerprinted assets: app.deadbeef.js, chunk-a1b2c3d4e5.css
-    const FINGERPRINT_ASSET = /(?:^|\/)[^/?#]*?(?:[._-][a-f0-9]{8,}|[a-f0-9]{8,})[^/?#]*\.(?:js|css|woff2?|ttf|otf|eot|png|jpe?g|gif|svg|ico|webp|avif|bmp|wasm)(?:[?#]|$)/i;
     const DOWNLOAD_EXTENSIONS = [
         '.pdf', '.zip', '.tar', '.gz', '.rar', '.7z', '.exe', '.dmg', '.pkg',
         '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv',
@@ -190,981 +188,6 @@
         '\\/(?:' + SENSITIVE_PATH_SEGMENTS + ')(?:[\\/?#-]|$)',
         'i'
     );
-
-    const SKIP_URL_PATTERNS = [
-        /\/api(?:\/|$)/i,
-        /\/graphql(?:[/?#]|$)/i,
-        /\/(?:feed|rss|json|ws)(?:\/|[?#]|$)/i,
-        /\.(?:json|html?|xml|m3u8|mpd)(?:[?#]|$)/i,
-        /\bservice-worker\b/i,
-        /\bmanifest\b.*\.js(?:[?#]|$)/i
-    ];
-
-    const NO_STORE = /\bno-store\b/i;
-    const PRIVATE = /\bprivate\b/i;
-    const FORCE_REVALIDATE = /\b(?:no-cache|must-revalidate)\b/i;
-    const IMMUTABLE = /\bimmutable\b/i;
-    const CACHEABLE_CONTENT_TYPES = /^(?:text\/css|text\/javascript|application\/javascript|application\/x-javascript|image\/|font\/|application\/font|application\/x-font|application\/wasm)/i;
-
-    let metadataMap = new Map();
-    let metadataDirty = false;
-    let flushTimer = null;
-    let cacheWritesSinceMaintenance = 0;
-
-    // Hit/miss/bypass counters persisted across page loads. In-memory counters
-    // alone always read ~0 because they reset on every navigation and the cache
-    // only ever sees window.fetch() traffic (a small slice of page loads).
-    function loadStats() {
-        try {
-            const raw = localStorage.getItem(STATS_KEY);
-            if (raw) {
-                const obj = JSON.parse(raw);
-                return {
-                    hits: Number(obj.hits) || 0,
-                    misses: Number(obj.misses) || 0,
-                    bypassed: Number(obj.bypassed) || 0,
-                    revalidations: Number(obj.revalidations) || 0
-                };
-            }
-        } catch (_) {}
-        return { hits: 0, misses: 0, bypassed: 0, revalidations: 0 };
-    }
-
-    const stats = loadStats();
-    let statsTimer = null;
-
-    function saveStats() {
-        if (statsTimer) {
-            clearTimeout(statsTimer);
-            statsTimer = null;
-        }
-        try {
-            localStorage.setItem(STATS_KEY, JSON.stringify(stats));
-        } catch (_) {}
-    }
-
-    function scheduleStatsSave() {
-        if (statsTimer) return;
-        statsTimer = setTimeout(saveStats, FLUSH_DELAY);
-    }
-
-    function normalizeMetadata(value) {
-        if (value && typeof value === 'object') {
-            const ttlMs = value.ttlMs === Infinity || value.ttlMs === 'Infinity'
-                ? Infinity
-                : (Number.isFinite(value.ttlMs) ? value.ttlMs : null);
-
-            return {
-                touchedAt: Number(value.touchedAt || value.cachedAt || 0),
-                cachedAt: Number(value.cachedAt || value.touchedAt || 0),
-                ttlMs,
-                forceRevalidate: Boolean(value.forceRevalidate)
-            };
-        }
-
-        const timestamp = Number(value || 0);
-        return {
-            touchedAt: timestamp,
-            cachedAt: timestamp,
-            ttlMs: null,
-            forceRevalidate: false
-        };
-    }
-
-    function loadMetadata() {
-        try {
-            const raw = localStorage.getItem(METADATA_KEY);
-            if (!raw) return;
-
-            const entries = Object.entries(JSON.parse(raw))
-                .map(([url, meta]) => [url, normalizeMetadata(meta)])
-                .sort((a, b) => (b[1].touchedAt || 0) - (a[1].touchedAt || 0))
-                .slice(0, MAX_ITEMS + PRUNE_CHUNK);
-
-            metadataMap = new Map(entries);
-        } catch (_) {}
-    }
-    loadMetadata();
-
-    const forceRevalidateUrls = new Set();
-    for (const [url, meta] of metadataMap) {
-        if (meta.forceRevalidate) forceRevalidateUrls.add(url);
-    }
-
-    function scheduleFlush() {
-        metadataDirty = true;
-        if (flushTimer) return;
-        flushTimer = setTimeout(flushMetadata, FLUSH_DELAY);
-    }
-
-    function flushMetadata() {
-        flushTimer = null;
-        if (!metadataDirty) return;
-        metadataDirty = false;
-
-        try {
-            const entries = Array.from(metadataMap)
-                .sort((a, b) => (b[1].touchedAt || 0) - (a[1].touchedAt || 0))
-                .slice(0, MAX_ITEMS + PRUNE_CHUNK);
-
-            const obj = Object.fromEntries(entries.map(([url, meta]) => [url, {
-                touchedAt: meta.touchedAt || 0,
-                cachedAt: meta.cachedAt || 0,
-                ttlMs: meta.ttlMs === Infinity ? 'Infinity' : meta.ttlMs,
-                forceRevalidate: Boolean(meta.forceRevalidate)
-            }]));
-
-            localStorage.setItem(METADATA_KEY, JSON.stringify(obj));
-        } catch (_) {
-            metadataDirty = true;
-        }
-    }
-
-    function getMetadata(url) {
-        return metadataMap.get(url) || normalizeMetadata(0);
-    }
-
-    function rememberCacheability(url, cacheability) {
-        if (cacheability.forceRevalidate) forceRevalidateUrls.add(url);
-        else forceRevalidateUrls.delete(url);
-    }
-
-    function touchItem(url, cacheability) {
-        const previous = getMetadata(url);
-        const touchedAt = Date.now();
-        const next = {
-            touchedAt,
-            cachedAt: previous.cachedAt,
-            ttlMs: previous.ttlMs,
-            forceRevalidate: previous.forceRevalidate
-        };
-
-        let shouldPersist = !previous.touchedAt || touchedAt - previous.touchedAt >= TOUCH_WRITE_MIN_MS;
-
-        if (cacheability) {
-            next.cachedAt = touchedAt;
-            next.ttlMs = cacheability.ttlMs;
-            next.forceRevalidate = cacheability.forceRevalidate;
-            rememberCacheability(url, cacheability);
-            shouldPersist = true;
-        }
-
-        metadataMap.set(url, next);
-        // A throttled touch still changed in-memory LRU state. Mark it dirty so
-        // pagehide persists it even when we deliberately avoid scheduling a
-        // localStorage write for every cache hit.
-        metadataDirty = true;
-        if (shouldPersist) scheduleFlush();
-    }
-
-    function isFresh(url) {
-        const meta = getMetadata(url);
-        if (forceRevalidateUrls.has(url) || meta.forceRevalidate || !meta.cachedAt) return false;
-
-        // Offline: treat any stored copy as fresh. Revalidating would spend a
-        // guaranteed-failing round trip before falling back to this same copy.
-        if (navigator.onLine === false) return true;
-
-        const ttlMs = meta.ttlMs === Infinity
-            ? Infinity
-            : (Number.isFinite(meta.ttlMs) && meta.ttlMs !== null ? meta.ttlMs : getRevalidateTTL());
-
-        return ttlMs === Infinity || Date.now() - meta.cachedAt < ttlMs;
-    }
-
-    function requiresSynchronousRevalidation(url) {
-        return forceRevalidateUrls.has(url) || getMetadata(url).forceRevalidate;
-    }
-
-    function evictEntry(cache, cacheRequest, url) {
-        metadataMap.delete(url);
-        forceRevalidateUrls.delete(url);
-        scheduleFlush();
-        return cache.delete(cacheRequest).catch(() => {});
-    }
-
-    // MAX_ITEMS bounds entry count, not bytes. An image-heavy origin can hit
-    // the storage quota well under 2000 entries, and once quota is exhausted
-    // every cache.put() throws — including the browser's own eviction-sensitive
-    // storage. Back off before that happens.
-    const STORAGE_CHECK_INTERVAL = 5 * MINUTE;
-    const STORAGE_PRESSURE_RATIO = 0.8;
-    let storagePressure = false;
-    let storageCheckedAt = 0;
-
-    async function underStoragePressure() {
-        if (!navigator.storage || typeof navigator.storage.estimate !== 'function') return false;
-
-        const now = Date.now();
-        if (storageCheckedAt && now - storageCheckedAt < STORAGE_CHECK_INTERVAL) return storagePressure;
-        storageCheckedAt = now;
-
-        try {
-            const estimate = await navigator.storage.estimate();
-            const quota = Number(estimate && estimate.quota) || 0;
-            const usage = Number(estimate && estimate.usage) || 0;
-            storagePressure = quota > 0 && usage / quota > STORAGE_PRESSURE_RATIO;
-        } catch (_) {
-            storagePressure = false;
-        }
-
-        return storagePressure;
-    }
-
-    let prunePending = false;
-
-    function triggerMaintenance(targetRatio) {
-        // Under storage pressure every cacheable response would otherwise queue
-        // its own prune, so one page load can schedule dozens of full cache
-        // enumerations that each free nothing.
-        if (prunePending) return;
-        prunePending = true;
-
-        // requestIdleCallback invokes its callback with an IdleDeadline, so the
-        // ratio has to be bound here rather than passed through.
-        postBackgroundTask(() => pruneCache(targetRatio), 5000);
-    }
-
-    async function pruneCache(targetRatio) {
-        prunePending = false;
-
-        try {
-            const cache = await caches.open(CACHE_NAME);
-            const keys = await cache.keys();
-
-            // Quota pressure is about bytes, not entry count: a cache of 300
-            // large images can exhaust the quota while sitting far below
-            // MAX_ITEMS, where a count-based target would free nothing at all.
-            const limit = Number.isFinite(targetRatio)
-                ? Math.floor(keys.length * targetRatio)
-                : MAX_ITEMS;
-
-            if (keys.length <= limit) return;
-
-            const toDelete = keys
-                .sort((a, b) => (getMetadata(a.url).touchedAt || 0) - (getMetadata(b.url).touchedAt || 0))
-                .slice(0, Math.max(PRUNE_CHUNK, keys.length - limit));
-
-            await Promise.all(toDelete.map(req => {
-                metadataMap.delete(req.url);
-                forceRevalidateUrls.delete(req.url);
-                return cache.delete(req);
-            }));
-            scheduleFlush();
-        } catch (_) {}
-    }
-
-    function isCacheableUrl(url) {
-        return CACHEABLE_EXTENSIONS.test(url) && !SKIP_URL_PATTERNS.some(re => re.test(url));
-    }
-
-    function isFingerprintedAsset(url) {
-        try {
-            return FINGERPRINT_ASSET.test(new URL(url, location.href).pathname);
-        } catch (_) {
-            return FINGERPRINT_ASSET.test(url);
-        }
-    }
-
-    function isSameOriginUrl(url) {
-        try {
-            return new URL(url, location.href).origin === location.origin;
-        } catch (_) {
-            return false;
-        }
-    }
-
-    function parseCacheTTL(response, cc, allowHeuristic) {
-        if (IMMUTABLE.test(cc)) return Infinity;
-
-        const maxAge = cc.match(/(?:^|,)\s*max-age\s*=\s*(\d+)/i);
-        if (maxAge) return Number(maxAge[1]) * SECOND;
-
-        const expires = response.headers.get('Expires');
-        if (expires) {
-            const expiresAt = Date.parse(expires);
-            if (!Number.isNaN(expiresAt)) {
-                const dateAt = Date.parse(response.headers.get('Date') || '') || Date.now();
-                return Math.max(0, expiresAt - dateAt);
-            }
-        }
-
-        if (!allowHeuristic) return null;
-
-        // Heuristic freshness (RFC 7234 §4.2.2): cache for a fraction of the time
-        // since the asset last changed, capped. Lets us cache header-less assets
-        // the browser's HTTP cache would otherwise treat as always-stale.
-        const lastModified = response.headers.get('Last-Modified');
-        if (lastModified) {
-            const lastModifiedAt = Date.parse(lastModified);
-            if (!Number.isNaN(lastModifiedAt)) {
-                const dateAt = Date.parse(response.headers.get('Date') || '') || Date.now();
-                const heuristic = (dateAt - lastModifiedAt) * 0.1;
-                if (heuristic > 0) return Math.min(heuristic, HEURISTIC_MAX_TTL);
-            }
-        }
-
-        return null;
-    }
-
-    // Caveat on both checks below: Set-Cookie is a forbidden response header
-    // (never visible to JS in any browser), and Vary is not CORS-safelisted, so
-    // on cross-origin responses headers.get('Vary') returns null even when the
-    // server sent it. Heuristic/fingerprint TTLs require same-origin or a
-    // readable Cache-Control so we do not invent freshness for CORS-opaque
-    // private assets.
-    function getCacheability(response, requestUrl) {
-        if (!response || !response.ok || response.status === 206) return false;
-
-        const ccHeader = response.headers.get('Cache-Control');
-        const cc = ccHeader || '';
-        if (NO_STORE.test(cc) || PRIVATE.test(cc)) return false;
-
-        const vary = response.headers.get('Vary') || '';
-        if (vary.trim()) return false;
-
-        const ct = response.headers.get('Content-Type') || '';
-        if (ct && !CACHEABLE_CONTENT_TYPES.test(ct)) return false;
-
-        const url = requestUrl || response.url || '';
-        const sameOrigin = isSameOriginUrl(url);
-        const ccReadable = ccHeader !== null;
-        const allowHeuristic = sameOrigin || ccReadable;
-
-        // no-cache / must-revalidate assets are storable, but must be revalidated
-        // before every reuse (network-first, stale only as offline fallback).
-        const forceRevalidate = FORCE_REVALIDATE.test(cc);
-        let ttlMs = parseCacheTTL(response, cc, allowHeuristic);
-
-        if (
-            ttlMs !== Infinity
-            && !forceRevalidate
-            && allowHeuristic
-            && isFingerprintedAsset(url)
-            && (sameOrigin || ccReadable)
-        ) {
-            // Content-hashed filenames are effectively immutable even without
-            // Cache-Control: immutable.
-            ttlMs = Infinity;
-        }
-
-        // TTL is irrelevant for force-revalidate entries (they always hit the
-        // network first), so only reject on a bad TTL for normal entries.
-        if (!forceRevalidate && ttlMs !== Infinity && (!Number.isFinite(ttlMs) || ttlMs <= 0)) return false;
-
-        return {
-            ttlMs,
-            forceRevalidate
-        };
-    }
-
-    function isReusableCachedResponse(response) {
-        if (!response || !response.ok || response.status === 206) return false;
-
-        const cc = response.headers.get('Cache-Control') || '';
-        if (NO_STORE.test(cc) || PRIVATE.test(cc)) return false;
-
-        const vary = response.headers.get('Vary') || '';
-        if (vary.trim()) return false;
-
-        // Stored no-cache/must-revalidate copies stay reusable as the stale
-        // fallback that SWR serves while a revalidation is in flight.
-        if (FORCE_REVALIDATE.test(cc)) return true;
-
-        if (isFingerprintedAsset(response.url || '')) return true;
-
-        const ttlMs = parseCacheTTL(response, cc, true);
-        return ttlMs === Infinity || (Number.isFinite(ttlMs) && ttlMs > 0);
-    }
-
-    // Requests carrying any of these need the real network semantics: Range
-    // expects a 206 slice and the conditional headers expect a possible 304 —
-    // serving a full cached 200 would break both.
-    const BYPASS_REQUEST_HEADERS = ['authorization', 'range', 'if-none-match', 'if-modified-since'];
-
-    function hasBypassHeader(headers) {
-        if (!headers) return false;
-
-        try {
-            if (typeof headers.get === 'function') {
-                return BYPASS_REQUEST_HEADERS.some(name => Boolean(headers.get(name)));
-            }
-            if (Array.isArray(headers)) {
-                return headers.some(([key, value]) =>
-                    BYPASS_REQUEST_HEADERS.includes(String(key).toLowerCase()) && Boolean(value));
-            }
-            if (typeof headers === 'object') {
-                return Object.keys(headers).some(key => BYPASS_REQUEST_HEADERS.includes(key.toLowerCase()) && headers[key]);
-            }
-        } catch (_) {}
-
-        return false;
-    }
-
-    function replaceSignalInArgs(args, signal) {
-        const request = args[0];
-        // Supplying the key is required — omitting it lets new Request(input)
-        // copy input.signal. Background revalidation passes null; shared
-        // network flights pass their own controller signal.
-        const init = Object.assign({}, args[1] || {}, { signal });
-
-        if (request && typeof request === 'object' && 'url' in request && 'method' in request) {
-            try {
-                return [new Request(request, init)];
-            } catch (_) {
-                return [request.url, Object.assign({
-                    method: request.method,
-                    headers: request.headers,
-                    credentials: request.credentials,
-                    mode: request.mode,
-                    redirect: request.redirect,
-                    referrer: request.referrer,
-                    referrerPolicy: request.referrerPolicy
-                }, init)];
-            }
-        }
-
-        return [request, init];
-    }
-
-    function stripSignalFromArgs(args) {
-        return replaceSignalInArgs(args, null);
-    }
-
-    let fetchCachePromise = null;
-
-    function installFetchCache() {
-        // typeof caches guard: the Cache API only exists in secure contexts, so
-        // on plain-HTTP pages the wrapper would fail (and fall back) per fetch.
-        const hasServiceWorker = 'serviceWorker' in navigator;
-        if ((hasServiceWorker && navigator.serviceWorker.controller) || typeof unsafeWindow === 'undefined' || typeof caches === 'undefined') return;
-
-        const originalFetch = unsafeWindow.fetch;
-        if (typeof originalFetch !== 'function') return;
-
-        const inFlightRevalidations = new Map();
-        const inFlightNetwork = new Map();
-
-        const getCache = () => {
-            if (!fetchCachePromise) {
-                fetchCachePromise = caches.open(CACHE_NAME).catch(error => {
-                    fetchCachePromise = null;
-                    throw error;
-                });
-            }
-            return fetchCachePromise;
-        };
-
-        const isRequestLike = obj => obj && typeof obj === 'object' && 'url' in obj && 'method' in obj;
-
-        function getFetchInfo(args) {
-            const request = args[0];
-            if (request == null) return null;
-
-            const init = args[1] || {};
-            const requestLike = isRequestLike(request);
-            const url = requestLike ? toUrl(request.url) : toUrl(request);
-
-            if (!url) return null;
-
-            const headers = init.headers || (requestLike ? request.headers : undefined);
-            const credentials = init.credentials || (requestLike ? request.credentials : undefined);
-            const mode = init.mode || (requestLike ? request.mode : undefined);
-            const redirect = init.redirect || (requestLike ? request.redirect : undefined);
-            const referrer = init.referrer || (requestLike ? request.referrer : undefined);
-            const referrerPolicy = init.referrerPolicy || (requestLike ? request.referrerPolicy : undefined);
-            const integrity = init.integrity || (requestLike ? request.integrity : undefined);
-            const keepalive = Object.prototype.hasOwnProperty.call(init, 'keepalive')
-                ? init.keepalive
-                : (requestLike ? request.keepalive : undefined);
-            const signal = Object.prototype.hasOwnProperty.call(init, 'signal')
-                ? init.signal
-                : (requestLike ? request.signal : undefined);
-
-            return {
-                url: url.href,
-                method: String(init.method || (requestLike ? request.method : '') || 'GET').toUpperCase(),
-                cacheMode: init.cache || (requestLike ? request.cache : undefined),
-                signal,
-                headers,
-                credentials,
-                mode,
-                redirect,
-                referrer,
-                referrerPolicy,
-                integrity,
-                keepalive,
-                cacheRequest: makeCacheRequest(url.href, { headers, credentials, mode, redirect, referrer, referrerPolicy })
-            };
-        }
-
-        function makeNetworkKey(info) {
-            let headers;
-            try {
-                headers = Array.from(new Headers(info.headers || undefined).entries())
-                    .sort(([aKey, aValue], [bKey, bValue]) => {
-                        const keyOrder = aKey.localeCompare(bKey);
-                        return keyOrder || aValue.localeCompare(bValue);
-                    });
-            } catch (_) {
-                // If the headers cannot be normalized, do not risk sharing the
-                // request with a semantically different caller.
-                return null;
-            }
-
-            return JSON.stringify([
-                info.url,
-                info.credentials || '',
-                info.mode || '',
-                info.redirect || '',
-                info.referrer || '',
-                info.referrerPolicy || '',
-                info.integrity || '',
-                Boolean(info.keepalive),
-                headers
-            ]);
-        }
-
-        function makeCacheRequest(url, source) {
-            if (typeof Request !== 'function') return url;
-
-            const init = { method: 'GET' };
-
-            if (source.headers) init.headers = source.headers;
-            if (source.credentials) init.credentials = source.credentials;
-            if (source.mode) init.mode = source.mode;
-            if (source.redirect) init.redirect = source.redirect;
-            if (source.referrer) init.referrer = source.referrer;
-            if (source.referrerPolicy) init.referrerPolicy = source.referrerPolicy;
-
-            try {
-                return new Request(url, init);
-            } catch (_) {
-                return new Request(url, { method: 'GET' });
-            }
-        }
-
-        function maybeScheduleMaintenance() {
-            cacheWritesSinceMaintenance += 1;
-            if (cacheWritesSinceMaintenance >= WRITE_MAINTENANCE_INTERVAL) {
-                cacheWritesSinceMaintenance = 0;
-                triggerMaintenance();
-            }
-        }
-
-        async function storeResponse(cache, info, networkResponse, cacheability) {
-            const finalUrl = networkResponse.url || info.url;
-            if (networkResponse.redirected && finalUrl && finalUrl !== info.url) {
-                if (!isCacheableUrl(finalUrl)) {
-                    await evictEntry(cache, info.cacheRequest, info.url);
-                    return;
-                }
-            }
-
-            if (await underStoragePressure()) {
-                // Prune hard rather than storing more: half the entry budget is
-                // a blunt but effective way to release quota before the browser
-                // starts evicting on our behalf.
-                triggerMaintenance(0.5);
-                return;
-            }
-
-            try {
-                // Cache under the URL the caller will request again. A cached
-                // Response may retain its final redirected URL; Cache API keys
-                // do not need to match response.url.
-                await cache.put(info.cacheRequest, networkResponse.clone());
-                touchItem(info.url, cacheability);
-                maybeScheduleMaintenance();
-            } catch (_) {
-                // Redirected / opaque / quota failures: skip store.
-            }
-        }
-
-        function waitForNetworkFlight(flight, signal) {
-            flight.waiters += 1;
-
-            return new Promise((resolve, reject) => {
-                let callerSettled = false;
-
-                const release = (aborted, reason) => {
-                    if (callerSettled) return;
-                    callerSettled = true;
-                    if (signal) signal.removeEventListener('abort', onAbort);
-                    flight.waiters = Math.max(0, flight.waiters - 1);
-
-                    if (aborted && flight.waiters === 0 && !flight.settled) {
-                        // Remove immediately so a new caller does not join a
-                        // flight whose shared controller is already aborted.
-                        if (inFlightNetwork.get(flight.key) === flight) {
-                            inFlightNetwork.delete(flight.key);
-                        }
-                        flight.controller.abort(reason);
-                    }
-                };
-
-                const onAbort = () => {
-                    const reason = getAbortReason(signal);
-                    release(true, reason);
-                    reject(reason);
-                };
-
-                if (signal && signal.aborted) {
-                    onAbort();
-                    return;
-                }
-
-                if (signal) signal.addEventListener('abort', onAbort, { once: true });
-                flight.promise.then(response => {
-                    release(false);
-                    resolve(response.clone());
-                }, error => {
-                    release(false);
-                    reject(error);
-                });
-            });
-        }
-
-        // Callers with semantically identical requests share one controller.
-        // One abort only releases that caller; all callers aborting cancels the
-        // underlying request and lets a later caller create a fresh flight.
-        function coalesceNetwork(thisArg, args, info) {
-            const networkKey = makeNetworkKey(info);
-            if (!networkKey) {
-                return originalFetch.apply(thisArg, args);
-            }
-
-            let flight = inFlightNetwork.get(networkKey);
-            if (!flight) {
-                const controller = new AbortController();
-                flight = {
-                    key: networkKey,
-                    controller,
-                    waiters: 0,
-                    settled: false,
-                    promise: null
-                };
-
-                flight.promise = originalFetch.apply(
-                    thisArg,
-                    replaceSignalInArgs(args, controller.signal)
-                ).finally(() => {
-                    flight.settled = true;
-                    if (inFlightNetwork.get(networkKey) === flight) {
-                        inFlightNetwork.delete(networkKey);
-                    }
-                });
-
-                inFlightNetwork.set(networkKey, flight);
-            }
-
-            return waitForNetworkFlight(flight, info.signal);
-        }
-
-        function getAbortReason(signal) {
-            if (signal && 'reason' in signal && signal.reason !== undefined) {
-                return signal.reason;
-            }
-            if (typeof DOMException === 'function') {
-                return new DOMException('Aborted', 'AbortError');
-            }
-            const err = new Error('Aborted');
-            err.name = 'AbortError';
-            return err;
-        }
-
-        function throwIfAborted(signal) {
-            if (!signal || !signal.aborted) return;
-            throw getAbortReason(signal);
-        }
-
-        async function revalidate(cache, info, thisArg, args) {
-            try {
-                const networkResponse = await originalFetch.apply(thisArg, stripSignalFromArgs(args));
-                const cacheability = getCacheability(networkResponse, networkResponse.url || info.url);
-                if (!cacheability) {
-                    // The server answered but no longer vouches for this asset
-                    // (gone, error, or uncacheable now). Without eviction the
-                    // stale copy would be served via SWR forever.
-                    await evictEntry(cache, info.cacheRequest, info.url);
-                    return;
-                }
-
-                await storeResponse(cache, info, networkResponse, cacheability);
-                stats.revalidations += 1;
-                scheduleStatsSave();
-            } catch (_) {
-                // Network failure: stale cache is still better than nothing.
-            } finally {
-                inFlightRevalidations.delete(info.url);
-            }
-        }
-
-        unsafeWindow.fetch = async function (...args) {
-            const info = getFetchInfo(args);
-            const bypass = !info
-                || info.method !== 'GET'
-                || !isCacheableUrl(info.url)
-                // Preserve native semantics for every explicit non-default
-                // Request.cache mode, especially force-cache/only-if-cached.
-                || (info.cacheMode && info.cacheMode !== 'default')
-                || hasBypassHeader(info.headers);
-
-            if (bypass) {
-                if (info && info.method === 'GET' && CACHEABLE_EXTENSIONS.test(info.url)) {
-                    stats.bypassed += 1;
-                    scheduleStatsSave();
-                }
-                return originalFetch.apply(this, args);
-            }
-
-            throwIfAborted(info.signal);
-
-            // Failures of our own cache machinery fall back to a plain fetch,
-            // but once the real network request has been issued its outcome
-            // (including AbortError) must propagate as-is — retrying here would
-            // fire the same request twice.
-            let networkAttempted = false;
-            try {
-                const cache = await getCache();
-                let cachedResponse = await cache.match(info.cacheRequest);
-
-                if (cachedResponse && !isReusableCachedResponse(cachedResponse)) {
-                    await evictEntry(cache, info.cacheRequest, info.url);
-                    cachedResponse = null;
-                }
-
-                if (cachedResponse) {
-                    if (isFresh(info.url)) {
-                        throwIfAborted(info.signal);
-                        stats.hits += 1;
-                        scheduleStatsSave();
-                        touchItem(info.url);
-                        return cachedResponse;
-                    }
-
-                    if (requiresSynchronousRevalidation(info.url)) {
-                        let networkResponse;
-                        try {
-                            networkAttempted = true;
-                            networkResponse = await coalesceNetwork(this, args, info);
-                            throwIfAborted(info.signal);
-                        } catch (error) {
-                            // The page cancelled the request; honor abort semantics.
-                            // abort(customReason) / AbortSignal.timeout() reject
-                            // with arbitrary reasons, so consult the signal too.
-                            if ((info.signal && info.signal.aborted) || (error && error.name === 'AbortError')) throw error;
-                            // Revalidation failed (offline/error): the stale copy
-                            // beats surfacing a network failure to the page.
-                            return cachedResponse;
-                        }
-
-                        const cacheability = getCacheability(networkResponse, networkResponse.url || info.url);
-                        if (cacheability) {
-                            storeResponse(cache, info, networkResponse, cacheability).catch(() => {});
-                        } else {
-                            await evictEntry(cache, info.cacheRequest, info.url);
-                        }
-                        stats.revalidations += 1;
-                        scheduleStatsSave();
-                        return networkResponse;
-                    }
-
-                    stats.hits += 1;
-                    scheduleStatsSave();
-                    if (!inFlightRevalidations.has(info.url)) {
-                        // The caller already has its bytes. On a constrained
-                        // link, issuing the revalidation now would compete with
-                        // the page's own critical requests for the same pipe.
-                        if (getConnectionTier() === TIER_FAST) {
-                            inFlightRevalidations.set(info.url, revalidate(cache, info, this, args));
-                        } else {
-                            // Placeholder keeps a second hit from queueing a
-                            // duplicate before the deferred task runs.
-                            inFlightRevalidations.set(info.url, null);
-                            postBackgroundTask(() => {
-                                inFlightRevalidations.set(info.url, revalidate(cache, info, this, args));
-                            }, 5000);
-                        }
-                    }
-
-                    throwIfAborted(info.signal);
-                    return cachedResponse;
-                }
-
-                stats.misses += 1;
-                scheduleStatsSave();
-                networkAttempted = true;
-                const networkResponse = await coalesceNetwork(this, args, info);
-                throwIfAborted(info.signal);
-                const cacheability = getCacheability(networkResponse, networkResponse.url || info.url);
-
-                if (cacheability) {
-                    storeResponse(cache, info, networkResponse, cacheability).catch(() => {});
-                }
-
-                return networkResponse;
-            } catch (error) {
-                if (networkAttempted) throw error;
-                return originalFetch.apply(this, args);
-            }
-        };
-
-        if (hasServiceWorker) {
-            navigator.serviceWorker.addEventListener('controllerchange', () => {
-                unsafeWindow.fetch = originalFetch;
-                fetchCachePromise = null;
-                inFlightNetwork.clear();
-                inFlightRevalidations.clear();
-            }, { once: true });
-        }
-    }
-
-    installFetchCache();
-
-    const IDLE_WARM_LIMIT = 40;
-
-    function initIdleCacheWarm() {
-        // Warming re-fetches assets the parser already loaded, purely to copy
-        // them into the Cache API. That is a reasonable trade on an idle fast
-        // link and a bad one on anything slower.
-        if (typeof caches === 'undefined' || getConnectionTier() !== TIER_FAST) return;
-        if (typeof unsafeWindow === 'undefined' || typeof unsafeWindow.fetch !== 'function') return;
-
-        const urls = new Set();
-        for (const el of document.querySelectorAll('script[src], link[rel~="stylesheet"][href]')) {
-            const href = el.currentSrc || el.src || el.href;
-            const url = toUrl(href);
-            if (!url) continue;
-            if (url.origin !== location.origin) continue;
-            if (!isCacheableUrl(url.href)) continue;
-            urls.add(url.href);
-            if (urls.size >= IDLE_WARM_LIMIT) break;
-        }
-
-        let chain = Promise.resolve();
-        for (const href of urls) {
-            chain = chain.then(() => unsafeWindow.fetch(href, {
-                credentials: 'same-origin',
-                mode: 'same-origin',
-                // Prefer our LRU when fresh; otherwise populate via miss path.
-                cache: 'default'
-            }).catch(() => {}));
-        }
-    }
-
-    runWhenLoadedIdle(initIdleCacheWarm);
-
-    if (typeof GM_registerMenuCommand !== 'undefined') {
-        GM_registerMenuCommand('Purge Asset Cache (Current Origin)', async () => {
-            try {
-                await caches.delete(CACHE_NAME);
-            } catch (_) {}
-            fetchCachePromise = null;
-            metadataMap.clear();
-            forceRevalidateUrls.clear();
-            metadataDirty = false;
-            if (flushTimer) {
-                clearTimeout(flushTimer);
-                flushTimer = null;
-            }
-
-            try {
-                localStorage.removeItem(METADATA_KEY);
-            } catch (_) {}
-
-            stats.hits = 0;
-            stats.misses = 0;
-            stats.bypassed = 0;
-            stats.revalidations = 0;
-            if (statsTimer) {
-                clearTimeout(statsTimer);
-                statsTimer = null;
-            }
-            try {
-                localStorage.removeItem(STATS_KEY);
-            } catch (_) {}
-            deleteStore(LEARN_LCP_KEY);
-            deleteStore(LEARN_ORIGINS_KEY);
-            deleteStore(LEARN_VITALS_KEY);
-            learnedLcpUrl = null;
-            alert('Quicksilver asset cache and learned hints purged for this origin.');
-        });
-
-        GM_registerMenuCommand('Toggle Aggressive Rendering (content-visibility)', () => {
-            const next = contentVisibilityEnabled() ? '0' : '1';
-            try {
-                localStorage.setItem(CV_FLAG_KEY, next);
-            } catch (_) {}
-            alert('Aggressive rendering ' + (next === '1' ? 'enabled' : 'disabled')
-                + ' for this origin. Reload to apply.\n\nSkips layout/paint for offscreen '
-                + 'sections. Disable if dropdowns or tooltips appear clipped at a section '
-                + 'edge, or if sticky headers or in-page anchors misbehave.');
-        });
-
-        GM_registerMenuCommand('Show Cache Stats', async () => {
-            let itemCount = 0;
-            let estimatedSize = 0;
-
-            try {
-                const cache = await caches.open(CACHE_NAME);
-                const keys = await cache.keys();
-                itemCount = keys.length;
-
-                const sample = keys.slice(0, 20);
-                const sampleSizes = await Promise.all(sample.map(async req => {
-                    const res = await cache.match(req);
-                    return res ? (await res.blob()).size : 0;
-                }));
-                const sampleSize = sampleSizes.reduce((sum, size) => sum + size, 0);
-                estimatedSize = sample.length ? sampleSize / sample.length * itemCount : 0;
-            } catch (_) {}
-
-            const total = stats.hits + stats.misses;
-            const hitRate = total ? (stats.hits / total * 100).toFixed(1) : 'N/A';
-
-            // Cache hit rate measures the machinery; LCP measures whether any
-            // of this actually made the page faster.
-            const vitals = readStore(LEARN_VITALS_KEY);
-            const samples = (vitals && Array.isArray(vitals.lcp) ? vitals.lcp : []).filter(Number.isFinite);
-            let lcpStr = 'no samples yet';
-            if (samples.length) {
-                const sorted = samples.slice().sort((a, b) => a - b);
-                const median = sorted[Math.floor(sorted.length / 2)];
-                lcpStr = Math.round(median) + ' ms (median of ' + sorted.length + ')';
-            }
-
-            const tierName = { 1: 'slow', 2: 'moderate', 3: 'fast' }[getConnectionTier()] || 'unknown';
-            const lcpStore = readStore(LEARN_LCP_KEY);
-            const learnedPages = lcpStore ? Object.keys(lcpStore).length : 0;
-            const originStore = readStore(LEARN_ORIGINS_KEY);
-            const learnedOrigins = (originStore && Array.isArray(originStore.origins)) ? originStore.origins.length : 0;
-            const sizeStr = estimatedSize > 1048576
-                ? (estimatedSize / 1048576).toFixed(1) + ' MB'
-                : Math.round(estimatedSize / 1024) + ' KB';
-
-            alert([
-                'Quicksilver Cache Stats (cumulative, this origin)',
-                'Cached items: ' + itemCount,
-                'Estimated size: ' + sizeStr,
-                'Hits: ' + stats.hits + ' | Misses: ' + stats.misses,
-                'Revalidations: ' + stats.revalidations,
-                'Hit rate: ' + hitRate + '% (of ' + total + ' cacheable fetches)',
-                'Not cached: ' + stats.bypassed + ' asset-like fetches (reload/auth/skip policy)',
-                '',
-                'LCP: ' + lcpStr,
-                'Learned: ' + learnedPages + ' page(s), ' + learnedOrigins + ' origin(s)',
-                'Preloading LCP here: ' + (learnedLcpUrl ? 'yes' : 'no'),
-                'Tier: ' + tierName + ' (' + (conn && conn.effectiveType || 'unknown') + ')',
-                'TTL: ' + Math.round(getRevalidateTTL() / MINUTE) + ' min'
-            ].join('\n'));
-        });
-    }
-
-    window.addEventListener('pagehide', () => {
-        flushMetadata();
-        saveStats();
-    });
 
     // =========================================================================
     // Part 2: Speculation Rules prefetch/prerender (Chrome, aggressive)
@@ -1521,6 +544,8 @@
     const LEARN_LCP_KEY = 'tm-qs-lcp';
     const LEARN_ORIGINS_KEY = 'tm-qs-origins';
     const LEARN_VITALS_KEY = 'tm-qs-vitals';
+    const LEARN_TRANSITIONS_KEY = 'tm-qs-transitions';
+    const CV_FLAG_KEY = 'tm-qs-content-visibility';
     const LEARN_LCP_MAX_ENTRIES = 60;
     const LEARN_ORIGIN_MAX_ENTRIES = 8;
     const LEARN_VITALS_SAMPLES = 12;
@@ -1529,6 +554,11 @@
     // preload, not one on every visit until the record ages out.
     const LEARN_MIN_SIGHTINGS = 2;
     const LEARN_EARLY_RESOURCE_MS = 4000;
+    // LCP candidates stop arriving at the first user interaction, and in
+    // practice well before this after load. Snapshotting here is what lets a
+    // page the user simply sits on — the common case, and the one earlier
+    // versions never recorded — contribute a record at all.
+    const LEARN_SETTLE_MS = 3000;
     const FONT_EXTENSION = /\.(?:woff2?|ttf|otf|eot)(?:[?#]|$)/i;
 
     let learnedLcpUrl = null;
@@ -1540,6 +570,7 @@
     // though, so keys are namespaced and the origin set is bounded.
     const LEARN_INDEX_KEY = 'tm-qs-origin-index';
     const LEARN_MAX_ORIGINS = 150;
+    const ORIGIN_KEYS = [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_VITALS_KEY, LEARN_TRANSITIONS_KEY];
     const hasGmStorage = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
 
     function storeKey(key) {
@@ -1616,7 +647,7 @@
         kept.sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0));
 
         for (const evicted of kept.slice(LEARN_MAX_ORIGINS)) {
-            for (const key of [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_VITALS_KEY]) {
+            for (const key of ORIGIN_KEYS.concat([CV_FLAG_KEY])) {
                 rawDelete(key + '::' + evicted.o);
             }
         }
@@ -1625,6 +656,68 @@
             rawWrite(LEARN_INDEX_KEY, JSON.stringify(kept.slice(0, LEARN_MAX_ORIGINS)));
         } catch (_) {}
     }
+
+    // -------------------------------------------------------------------------
+    // Same-document route changes
+    // -------------------------------------------------------------------------
+    //
+    // A client-side router changes the URL without a navigation, so nothing in
+    // the page lifecycle fires. Both the learning and the prediction parts need
+    // to know, so the plumbing is shared.
+
+    const routeChangeHandlers = [];
+    let routeWatcherInstalled = false;
+
+    function onRouteChange(handler) {
+        routeChangeHandlers.push(handler);
+        installRouteWatcher();
+    }
+
+    function installRouteWatcher() {
+        if (routeWatcherInstalled) return;
+        routeWatcherInstalled = true;
+
+        // Deferred a turn: pushState updates location *before* returning, but
+        // the Navigation API's navigate event fires before the new URL is
+        // committed, so reading it fresh on the next task is correct for both.
+        const fire = () => setTimeout(() => {
+            for (const handler of routeChangeHandlers) {
+                try {
+                    handler();
+                } catch (_) {}
+            }
+        }, 0);
+
+        // The Navigation API reports every same-document navigation without
+        // touching page globals, so it is strongly preferred over patching
+        // history.pushState.
+        if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+            window.navigation.addEventListener('navigate', fire);
+            return;
+        }
+
+        window.addEventListener('popstate', fire);
+
+        // Fallback only. A pushState-only router fires nothing else at all, so
+        // without this the whole SPA case goes dark on builds that predate the
+        // Navigation API.
+        try {
+            const target = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).history;
+            for (const method of ['pushState', 'replaceState']) {
+                const original = target[method];
+                if (typeof original !== 'function') continue;
+                target[method] = function (...args) {
+                    const result = original.apply(this, args);
+                    fire();
+                    return result;
+                };
+            }
+        } catch (_) {}
+    }
+
+    // -------------------------------------------------------------------------
+    // Hint emission
+    // -------------------------------------------------------------------------
 
     function appendToHead(node) {
         if (document.head) {
@@ -1668,11 +761,14 @@
         return Object.fromEntries(entries);
     }
 
-    function applyLearnedHints() {
+    let emittedPreloadFor = null;
+
+    function applyLearnedHints(route) {
+        const key = route || pageKey();
         const tier = getConnectionTier();
 
         const lcpStore = readStore(LEARN_LCP_KEY);
-        const record = lcpStore && lcpStore[pageKey()];
+        const record = lcpStore && lcpStore[key];
 
         if (
             record
@@ -1680,8 +776,10 @@
             && (Number(record.seen) || 0) >= LEARN_MIN_SIGHTINGS
             && record.vw === viewportBucket()
             && Date.now() - (Number(record.at) || 0) < LEARN_MAX_AGE
+            && emittedPreloadFor !== record.url
         ) {
             learnedLcpUrl = record.url;
+            emittedPreloadFor = record.url;
 
             try {
                 const link = document.createElement('link');
@@ -1704,13 +802,17 @@
                 // rather than cost a request a day for two weeks.
                 link.addEventListener('error', () => {
                     const current = readStore(LEARN_LCP_KEY);
-                    if (!current || !current[pageKey()]) return;
-                    delete current[pageKey()];
+                    if (!current || !current[key]) return;
+                    delete current[key];
                     writeStore(LEARN_LCP_KEY, current);
                 }, { once: true });
                 appendToHead(link);
             } catch (_) {}
         }
+
+        // Origins are a property of the site, not the route, so they are only
+        // worth emitting once per document.
+        if (route) return;
 
         const originStore = readStore(LEARN_ORIGINS_KEY);
         const origins = (originStore && Array.isArray(originStore.origins)) ? originStore.origins : [];
@@ -1738,8 +840,17 @@
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Observation
+    // -------------------------------------------------------------------------
+
     function initLearning() {
-        let latestLcp = null;
+        let pending = null;
+        let settleTimer = null;
+        let sawLoad = document.readyState === 'complete';
+        let hiddenBeforeLoad = document.visibilityState === 'hidden';
+        let currentRoute = pageKey();
+        let persistedRoute = null;
 
         try {
             const observer = new PerformanceObserver(list => {
@@ -1749,55 +860,60 @@
                     // preload there, so those entries are ignored.
                     if (!entry || !entry.url) continue;
 
-                    // Snapshot now, not at pagehide: entry.element is null once
-                    // the element leaves the document, which is routine for
+                    // Snapshot now, not at persist time: entry.element is null
+                    // once the element leaves the document, which is routine for
                     // carousels and SPA route changes, and reading crossOrigin
                     // as null then is exactly the CORS-mode mismatch that turns
                     // the preload into a second full download.
                     const element = entry.element;
-                    latestLcp = {
+                    pending = {
                         url: entry.url,
                         startTime: entry.startTime,
                         cors: (element && element.crossOrigin) || null,
                         srcset: (element && element.getAttribute) ? element.getAttribute('srcset') : null,
-                        sizes: (element && element.getAttribute) ? element.getAttribute('sizes') : null
+                        sizes: (element && element.getAttribute) ? element.getAttribute('sizes') : null,
+                        // Bound to the route that was current when the hero
+                        // painted. Reading location.pathname at persist time is
+                        // what used to file an SPA's hero under the wrong page.
+                        route: currentRoute
                     };
                 }
             });
             observer.observe({ type: 'largest-contentful-paint', buffered: true });
         } catch (_) {}
 
-        function persistLcp() {
-            const key = pageKey();
+        function persistLcp(route, observed) {
+            if (!route || persistedRoute === route) return;
+            persistedRoute = route;
 
-            if (!latestLcp || !latestLcp.url) {
-                // No image LCP this visit: redesigned to a text headline, or
-                // the hero is gone. Returning early would leave the old record
-                // authoritative for the full LEARN_MAX_AGE, preloading an image
-                // the page no longer references against the real LCP.
+            if (!observed || !observed.url) {
+                // No image LCP for this route: redesigned to a text headline,
+                // or the hero is gone. Returning early would leave the old
+                // record authoritative for the full LEARN_MAX_AGE, preloading
+                // an image the page no longer references against the real LCP.
                 const existing = readStore(LEARN_LCP_KEY);
-                if (!existing || !existing[key]) return;
+                if (!existing || !existing[route]) return;
 
-                const seen = (Number(existing[key].seen) || 0) - 1;
-                if (seen <= 0) delete existing[key];
-                else existing[key] = Object.assign({}, existing[key], { seen });
+                const seen = (Number(existing[route].seen) || 0) - 1;
+                if (seen <= 0) delete existing[route];
+                else existing[route] = Object.assign({}, existing[route], { seen });
                 writeStore(LEARN_LCP_KEY, existing);
                 return;
             }
 
-            const url = toUrl(latestLcp.url);
+            const url = toUrl(observed.url);
             if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) return;
 
             const store = readStore(LEARN_LCP_KEY) || {};
-            const previous = store[key];
+            const previous = store[route];
             const bucket = viewportBucket();
             const sameTarget = Boolean(previous && previous.url === url.href && previous.vw === bucket);
 
-            store[key] = {
+            store[route] = {
                 url: url.href,
-                cors: latestLcp.cors,
-                srcset: latestLcp.srcset,
-                sizes: latestLcp.sizes,
+                cors: observed.cors,
+                srcset: observed.srcset,
+                sizes: observed.sizes,
                 vw: bucket,
                 at: Date.now(),
                 // A changed target resets confidence rather than accumulating
@@ -1809,120 +925,298 @@
 
             const vitals = readStore(LEARN_VITALS_KEY) || {};
             const samples = Array.isArray(vitals.lcp) ? vitals.lcp.filter(Number.isFinite) : [];
-            samples.push(Math.round(latestLcp.startTime));
+            samples.push(Math.round(observed.startTime));
             writeStore(LEARN_VITALS_KEY, { lcp: samples.slice(-LEARN_VITALS_SAMPLES) });
         }
 
-        function persistOrigins() {
-            let entries;
-            try {
-                entries = performance.getEntriesByType('resource') || [];
-            } catch (_) {
-                return;
-            }
-
-            const observed = new Map();
-            for (const entry of entries) {
-                // Only resources needed early are worth a preconnect; a lazily
-                // loaded widget's origin is not on the critical path.
-                if (!entry || entry.startTime > LEARN_EARLY_RESOURCE_MS) continue;
-
-                const url = toUrl(entry.name);
-                if (!url || url.origin === location.origin) continue;
-                if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
-
-                const needsCors = entry.initiatorType === 'css' || FONT_EXTENSION.test(url.pathname);
-                const existing = observed.get(url.origin);
-
-                if (existing) {
-                    existing.cors = existing.cors || needsCors;
-                    existing.first = Math.min(existing.first, entry.startTime);
-                } else {
-                    observed.set(url.origin, { origin: url.origin, cors: needsCors, first: entry.startTime });
-                }
-            }
-
-            if (!observed.size) return;
-
-            const store = readStore(LEARN_ORIGINS_KEY) || {};
-            const previous = Array.isArray(store.origins) ? store.origins : [];
-            const merged = new Map();
-
-            const now = Date.now();
-            for (const entry of previous) {
-                if (!entry || typeof entry.o !== 'string') continue;
-                // Without aging, a CDN that mattered a year ago outranks a
-                // currently-critical origin forever and keeps costing a
-                // DNS+TCP+TLS handshake on every visit.
-                const updatedAt = Number(entry.u) || 0;
-                if (updatedAt && now - updatedAt > LEARN_MAX_AGE) continue;
-
-                merged.set(entry.o, {
-                    o: entry.o,
-                    c: Boolean(entry.c),
-                    n: Number(entry.n) || 0,
-                    t: Number(entry.t) || 0,
-                    u: updatedAt
-                });
-            }
-
-            for (const info of observed.values()) {
-                const existing = merged.get(info.origin);
-                if (existing) {
-                    existing.n += 1;
-                    existing.c = existing.c || info.cors;
-                    existing.t = Math.min(existing.t || info.first, info.first);
-                    existing.u = now;
-                } else {
-                    merged.set(info.origin, { o: info.origin, c: info.cors, n: 1, t: info.first, u: now });
-                }
-            }
-
-            // Most consistently used first, ties broken by how early the origin
-            // is needed — that is the order a preconnect budget should spend in.
-            const ranked = Array.from(merged.values())
-                .sort((a, b) => (b.n - a.n) || (a.t - b.t))
-                .slice(0, LEARN_ORIGIN_MAX_ENTRIES);
-
-            writeStore(LEARN_ORIGINS_KEY, { origins: ranked, at: Date.now() });
-        }
-
-        let sawLoad = document.readyState === 'complete';
-        let hiddenBeforeLoad = document.visibilityState === 'hidden';
-        window.addEventListener('load', () => { sawLoad = true; }, { once: true });
-
-        let persisted = false;
-        function persist() {
-            if (persisted) return;
-            persisted = true;
-
-            // LCP is finalised when the page is backgrounded. A user who tabs
-            // away at 800ms finalises it on whatever had painted — often the
-            // logo. That wrong value is *consistent* across such visits, so the
-            // seen>=2 gate endorses it instead of filtering it out, and the
-            // script trains itself to preload the logo and shield it from
-            // lazying while the real hero stays eligible for fetchpriority=low.
+        function settle() {
+            // A page backgrounded during load finalises its LCP on whatever had
+            // painted — often the logo. That wrong value is *consistent* across
+            // such visits, so the seen>=2 gate would endorse it rather than
+            // filter it out, and the script would train itself to preload the
+            // logo and shield it from lazying while the real hero stays
+            // eligible for fetchpriority=low.
             if (!sawLoad || hiddenBeforeLoad) return;
-
-            persistLcp();
+            persistLcp(currentRoute, pending);
         }
 
-        // LCP is only final once the page is backgrounded or torn down.
-        // pagehide alone misses tab switches that never unload.
-        window.addEventListener('pagehide', persist);
+        function scheduleSettle() {
+            if (settleTimer) clearTimeout(settleTimer);
+            settleTimer = setTimeout(settle, LEARN_SETTLE_MS);
+        }
+
+        // A client-side route change ends the old route's observation window.
+        // Finalise what we saw for it, then start again for the new one.
+        onRouteChange(() => {
+            const next = pageKey();
+            if (next === currentRoute) return;
+
+            settle();
+
+            currentRoute = next;
+            persistedRoute = null;
+            pending = null;
+            emittedPreloadFor = null;
+            learnedLcpUrl = null;
+
+            applyLearnedHints(next);
+            scheduleSettle();
+        });
+
+        if (sawLoad) scheduleSettle();
+        else window.addEventListener('load', () => {
+            sawLoad = true;
+            scheduleSettle();
+        }, { once: true });
+
+        // Kept as a backstop: settle() is idempotent per route, so whichever of
+        // these fires first wins and the rest are no-ops.
+        window.addEventListener('pagehide', settle);
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState !== 'hidden') return;
             if (!sawLoad) hiddenBeforeLoad = true;
-            persist();
+            settle();
         });
+    }
 
-        runWhenLoadedIdle(persistOrigins);
+    function persistOrigins() {
+        let entries;
+        try {
+            entries = performance.getEntriesByType('resource') || [];
+        } catch (_) {
+            return;
+        }
+
+        const observed = new Map();
+        for (const entry of entries) {
+            // Only resources needed early are worth a preconnect; a lazily
+            // loaded widget's origin is not on the critical path.
+            if (!entry || entry.startTime > LEARN_EARLY_RESOURCE_MS) continue;
+
+            const url = toUrl(entry.name);
+            if (!url || url.origin === location.origin) continue;
+            if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
+
+            const needsCors = entry.initiatorType === 'css' || FONT_EXTENSION.test(url.pathname);
+            const existing = observed.get(url.origin);
+
+            if (existing) {
+                existing.cors = existing.cors || needsCors;
+                existing.first = Math.min(existing.first, entry.startTime);
+            } else {
+                observed.set(url.origin, { origin: url.origin, cors: needsCors, first: entry.startTime });
+            }
+        }
+
+        if (!observed.size) return;
+
+        const store = readStore(LEARN_ORIGINS_KEY) || {};
+        const previous = Array.isArray(store.origins) ? store.origins : [];
+        const merged = new Map();
+
+        const now = Date.now();
+        for (const entry of previous) {
+            if (!entry || typeof entry.o !== 'string') continue;
+            // Without aging, a CDN that mattered a year ago outranks a
+            // currently-critical origin forever and keeps costing a
+            // DNS+TCP+TLS handshake on every visit.
+            const updatedAt = Number(entry.u) || 0;
+            if (updatedAt && now - updatedAt > LEARN_MAX_AGE) continue;
+
+            merged.set(entry.o, {
+                o: entry.o,
+                c: Boolean(entry.c),
+                n: Number(entry.n) || 0,
+                t: Number(entry.t) || 0,
+                u: updatedAt
+            });
+        }
+
+        for (const info of observed.values()) {
+            const existing = merged.get(info.origin);
+            if (existing) {
+                existing.n += 1;
+                existing.c = existing.c || info.cors;
+                existing.t = Math.min(existing.t || info.first, info.first);
+                existing.u = now;
+            } else {
+                merged.set(info.origin, { o: info.origin, c: info.cors, n: 1, t: info.first, u: now });
+            }
+        }
+
+        // Most consistently used first, ties broken by how early the origin is
+        // needed — that is the order a preconnect budget should spend in.
+        const ranked = Array.from(merged.values())
+            .sort((a, b) => (b.n - a.n) || (a.t - b.t))
+            .slice(0, LEARN_ORIGIN_MAX_ENTRIES);
+
+        writeStore(LEARN_ORIGINS_KEY, { origins: ranked, at: Date.now() });
     }
 
     if (isTopFrame) {
         applyLearnedHints();
         initLearning();
+        runWhenLoadedIdle(persistOrigins);
     }
+
+    // =========================================================================
+    // Part 9: navigation-transition prediction
+    // =========================================================================
+    //
+    // Parts 2 and 4 speculate from what is on the page: every eligible link, or
+    // the one under the pointer. On a link-dense article that is a fair bet. On
+    // an app shell with seventeen anchors and client-side routing it has almost
+    // nothing to work with — which is the case that motivated this part.
+    //
+    // document.referrer already says which page you came from, and same-origin
+    // navigations carry it in full under Chrome's default referrer policy. Two
+    // sightings of the same transition is a better prediction than "some link
+    // on this page", and costs one prerender instead of dozens of prefetches.
+    //
+    // Scope limit, deliberate: only same-origin transitions are recorded, keyed
+    // by pathname with query strings and fragments dropped before anything is
+    // written. Those carry session tokens and search terms, and none of it
+    // changes which page you are going to next. The result is in-site
+    // prediction with no cross-site browsing graph anywhere in storage.
+
+    const TRANSITION_MAX_SOURCES = 120;
+    const TRANSITION_MAX_TARGETS = 4;
+    const TRANSITION_MIN_CONFIDENCE = 2;
+
+    let predictedTargets = [];
+    let currentPredictionScript = null;
+
+    function recordTransition(fromPath, toPath) {
+        const from = String(fromPath || '').slice(0, 200);
+        const to = String(toPath || '').slice(0, 200);
+        if (!from || !to || from === to) return;
+
+        const store = readStore(LEARN_TRANSITIONS_KEY) || {};
+        const now = Date.now();
+
+        const entry = (store[from] && typeof store[from] === 'object') ? store[from] : { t: {}, at: 0 };
+        const targets = (entry.t && typeof entry.t === 'object') ? entry.t : {};
+
+        targets[to] = (Number(targets[to]) || 0) + 1;
+
+        // Keep only the strongest few targets per source. A page that leads
+        // everywhere predicts nothing, and storing its whole fan-out just
+        // spends quota to dilute the ranking.
+        const ranked = Object.entries(targets)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, TRANSITION_MAX_TARGETS);
+
+        store[from] = { t: Object.fromEntries(ranked), at: now };
+
+        // Age out, then cap by recency. Without this a page visited once a year
+        // outranks nothing but still occupies a slot forever.
+        const live = Object.entries(store)
+            .filter(([, value]) => value && (now - (Number(value.at) || 0)) < LEARN_MAX_AGE)
+            .sort((a, b) => (Number(b[1].at) || 0) - (Number(a[1].at) || 0))
+            .slice(0, TRANSITION_MAX_SOURCES);
+
+        writeStore(LEARN_TRANSITIONS_KEY, Object.fromEntries(live));
+    }
+
+    function predictNext(fromPath) {
+        const store = readStore(LEARN_TRANSITIONS_KEY);
+        const entry = store && store[String(fromPath || '').slice(0, 200)];
+        if (!entry || !entry.t) return [];
+
+        return Object.entries(entry.t)
+            .filter(([, count]) => (Number(count) || 0) >= TRANSITION_MIN_CONFIDENCE)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 2)
+            .map(([path, count]) => ({ path, count }));
+    }
+
+    function isSpeculationEligible(url) {
+        if (!url) return false;
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+        if (url.origin !== location.origin) return false;
+        if (url.pathname === location.pathname) return false;
+        if (DOWNLOAD_REGEX.test(url.pathname)) return false;
+        // Prerender *executes* the target. A destructive GET behind one of
+        // these paths would be run, not merely fetched.
+        if (SENSITIVE_HREF_REGEX.test(url.pathname)) return false;
+        return true;
+    }
+
+    function speculateOnPrediction() {
+        if (!supportsSpeculationRules) return;
+        if (getConnectionTier() === TIER_SLOW) return;
+
+        const candidates = predictNext(pageKey());
+        if (!candidates.length) return;
+
+        const hrefs = [];
+        for (const candidate of candidates) {
+            const url = toUrl(candidate.path, location.origin);
+            if (!isSpeculationEligible(url)) continue;
+            hrefs.push(url.href);
+        }
+
+        if (!hrefs.length) return;
+        predictedTargets = candidates.filter(c => {
+            const url = toUrl(c.path, location.origin);
+            return url && hrefs.includes(url.href);
+        });
+
+        // Prerender only where the connection can absorb a full page load in
+        // the background; otherwise take the cheaper bytes-only win.
+        const action = getConnectionTier() === TIER_FAST ? 'prerender' : 'prefetch';
+        const rules = {};
+        // Chrome caps concurrent prerenders hard, so this stays at one for
+        // prerender and allows the cheaper pair for prefetch.
+        rules[action] = [{
+            urls: action === 'prerender' ? hrefs.slice(0, 1) : hrefs,
+            eagerness: 'immediate'
+        }];
+
+        try {
+            const script = document.createElement('script');
+            script.type = 'speculationrules';
+            script.textContent = JSON.stringify(rules);
+            // One prediction is live at a time. Removing a rules script cancels
+            // its speculation, which is what we want when a route change makes
+            // the previous prediction obsolete — and without this a long
+            // single-page session would accumulate one script per navigation.
+            if (currentPredictionScript) currentPredictionScript.remove();
+            (document.head || document.documentElement).appendChild(script);
+            currentPredictionScript = script;
+        } catch (_) {}
+    }
+
+    function initTransitionLearning() {
+        let previousRoute = pageKey();
+
+        // A full navigation: the referrer is the page we came from. Chrome's
+        // default policy sends it in full for same-origin requests, which is
+        // the only case recorded here anyway.
+        if (document.referrer) {
+            const from = toUrl(document.referrer);
+            if (from && from.origin === location.origin) {
+                recordTransition(from.pathname, previousRoute);
+            }
+        }
+
+        // A same-document navigation: no request is made, so nothing carries a
+        // referrer and the transition would otherwise go unrecorded.
+        onRouteChange(() => {
+            const next = pageKey();
+            if (next === previousRoute) return;
+
+            recordTransition(previousRoute, next);
+            previousRoute = next;
+
+            predictedTargets = [];
+            speculateOnPrediction();
+        });
+
+        runWhenLoadedIdle(speculateOnPrediction);
+    }
+
+    if (isTopFrame) initTransitionLearning();
 
     // =========================================================================
     // Part 7: priority hints and lazy media
@@ -2081,16 +1375,11 @@
     // sticky positioning, in-page anchors and some virtualised lists — so it
     // stays behind a per-origin toggle rather than defaulting on.
 
-    const CV_FLAG_KEY = 'tm-qs-content-visibility';
     const CV_MIN_HEIGHT = 300;
     const CV_MAX_ELEMENTS = 60;
 
     function contentVisibilityEnabled() {
-        try {
-            return localStorage.getItem(CV_FLAG_KEY) === '1';
-        } catch (_) {
-            return false;
-        }
+        return rawRead(storeKey(CV_FLAG_KEY)) === '1';
     }
 
     function initContentVisibility() {
@@ -2123,4 +1412,113 @@
     }
 
     if (isTopFrame) runWhenLoadedIdle(initContentVisibility);
+
+    // =========================================================================
+    // Menu commands
+    // =========================================================================
+    //
+    // The old commands reported a cache hit rate, which measured the machinery
+    // rather than the outcome, and reported zeros in the two situations that
+    // matter most: working-but-nothing-learned-yet, and switched-off. Each
+    // feature now says which of the three it is.
+
+    function statusReport() {
+        const tier = getConnectionTier();
+        const tierName = { 1: 'slow', 2: 'moderate', 3: 'fast' }[tier] || 'unknown';
+        const route = pageKey();
+
+        const lcpStore = readStore(LEARN_LCP_KEY);
+        const originStore = readStore(LEARN_ORIGINS_KEY);
+        const vitals = readStore(LEARN_VITALS_KEY);
+        const transitions = readStore(LEARN_TRANSITIONS_KEY);
+        const record = lcpStore && lcpStore[route];
+
+        const lines = [];
+        const feature = (mark, name, detail) => lines.push('  ' + mark + ' ' + name + '\n      ' + detail);
+
+        lines.push('Quicksilver 4.0.0 — ' + location.origin + route);
+        lines.push('');
+        lines.push('ACTIVE ON THIS PAGE');
+
+        let anchors = 0;
+        try {
+            anchors = document.querySelectorAll('a[href]').length;
+        } catch (_) {}
+
+        if (!supportsSpeculationRules) feature('○', 'Link speculation', 'not supported by this Chrome build');
+        else if (tier === TIER_SLOW) feature('○', 'Link speculation', 'paused — connection is ' + tierName);
+        else feature('●', 'Link speculation', anchors + ' eligible links on this page');
+
+        if (learnedLcpUrl) {
+            feature('●', 'Learned hero preload', 'preloading this route’s hero image');
+        } else if (record) {
+            const seen = Number(record.seen) || 0;
+            const need = Math.max(0, LEARN_MIN_SIGHTINGS - seen);
+            feature('◐', 'Learned hero preload', need > 0
+                ? 'seen ' + seen + '× — ' + need + ' more visit' + (need === 1 ? '' : 's') + ' before it acts'
+                : 'record exists but did not match this viewport');
+        } else {
+            feature('◐', 'Learned hero preload', 'no record for this route yet');
+        }
+
+        if (predictedTargets.length) {
+            const next = predictedTargets[0];
+            feature('●', 'Next-page prediction', next.path + ' (seen ' + next.count + '×)');
+        } else {
+            feature('◐', 'Next-page prediction',
+                'learns where you go from here — needs ' + TRANSITION_MIN_CONFIDENCE + ' visits along the same path');
+        }
+
+        feature(contentVisibilityEnabled() ? '●' : '○', 'Aggressive rendering',
+            contentVisibilityEnabled() ? 'skipping layout for offscreen sections' : 'off for this origin');
+
+        const samples = (vitals && Array.isArray(vitals.lcp) ? vitals.lcp : []).filter(Number.isFinite);
+        let lcpText = 'no samples yet';
+        if (samples.length) {
+            const sorted = samples.slice().sort((a, b) => a - b);
+            lcpText = Math.round(sorted[Math.floor(sorted.length / 2)]) + ' ms (median of ' + sorted.length + ')';
+        }
+
+        lines.push('');
+        lines.push('LEARNED FOR THIS ORIGIN');
+        lines.push('  Pages with a hero record   ' + (lcpStore ? Object.keys(lcpStore).length : 0));
+        lines.push('  Critical origins           ' + ((originStore && Array.isArray(originStore.origins))
+            ? originStore.origins.length : 0));
+        lines.push('  Navigation sources         ' + (transitions ? Object.keys(transitions).length : 0));
+        lines.push('  Median LCP                 ' + lcpText);
+        lines.push('  Connection                 ' + tierName + ' (' + ((conn && conn.effectiveType) || 'unknown') + ')');
+
+        return lines.join('\n');
+    }
+
+    if (typeof GM_registerMenuCommand !== 'undefined') {
+        GM_registerMenuCommand('Quicksilver: Status', () => {
+            alert(statusReport());
+        });
+
+        GM_registerMenuCommand('Quicksilver: Forget this site', () => {
+            for (const key of ORIGIN_KEYS) deleteStore(key);
+            learnedLcpUrl = null;
+            emittedPreloadFor = null;
+            predictedTargets = [];
+            alert('Quicksilver forgot everything learned for ' + location.origin
+                + '.\n\nThe aggressive-rendering preference was kept.');
+        });
+
+        GM_registerMenuCommand('Quicksilver: Forget navigation history (this site)', () => {
+            deleteStore(LEARN_TRANSITIONS_KEY);
+            predictedTargets = [];
+            alert('Quicksilver forgot every page-to-page transition learned for '
+                + location.origin + '.');
+        });
+
+        GM_registerMenuCommand('Quicksilver: Toggle aggressive rendering', () => {
+            const next = contentVisibilityEnabled() ? '0' : '1';
+            rawWrite(storeKey(CV_FLAG_KEY), next);
+            alert('Aggressive rendering ' + (next === '1' ? 'enabled' : 'disabled')
+                + ' for this origin. Reload to apply.\n\nSkips layout and paint for offscreen '
+                + 'sections. Disable if dropdowns or tooltips appear clipped at a section '
+                + 'edge, or if sticky headers or in-page anchors misbehave.');
+        });
+    }
 })();
