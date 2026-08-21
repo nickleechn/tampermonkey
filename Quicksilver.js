@@ -658,6 +658,49 @@
     }
 
     // -------------------------------------------------------------------------
+    // 3.x migration
+    // -------------------------------------------------------------------------
+    //
+    // 3.x kept an asset cache in CacheStorage plus its metadata in
+    // localStorage, and the content-visibility toggle in localStorage. 4.0.0
+    // removed the cache and moved the toggle into GM storage; without this,
+    // every origin visited under 3.x keeps megabytes of dead cache forever and
+    // silently loses its rendering preference on upgrade. All idempotent.
+
+    function migrateLegacyStorage() {
+        if (hasGmStorage) {
+            try {
+                const legacyFlag = localStorage.getItem(CV_FLAG_KEY);
+                if (legacyFlag !== null) {
+                    if (rawRead(storeKey(CV_FLAG_KEY)) === null) {
+                        rawWrite(storeKey(CV_FLAG_KEY), legacyFlag);
+                    }
+                    localStorage.removeItem(CV_FLAG_KEY);
+                }
+            } catch (_) {}
+        }
+
+        try {
+            localStorage.removeItem('tm-cache-lru-metadata');
+            localStorage.removeItem('tm-cache-stats');
+        } catch (_) {}
+    }
+
+    function purgeLegacyCache() {
+        // The Cache API only exists in secure contexts, and deleting a cache
+        // that is already gone is a cheap async no-op, so this is safe to run
+        // on every load. 3.x cached in every frame, so no isTopFrame gate.
+        try {
+            if (typeof caches !== 'undefined') {
+                caches.delete('tm-smart-lru-v3').catch(() => {});
+            }
+        } catch (_) {}
+    }
+
+    migrateLegacyStorage();
+    runWhenLoadedIdle(purgeLegacyCache);
+
+    // -------------------------------------------------------------------------
     // Same-document route changes
     // -------------------------------------------------------------------------
     //
@@ -848,7 +891,12 @@
         let pending = null;
         let settleTimer = null;
         let sawLoad = document.readyState === 'complete';
-        let hiddenBeforeLoad = document.visibilityState === 'hidden';
+        // A prerendered document reports 'hidden' while it loads, but a user
+        // who activates it is looking at a normally-loaded page — that must
+        // not latch the backgrounded-tab guard, or every route Part 9
+        // successfully prerenders becomes a route Part 6 refuses to learn.
+        let hiddenBeforeLoad = document.visibilityState === 'hidden' && !document.prerendering;
+        let softNavigated = false;
         let currentRoute = pageKey();
         let persistedRoute = null;
 
@@ -930,6 +978,16 @@
         }
 
         function settle() {
+            // Never persist from a document that is still prerendering: the
+            // page has not been seen, so its timer-driven settle would record
+            // a visit that never happened. Rescheduled on prerenderingchange.
+            if (document.prerendering) return;
+            // The LCP API only reports entries for the initial hard
+            // navigation. Once a client-side route change has happened, an
+            // empty pending is the API staying silent, not evidence the hero
+            // is gone — running the no-image decrement then would erode every
+            // learned record each time its route is revisited in an SPA.
+            if (!pending && softNavigated) return;
             // A page backgrounded during load finalises its LCP on whatever had
             // painted — often the logo. That wrong value is *consistent* across
             // such visits, so the seen>=2 gate would endorse it rather than
@@ -937,7 +995,10 @@
             // logo and shield it from lazying while the real hero stays
             // eligible for fetchpriority=low.
             if (!sawLoad || hiddenBeforeLoad) return;
-            persistLcp(currentRoute, pending);
+            // pending.route is authoritative: it names the route that was
+            // current when the hero actually painted, independent of handler
+            // ordering on a route change.
+            persistLcp(pending ? pending.route : currentRoute, pending);
         }
 
         function scheduleSettle() {
@@ -952,6 +1013,7 @@
             if (next === currentRoute) return;
 
             settle();
+            softNavigated = true;
 
             currentRoute = next;
             persistedRoute = null;
@@ -977,6 +1039,10 @@
             if (!sawLoad) hiddenBeforeLoad = true;
             settle();
         });
+
+        // Activation of a prerendered document is the moment the user really
+        // arrives; the settle clock starts from here. Never fires otherwise.
+        document.addEventListener('prerenderingchange', scheduleSettle, { once: true });
     }
 
     function persistOrigins() {
@@ -1056,7 +1122,15 @@
     if (isTopFrame) {
         applyLearnedHints();
         initLearning();
-        runWhenLoadedIdle(persistOrigins);
+        runWhenLoadedIdle(() => {
+            // Origin sightings from a prerendered document would credit a
+            // visit that never happened; count them only after activation.
+            if (document.prerendering) {
+                document.addEventListener('prerenderingchange', persistOrigins, { once: true });
+            } else {
+                persistOrigins();
+            }
+        });
     }
 
     // =========================================================================
@@ -1190,10 +1264,20 @@
     function initTransitionLearning() {
         let previousRoute = pageKey();
 
+        // document.referrer survives reloads and back/forward traversals, so
+        // recording it unconditionally would count /list → /item once per
+        // reload of /item, letting a single real navigation reach the
+        // confidence gate by itself. Only a fresh navigation is a choice.
+        let navType = 'navigate';
+        try {
+            const nav = performance.getEntriesByType('navigation');
+            if (nav && nav[0] && nav[0].type) navType = nav[0].type;
+        } catch (_) {}
+
         // A full navigation: the referrer is the page we came from. Chrome's
         // default policy sends it in full for same-origin requests, which is
         // the only case recorded here anyway.
-        if (document.referrer) {
+        if (navType === 'navigate' && document.referrer) {
             const from = toUrl(document.referrer);
             if (from && from.origin === location.origin) {
                 recordTransition(from.pathname, previousRoute);
@@ -1216,7 +1300,17 @@
         runWhenLoadedIdle(speculateOnPrediction);
     }
 
-    if (isTopFrame) initTransitionLearning();
+    if (isTopFrame) {
+        // A prerendered document runs this script too. Recording its referrer
+        // there would count Part 9's own prerenders as navigations the user
+        // made — a feedback loop where a wrong prediction reinforces itself
+        // forever. Learn (and predict) only once the user actually arrives.
+        if (document.prerendering) {
+            document.addEventListener('prerenderingchange', initTransitionLearning, { once: true });
+        } else {
+            initTransitionLearning();
+        }
+    }
 
     // =========================================================================
     // Part 7: priority hints and lazy media
@@ -1461,7 +1555,11 @@
             feature('◐', 'Learned hero preload', 'no record for this route yet');
         }
 
-        if (predictedTargets.length) {
+        if (!supportsSpeculationRules) {
+            feature('○', 'Next-page prediction', 'not supported by this Chrome build');
+        } else if (tier === TIER_SLOW) {
+            feature('○', 'Next-page prediction', 'paused — connection is ' + tierName);
+        } else if (predictedTargets.length) {
             const next = predictedTargets[0];
             feature('●', 'Next-page prediction', next.path + ' (seen ' + next.count + '×)');
         } else {
