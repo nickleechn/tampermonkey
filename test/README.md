@@ -15,6 +15,21 @@ sensitive and download targets refused).
 
 No browser required.
 
+## `quicksilver-safari-behaviour.js` — headless, current
+
+```bash
+node test/quicksilver-safari-behaviour.js
+```
+
+Evaluates `Quicksilver.safari.user.js` against a stubbed **WebKit** DOM — no
+`navigator.connection`, no `largest-contentful-paint`, no Navigation API, no
+speculation rules — and asserts what the port rests on: the WebKit-only guard,
+the geometric hero heuristic and its raised three-sighting gate, the connection
+tier learned from Navigation Timing, and the same scope limits on transition
+learning the Chrome build has.
+
+No browser required.
+
 ## `quicksilver-chrome/` — browser harness, **partly obsolete**
 
 Written for 3.x. The bulk of its assertions cover the optimistic `fetch` cache,
