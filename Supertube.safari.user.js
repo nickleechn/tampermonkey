@@ -1,27 +1,215 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.1.0
-// @description  Safari-friendly YouTube cleanup and automatic highest-quality selection.
+// @version      2.0.0
+// @description  Safari-only YouTube tuning: hardware-aware codec filtering, telemetry blocking, UI cleanup, and automatic highest-quality selection (1080p Premium when offered).
 // @author       nickleechn
 // @match        https://www.youtube.com/*
-// @match        https://www.youtube-nocookie.com/*
 // @exclude      https://www.youtube.com/live_chat*
-// @inject-into  content
-// @grant        GM.addStyle
+// @inject-into  page
+// @grant        none
 // @noframes
 // @run-at       document-start
 // @updateURL    https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Supertube.safari.user.js
 // @downloadURL  https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Supertube.safari.user.js
 // ==/UserScript==
 
+/*
+ * WORLD: page, not content.
+ *
+ * Every early hook below (MediaSource.isTypeSupported, fetch, XMLHttpRequest)
+ * and the whole player-API path (getAvailableQualityLevels /
+ * setPlaybackQualityRange) only work if this script shares a global with
+ * YouTube's own code. In an isolated content world `window` is a different
+ * object and DOM nodes carry none of the JS properties page script attached to
+ * them, so `movie_player.getAvailableQualityLevels` is simply undefined there.
+ *
+ * `@grant none` already means page context under Tampermonkey for Safari;
+ * `@inject-into page` says the same thing to the Userscripts extension. The
+ * cost is that GM.* APIs are unavailable, so styles go in via a plain <style>
+ * element. The settings-menu clicking path is kept as a fallback for the case
+ * where the player API is missing anyway.
+ */
+
 (function () {
     'use strict';
 
-    if (window.top !== window) return;
+    /* ==================================================================
+     * Configuration
+     * ================================================================== */
+
+    // 'auto'      : probe for hardware AV1 decode, block AV1 only if absent (recommended)
+    // 'no-av1'    : always block AV1
+    // 'h264-only' : block AV1 and VP9 — caps you at 1080p, for old Intel Macs
+    // 'all'       : no codec filtering
+    const CODEC_PROFILE = 'auto';
+
+    // Blocking /api/stats/watchtime and /api/stats/atr stops YouTube recording
+    // your playback position, which breaks "resume where you left off" and stops
+    // views counting for creators. Pure telemetry (log_event, qoe, ptracking,
+    // ads) is blocked regardless of this setting.
+    const BLOCK_WATCH_HISTORY = false;
+
+    // Turn off "autoplay next video" via the player API.
+    const DISABLE_AUTOPLAY_NEXT = false;
+
+    /* ==================================================================
+     * PART A — Early hooks. Installed once, never torn down.
+     * ================================================================== */
+
+    /* --- A1. Codec filtering ------------------------------------------ */
+
+    const AV1_RE = /av0?1/i;
+    const VP9_RE = /vp0?9/i;
+    const AV1_PROBE = 'video/mp4; codecs="av01.0.08M.08"';
+
+    // Start conservative: assume no hardware AV1 until proven otherwise, so a
+    // player that initialises before the async probe resolves never gets handed
+    // a software-decoded AV1 stream.
+    let blockAv1 = CODEC_PROFILE !== 'all';
+    const blockVp9 = CODEC_PROFILE === 'h264-only';
+
+    const isBlockedCodec = (mime) => {
+        if (typeof mime !== 'string') return false;
+        if (blockAv1 && AV1_RE.test(mime)) return true;
+        if (blockVp9 && VP9_RE.test(mime)) return true;
+        return false;
+    };
+
+    if (CODEC_PROFILE === 'auto') {
+        // powerEfficient is the actual question being asked — "does this Mac
+        // have an AV1 hardware decoder". M3/M4 report true, M1/M2 report false.
+        // This replaces hand-editing a profile to match your own silicon.
+        try {
+            navigator.mediaCapabilities.decodingInfo({
+                type: 'media-source',
+                video: {
+                    contentType: AV1_PROBE,
+                    width: 3840,
+                    height: 2160,
+                    bitrate: 20000000,
+                    framerate: 30
+                }
+            }).then((info) => {
+                blockAv1 = !(info && info.supported && info.powerEfficient);
+            }).catch(() => {});
+        } catch (_) {}
+    }
+
+    if (CODEC_PROFILE !== 'all') {
+        if (window.MediaSource && typeof MediaSource.isTypeSupported === 'function') {
+            const nativeIsTypeSupported = MediaSource.isTypeSupported.bind(MediaSource);
+            MediaSource.isTypeSupported = function (mime) {
+                if (isBlockedCodec(mime)) return false;
+                return nativeIsTypeSupported(mime);
+            };
+        }
+        if (window.HTMLVideoElement) {
+            const nativeVideoCanPlay = HTMLVideoElement.prototype.canPlayType;
+            HTMLVideoElement.prototype.canPlayType = function (mime) {
+                if (isBlockedCodec(mime)) return '';
+                return nativeVideoCanPlay.call(this, mime);
+            };
+        }
+        if (window.HTMLAudioElement) {
+            const nativeAudioCanPlay = HTMLAudioElement.prototype.canPlayType;
+            HTMLAudioElement.prototype.canPlayType = function (mime) {
+                if (isBlockedCodec(mime)) return '';
+                return nativeAudioCanPlay.call(this, mime);
+            };
+        }
+    }
+
+    /* --- A2. Block telemetry / ad endpoints ---------------------------- */
+
+    const BLOCKED_URL_PATTERNS = [
+        '/youtubei/v1/log_event',
+        '/api/stats/qoe',
+        '/ptracking',
+        '/csi_204',
+        '/pagead/',
+        'doubleclick.net',
+        'googleadservices.com'
+    ];
+    if (BLOCK_WATCH_HISTORY) {
+        BLOCKED_URL_PATTERNS.push('/api/stats/atr', '/api/stats/watchtime');
+    }
+
+    const toUrlString = (value) => {
+        if (typeof value === 'string') return value;
+        if (!value) return '';
+        try {
+            // Request exposes .url; URL and everything else stringify sensibly.
+            if (typeof value.url === 'string') return value.url;
+            return String(value);
+        } catch (_) {
+            return '';
+        }
+    };
+
+    const isBlockedURL = (value) => {
+        const url = toUrlString(value);
+        if (!url) return false;
+        return BLOCKED_URL_PATTERNS.some((pattern) => url.includes(pattern));
+    };
+
+    if (typeof window.fetch === 'function') {
+        const nativeFetch = window.fetch;
+        window.fetch = function (input, init) {
+            try {
+                if (isBlockedURL(input)) {
+                    // 204 is a null-body status: `new Response('', {status: 204})`
+                    // throws TypeError, which previously fell through the catch
+                    // and let every "blocked" request through untouched.
+                    return Promise.resolve(new Response(null, { status: 204 }));
+                }
+            } catch (_) {}
+            // Not .call(this, ...) — a destructured `fetch` would arrive with
+            // `this === undefined` and WebKit rejects that outright.
+            return nativeFetch.apply(window, arguments);
+        };
+    }
+
+    const nativeXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+        this.__supertubeBlocked = isBlockedURL(url);
+        return nativeXhrOpen.call(this, method, url, ...rest);
+    };
+
+    const nativeXhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function (body) {
+        if (!this.__supertubeBlocked) return nativeXhrSend.call(this, body);
+        // Simply swallowing send() leaves readyState at 1 forever, so callers
+        // keep a pending promise or retry timer alive. Fake a clean 204 instead.
+        window.setTimeout(() => {
+            try {
+                Object.defineProperty(this, 'readyState', { value: 4, configurable: true });
+                Object.defineProperty(this, 'status', { value: 204, configurable: true });
+                Object.defineProperty(this, 'responseText', { value: '', configurable: true });
+            } catch (_) {}
+            try {
+                this.dispatchEvent(new Event('readystatechange'));
+                this.dispatchEvent(new Event('load'));
+                this.dispatchEvent(new Event('loadend'));
+            } catch (_) {}
+        }, 0);
+    };
+
+    if (typeof navigator.sendBeacon === 'function') {
+        const nativeSendBeacon = navigator.sendBeacon.bind(navigator);
+        navigator.sendBeacon = function (url, data) {
+            if (isBlockedURL(url)) return true;
+            return nativeSendBeacon(url, data);
+        };
+    }
+
+    /* ==================================================================
+     * PART B — Cleanup CSS, preconnects, and quality selection
+     * ================================================================== */
 
     const APPLY_DELAYS_MS = [250, 1000, 2500, 5000];
     const MENU_WAIT_MS = 150;
+    const OBSERVER_DEBOUNCE_MS = 250;
     const MAX_ATTEMPTS_PER_VIDEO = 4;
     const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
     const QUALITY_ORDER = [
@@ -29,11 +217,18 @@
         'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'
     ];
     const PREMIUM_RE = /\b(?:premium|enhanced bitrate)\b/i;
-    // Apex googlevideo.com does not warm the real CDN hosts (rr*---sn-*.googlevideo.com).
+    // Apex googlevideo.com does not warm the real CDN hosts, and the per-session
+    // rr*---sn-*.googlevideo.com name is unknowable ahead of time, so media
+    // preconnects are not attempted at all.
     const PRECONNECT_HOSTS = [
         'https://i.ytimg.com',
         'https://yt3.ggpht.com',
         'https://s.ytimg.com'
+    ];
+    const VIDEO_SELECTORS = [
+        '#movie_player video',
+        '.html5-video-player video',
+        'video'
     ];
     const CSS = `
         ytd-video-preview,
@@ -52,8 +247,8 @@
         ytd-rich-shelf-renderer[is-shorts],
         ytd-reel-shelf-renderer,
         ytd-rich-section-renderer:has(ytd-rich-shelf-renderer[is-shorts]),
-        a[title="Shorts"],
-        ytd-mini-guide-entry-renderer[aria-label="Shorts"] {
+        ytd-guide-entry-renderer:has(a[href="/shorts"]),
+        ytd-mini-guide-entry-renderer:has(a[href="/shorts"]) {
             display: none !important;
         }
 
@@ -70,10 +265,11 @@
     const preconnectHints = new Set();
 
     let stopped = true;
-    let styleInstalled = false;
+    let styleElement = null;
     let currentVideoKey = '';
     let completedVideoKey = '';
-    let premiumAttemptedKey = '';
+    let premiumSelectedKey = '';
+    let autonavDisabledKey = '';
     let activeScheduleKey = '';
     let attempts = 0;
     let observer = null;
@@ -149,6 +345,17 @@
         return document.getElementById('movie_player') || document.querySelector('.html5-video-player');
     }
 
+    function getVideoElement() {
+        // Deliberately one querySelector per selector: a grouped selector list
+        // returns the first match in *document order*, which on a watch page can
+        // be a hover-preview <video> in the sidebar rather than the real player.
+        for (const selector of VIDEO_SELECTORS) {
+            const video = document.querySelector(selector);
+            if (video) return video;
+        }
+        return null;
+    }
+
     function getSettingsButton(player) {
         return player && player.querySelector('.ytp-settings-button');
     }
@@ -178,7 +385,10 @@
         if (!player || typeof player.getAvailableQualityData !== 'function') return [];
         try {
             const data = player.getAvailableQualityData();
-            return Array.isArray(data) ? data.filter(Boolean) : [];
+            if (!Array.isArray(data)) return [];
+            return data.filter(function (entry) {
+                return entry && entry.isPlayable !== false;
+            });
         } catch (_) {
             return [];
         }
@@ -190,7 +400,14 @@
     }
 
     function chooseTargetQuality(levels, qualityData) {
-        const uniqueLevels = Array.from(new Set(levels)).sort(function (left, right) {
+        // Prefer the levels the player reports as playable; fall back to the raw
+        // level list when getAvailableQualityData is unavailable.
+        const playableLevels = qualityData.length
+            ? qualityData.map(function (entry) { return entry.quality; }).filter(Boolean)
+            : [];
+        const candidates = playableLevels.length ? playableLevels : levels;
+
+        const uniqueLevels = Array.from(new Set(candidates)).sort(function (left, right) {
             return rankQuality(left) - rankQuality(right);
         });
         if (!uniqueLevels.length) return null;
@@ -240,6 +457,16 @@
             }
         } catch (_) {}
         return false;
+    }
+
+    function disableAutonavOnce(player, videoKey) {
+        if (!DISABLE_AUTOPLAY_NEXT || !player || autonavDisabledKey === videoKey) return;
+        try {
+            if (typeof player.setAutonavState === 'function') {
+                player.setAutonavState(1); // 1 = disabled
+                autonavDisabledKey = videoKey;
+            }
+        } catch (_) {}
     }
 
     function parseQuality(item) {
@@ -333,7 +560,7 @@
         return true;
     }
 
-    async function selectHighestQuality(reason) {
+    async function selectHighestQuality() {
         if (stopped || qualitySelectionRunning || attempts >= MAX_ATTEMPTS_PER_VIDEO) return;
         if (!isWatchPage()) return;
 
@@ -345,7 +572,7 @@
 
         const levels = getAvailableQualityLevels(player);
         const choice = chooseTargetQuality(levels, getAvailableQualityData(player));
-        // Don't burn attempts while the player is still initializing.
+        // Don't burn an attempt while the player is still initialising.
         if (!choice && !getSettingsButton(player)) return;
 
         qualitySelectionRunning = true;
@@ -354,29 +581,40 @@
         try {
             if (expectedVideoKey !== getVideoKey() || stopped) return;
 
-            if (choice) {
-                persistPlayerQuality(choice.quality);
-                const applied = applyQualityViaApi(player, choice.quality);
-                if (!applied) {
-                    // Player API unavailable — fall back to the settings menu once.
-                    if (!await selectHighestQualityViaMenu(player) || expectedVideoKey !== getVideoKey()) return;
-                } else if (
-                    choice.wantsPremium1080 &&
-                    premiumAttemptedKey !== expectedVideoKey &&
-                    getSettingsButton(player)
-                ) {
-                    premiumAttemptedKey = expectedVideoKey;
-                    await wait(700);
-                    if (stopped || expectedVideoKey !== getVideoKey()) return;
-                    await selectPremiumInMenu(player, choice.displayLabel);
-                }
+            disableAutonavOnce(player, expectedVideoKey);
 
+            if (!choice) {
+                if (!await selectHighestQualityViaMenu(player) || expectedVideoKey !== getVideoKey()) return;
                 completedVideoKey = expectedVideoKey;
                 clearApplyTimers();
                 return;
             }
 
-            if (!await selectHighestQualityViaMenu(player) || expectedVideoKey !== getVideoKey()) return;
+            persistPlayerQuality(choice.quality);
+
+            if (!applyQualityViaApi(player, choice.quality)) {
+                // Player API unavailable — drive the settings menu instead.
+                if (!await selectHighestQualityViaMenu(player) || expectedVideoKey !== getVideoKey()) return;
+                completedVideoKey = expectedVideoKey;
+                clearApplyTimers();
+                return;
+            }
+
+            if (choice.wantsPremium1080 && premiumSelectedKey !== expectedVideoKey) {
+                if (!getSettingsButton(player)) {
+                    // Menu isn't built yet. Leave the video incomplete so a later
+                    // scheduled attempt retries rather than marking it done here.
+                    return;
+                }
+                await wait(700);
+                if (stopped || expectedVideoKey !== getVideoKey()) return;
+                // Only record success — a failed menu walk must stay retryable.
+                if (await selectPremiumInMenu(player, choice.displayLabel)) {
+                    premiumSelectedKey = expectedVideoKey;
+                } else {
+                    return;
+                }
+            }
 
             completedVideoKey = expectedVideoKey;
             clearApplyTimers();
@@ -403,7 +641,7 @@
         activeScheduleKey = videoKey;
         for (const delay of APPLY_DELAYS_MS) {
             scheduleApply(function () {
-                selectHighestQuality(reason + ':' + delay);
+                selectHighestQuality();
             }, delay);
         }
     }
@@ -414,7 +652,8 @@
         if (changed) {
             currentVideoKey = nextVideoKey;
             completedVideoKey = '';
-            premiumAttemptedKey = '';
+            premiumSelectedKey = '';
+            autonavDisabledKey = '';
             attempts = 0;
             qualitySelectionRunning = false;
             attachVideoListeners();
@@ -424,7 +663,7 @@
     }
 
     function attachVideoListeners() {
-        const video = document.querySelector('#movie_player video, .html5-video-player video, video');
+        const video = getVideoElement();
         if (!video || video === watchedVideo) return;
 
         if (removeVideoListeners) removeVideoListeners();
@@ -458,17 +697,22 @@
         const root = getObservationRoot();
         if (!root) return;
 
+        // Note: attachVideoListeners must NOT disconnect this observer. Doing so
+        // left the page unobserved for good after the first <video> attach, so
+        // later element swaps (ad -> content, player remount) went unnoticed.
         observer = new MutationObserver(function () {
             cancelTimer(observerTimer);
             observerTimer = schedule(function () {
                 observerTimer = 0;
                 attachVideoListeners();
-            }, 250);
+            }, OBSERVER_DEBOUNCE_MS);
         });
         observer.observe(root, { childList: true, subtree: true });
     }
 
     function installNavigationListeners() {
+        // Registered on document only — these bubble, so also binding window
+        // would run every handler twice per navigation.
         const events = ['yt-navigate-finish', 'yt-page-data-updated', 'spfdone'];
         for (const eventName of events) {
             addListener(document, eventName, function () {
@@ -481,34 +725,12 @@
     }
 
     function installStyles() {
-        if (styleInstalled) return;
-
-        const installFallbackStyle = function () {
-            if (styleInstalled) return;
-            const style = document.createElement('style');
-            style.textContent = CSS;
-            (document.head || document.documentElement).appendChild(style);
-            styleInstalled = true;
-        };
-
-        try {
-            if (typeof GM !== 'object' || typeof GM.addStyle !== 'function') {
-                installFallbackStyle();
-                return;
-            }
-
-            const result = GM.addStyle(CSS);
-            styleInstalled = true;
-            if (result && typeof result.catch === 'function') {
-                result.catch(function () {
-                    styleInstalled = false;
-                    installFallbackStyle();
-                });
-            }
-        } catch (_) {
-            styleInstalled = false;
-            installFallbackStyle();
-        }
+        if (styleElement && styleElement.isConnected) return;
+        const parent = document.head || document.documentElement;
+        if (!parent) return;
+        styleElement = document.createElement('style');
+        styleElement.textContent = CSS;
+        parent.appendChild(styleElement);
     }
 
     function installPreconnects() {
@@ -562,7 +784,8 @@
         stopped = false;
         attempts = 0;
         completedVideoKey = '';
-        premiumAttemptedKey = '';
+        premiumSelectedKey = '';
+        autonavDisabledKey = '';
 
         installStyles();
         installPreconnects();
