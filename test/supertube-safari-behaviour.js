@@ -11,6 +11,14 @@
 // keeps an ABR floor instead of being pinned, and that the MutationObserver
 // never falls back to observing the whole feed.
 //
+// 2.2.0 adds: that a cached hardware-AV1 verdict is applied SYNCHRONOUSLY, before
+// decodingInfo() settles (the window the player actually asks in, which every
+// other check here misses because it runs after clock.flush()); that a stale
+// cache loses to the live probe; that AV1 survives when only one of the two
+// probe configurations is power-efficient; that the observer's record filter
+// drops text-node churn without losing player remounts; that preconnects target
+// the non-CORS pool; and that a blocked XHR is as parseable as a blocked fetch.
+//
 // No browser required.
 const vm = require('vm');
 const fs = require('fs');
@@ -39,6 +47,7 @@ function makeClock() {
             return id;
         },
         clearTimeout(id) { queue.delete(id); },
+        size() { return queue.size; },
         async flush(limit = 400) {
             let steps = 0;
             while (queue.size && steps++ < limit) {
@@ -60,6 +69,7 @@ function makeClock() {
 function makeEl(tag) {
     return {
         tagName: String(tag).toUpperCase(),
+        nodeType: 1,
         attributes: {},
         children: [],
         textContent: '',
@@ -130,6 +140,7 @@ function build({
     qualityData = null,
     hasManagedMediaSource = true,
     powerEfficientAv1 = false,
+    storedSeed = null,
     observationRoots = { '#player': makeEl('div') },
     playerApi = true,
     menuLabels = null
@@ -139,7 +150,7 @@ function build({
         ? makePlayer(levels, qualityData)
         : makeMenuPlayer(menuLabels || []);
     const observed = [];
-    const stored = {};
+    const stored = Object.assign({}, storedSeed || {});
 
     const head = makeEl('head');
     const body = makeEl('body');
@@ -180,12 +191,20 @@ function build({
 
     class MutationObserver {
         constructor(cb) { this.cb = cb; }
-        observe(root, opts) { observed.push({ root, opts }); }
+        observe(root, opts) { observed.push({ root, opts, observer: this }); }
         disconnect() { this.disconnected = true; }
     }
 
     class XMLHttpRequest {
-        open() {} send() {} addEventListener() {} dispatchEvent() {}
+        constructor() { this.listeners = {}; this.responseType = ''; }
+        open() {} send() {}
+        addEventListener(type, fn) {
+            (this.listeners[type] = this.listeners[type] || []).push(fn);
+        }
+        dispatchEvent(event) {
+            for (const fn of this.listeners[event.type] || []) fn(event);
+            return true;
+        }
     }
 
     const sandbox = {
@@ -203,8 +222,14 @@ function build({
         navigator: {
             sendBeacon: () => true,
             mediaCapabilities: {
-                decodingInfo: () => Promise.resolve({
-                    supported: true, powerEfficient: powerEfficientAv1
+                // powerEfficientAv1 may be a function so a test can answer
+                // differently per configuration, which is the whole point of
+                // probing more than one.
+                decodingInfo: (config) => Promise.resolve({
+                    supported: true,
+                    powerEfficient: typeof powerEfficientAv1 === 'function'
+                        ? powerEfficientAv1(config.video)
+                        : powerEfficientAv1
                 })
             }
         },
@@ -219,7 +244,7 @@ function build({
     vm.runInContext(SOURCE, sandbox, { filename: 'Supertube.safari.user.js' });
 
     return {
-        sandbox, player, observed, stored, clock, MediaSource, ManagedMediaSource,
+        sandbox, player, observed, stored, clock, MediaSource, ManagedMediaSource, head,
         picked: () => player.picked
     };
 }
@@ -250,6 +275,37 @@ function build({
     env = build({ powerEfficientAv1: true });
     await env.clock.flush();
     check('AV1 is allowed once the probe reports a power-efficient decoder',
+        env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === true);
+
+    // Every check above runs after clock.flush(), i.e. after decodingInfo() has
+    // settled. That is precisely the window the player actually asks in, so the
+    // synchronous seed has to be asserted with no flush at all.
+    env = build({ powerEfficientAv1: true, storedSeed: { 'supertube-av1-hw-v1': '1' } });
+    check('a cached hardware verdict unblocks AV1 before the probe resolves',
+        env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === true);
+
+    env = build({ powerEfficientAv1: false });
+    check('with no cache the first load still starts conservative',
+        env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === false);
+
+    env = build({ powerEfficientAv1: true });
+    await env.clock.flush();
+    check('the probe writes its verdict back for the next load',
+        env.stored['supertube-av1-hw-v1'] === '1');
+
+    // A stale cache must lose to the live probe rather than persisting forever.
+    env = build({ powerEfficientAv1: false, storedSeed: { 'supertube-av1-hw-v1': '1' } });
+    await env.clock.flush();
+    check('a stale cache is corrected once the probe disagrees',
+        env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === false
+        && env.stored['supertube-av1-hw-v1'] === '0');
+
+    // powerEfficient is answered per configuration: hardware that is not efficient
+    // at the top of the bitrate ladder can still be efficient at the 4K60 stream
+    // actually served, and blocking AV1 on the first answer alone loses that.
+    env = build({ powerEfficientAv1: (video) => video.framerate === 60 });
+    await env.clock.flush();
+    check('AV1 survives when only the second probe configuration is efficient',
         env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === true);
 
     console.log('\nQuality ceiling');
@@ -315,6 +371,44 @@ function build({
     check('and never falls back to observing <body>',
         !env.observed.some((o) => o.root.tagName === 'BODY'));
 
+    // The player subtree churns ~1Hz purely from .ytp-time-current being
+    // rewritten, which appends a Text node. Those must not reach the debounce.
+    env = build({ observationRoots: { '#player': makeEl('div') } });
+    await env.clock.flush();
+    const observer = env.observed[0].observer;
+    let before = env.clock.size();
+    observer.cb([{ addedNodes: [{ nodeType: 3, textContent: '1:23' }] }]);
+    check('a text-node mutation schedules no work',
+        env.clock.size() === before);
+
+    const chrome = makeEl('div');
+    observer.cb([{ addedNodes: [chrome] }]);
+    check('an unrelated element mutation schedules no work either',
+        env.clock.size() === before);
+
+    observer.cb([{ addedNodes: [makeEl('video')] }]);
+    check('a <video> insertion still schedules a re-attach',
+        env.clock.size() === before + 1);
+
+    // Drain first: the debounce cancels the pending timer before scheduling the
+    // next one, so back-to-back hits leave the queue the same size rather than
+    // growing it.
+    await env.clock.flush();
+    const wrapper = makeEl('div');
+    wrapper.querySelector = (sel) => (sel === 'video' ? makeEl('video') : null);
+    before = env.clock.size();
+    observer.cb([{ addedNodes: [wrapper] }]);
+    check('a remounted container carrying a <video> is caught too',
+        env.clock.size() === before + 1);
+
+    console.log('\nPreconnect hints');
+
+    env = build();
+    const hints = env.head.children.filter((el) => el.rel === 'preconnect');
+    check('preconnects target the non-CORS pool the assets actually use',
+        hints.length === 3 && hints.every((h) => !h.crossOrigin),
+        hints.length ? 'crossOrigin=' + String(hints[0].crossOrigin) : 'no hints');
+
     console.log('\nBlocked requests stay parseable');
 
     env = build();
@@ -328,6 +422,21 @@ function build({
         threw ? `${threw.name}: ${threw.message}` : `body=${JSON.stringify(parsed)}`);
 
     const allowed = await env.sandbox.fetch('https://www.youtube.com/watch?v=abc123');
+    env = build();
+    const xhr = new env.sandbox.XMLHttpRequest();
+    let xhrParsed = null;
+    let xhrThrew = null;
+    xhr.addEventListener('load', () => {
+        try { xhrParsed = JSON.parse(xhr.responseText); } catch (err) { xhrThrew = err; }
+    });
+    xhr.open('POST', 'https://www.youtube.com/youtubei/v1/log_event');
+    xhr.send('{}');
+    await env.clock.flush();
+    check('a blocked XHR is parseable too, matching the fetch path',
+        xhrThrew === null && xhrParsed !== null && xhr.status === 200
+        && xhr.response === '{}',
+        xhrThrew ? String(xhrThrew.message) : 'status=' + xhr.status);
+
     check('an unblocked fetch still reaches the native implementation',
         (await allowed.text()) === 'native');
 

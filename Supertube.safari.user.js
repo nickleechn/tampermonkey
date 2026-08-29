@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      2.1.0
+// @version      2.2.0
 // @description  Safari-only YouTube tuning: hardware-aware codec filtering, telemetry blocking, UI cleanup, and automatic highest-quality selection capped at 4K (1080p Premium when offered).
 // @author       nickleechn
 // @match        https://www.youtube.com/*
@@ -60,6 +60,24 @@
     // remove the cap.
     const MAX_QUALITY = 'hd2160';
 
+    // Safari 17+ exposes ManagedMediaSource, and YouTube picks it up via
+    // `self.ManagedMediaSource || self.MediaSource`. MMS hands buffering policy to
+    // WebKit, which deliberately keeps the forward buffer small to save power and
+    // memory; Chrome's classic MSE buffers far more aggressively. On a desktop Mac
+    // on wifi that trade is backwards and reads as "Safari is slower".
+    //
+    // Hiding the constructor makes YouTube's feature detect fall through to plain
+    // MediaSource. Left OFF by default: it is a real power regression on battery,
+    // and it changes which YouTube code path runs, so turn it on only once
+    // DEBUG_STATS shows it actually helps on your hardware.
+    const PREFER_CLASSIC_MSE = false;
+
+    // Logs dropped-frame counts and the codec actually in use every few seconds.
+    // The codec policy above rests entirely on one vendor hint (powerEfficient);
+    // this is how you check that hint against reality on your own Mac.
+    const DEBUG_STATS = false;
+    const DEBUG_STATS_INTERVAL_MS = 5000;
+
     // Floor handed to setPlaybackQualityRange as its minimum. Pinning min === max
     // leaves the player no room to adapt, so a bandwidth dip becomes a rebuffer
     // instead of a brief quality drop. Set to null to pin hard at MAX_QUALITY.
@@ -75,6 +93,25 @@
     const VP9_RE = /vp0?9/i;
     const AV1_PROBE = 'video/mp4; codecs="av01.0.08M.08"';
 
+    // powerEfficient is answered per *configuration*, not per codec. Asking only
+    // about 4K30 at the very top of YouTube's bitrate ladder can come back false
+    // on hardware that decodes the mid-bitrate and 4K60 streams actually served,
+    // which would block AV1 on a Mac that handles it fine. Ask about both shapes
+    // and treat AV1 as viable if either one is power-efficient.
+    const AV1_PROBE_CONFIGS = [
+        { width: 3840, height: 2160, bitrate: 20000000, framerate: 30 },
+        { width: 3840, height: 2160, bitrate: 14000000, framerate: 60 }
+    ];
+
+    // decodingInfo() is async, but YouTube's player asks isTypeSupported() long
+    // before it settles. Whatever blockAv1 holds in that window is what the player
+    // sees. Starting conservative protects an M1/M2 from software AV1, but it also
+    // means an M3/M4 *with* a hardware decoder spends its first navigation blocking
+    // AV1 and falling back to software VP9 for 4K — the exact outcome this file
+    // exists to prevent. The answer never changes for a given Mac, so cache it and
+    // read it back synchronously on the next load.
+    const AV1_CACHE_KEY = 'supertube-av1-hw-v1';
+
     // Start conservative: assume no hardware AV1 until proven otherwise, so a
     // player that initialises before the async probe resolves never gets handed
     // a software-decoded AV1 stream.
@@ -89,23 +126,39 @@
     };
 
     if (CODEC_PROFILE === 'auto') {
+        // Synchronous, so it lands before YouTube's first isTypeSupported() call.
+        // Only a cached 'yes' relaxes the default — a cached 'no' and a missing
+        // entry both leave the conservative starting value in place.
+        try {
+            if (localStorage.getItem(AV1_CACHE_KEY) === '1') blockAv1 = false;
+        } catch (_) {}
+
         // powerEfficient is the actual question being asked — "does this Mac
         // have an AV1 hardware decoder". M3/M4 report true, M1/M2 report false.
         // This replaces hand-editing a profile to match your own silicon.
         try {
-            navigator.mediaCapabilities.decodingInfo({
-                type: 'media-source',
-                video: {
-                    contentType: AV1_PROBE,
-                    width: 3840,
-                    height: 2160,
-                    bitrate: 20000000,
-                    framerate: 30
-                }
-            }).then((info) => {
-                blockAv1 = !(info && info.supported && info.powerEfficient);
-            }).catch(() => {});
+            Promise.all(AV1_PROBE_CONFIGS.map(function (config) {
+                return navigator.mediaCapabilities.decodingInfo({
+                    type: 'media-source',
+                    video: Object.assign({ contentType: AV1_PROBE }, config)
+                }).catch(function () { return null; });
+            })).then(function (results) {
+                const efficient = results.some(function (info) {
+                    return Boolean(info && info.supported && info.powerEfficient);
+                });
+                blockAv1 = !efficient;
+                try { localStorage.setItem(AV1_CACHE_KEY, efficient ? '1' : '0'); } catch (_) {}
+            }).catch(function () {});
         } catch (_) {}
+    }
+
+    // Must run before YouTube's player boots and caches the constructor it found.
+    if (PREFER_CLASSIC_MSE && window.ManagedMediaSource) {
+        try {
+            delete window.ManagedMediaSource;
+        } catch (_) {
+            window.ManagedMediaSource = undefined;
+        }
     }
 
     if (CODEC_PROFILE !== 'all') {
@@ -211,9 +264,20 @@
         // keep a pending promise or retry timer alive. Fake a clean 204 instead.
         window.setTimeout(() => {
             try {
+                // Mirror the fetch path above rather than inventing a second
+                // shape. A 204 with an empty body puts a caller doing
+                // JSON.parse(xhr.responseText) straight into "SyntaxError:
+                // Unexpected end of JSON input" — the very bug the fetch branch
+                // was already fixed for. `response` has to be defined explicitly:
+                // send() never ran, so the native getter yields null.
+                const wantsJson = this.responseType === 'json';
                 Object.defineProperty(this, 'readyState', { value: 4, configurable: true });
-                Object.defineProperty(this, 'status', { value: 204, configurable: true });
-                Object.defineProperty(this, 'responseText', { value: '', configurable: true });
+                Object.defineProperty(this, 'status', { value: 200, configurable: true });
+                Object.defineProperty(this, 'statusText', { value: 'OK', configurable: true });
+                Object.defineProperty(this, 'responseText', { value: '{}', configurable: true });
+                Object.defineProperty(this, 'response', {
+                    value: wantsJson ? {} : '{}', configurable: true
+                });
             } catch (_) {}
             try {
                 this.dispatchEvent(new Event('readystatechange'));
@@ -279,12 +343,32 @@
             display: none !important;
         }
 
+        /* The section wrapper is deliberately NOT matched with
+           :has(ytd-rich-shelf-renderer[is-shorts]). That selector is re-evaluated
+           against a feed that appends items continuously, which broadens style
+           invalidation for the sake of collapsing a container whose only child is
+           already hidden above. The cost of leaving it is an empty gap.
+           The two guide entries keep their :has() — the sidebar is small and
+           static, and hiding only the inner <a> would leave a clickable empty row. */
         ytd-rich-shelf-renderer[is-shorts],
         ytd-reel-shelf-renderer,
-        ytd-rich-section-renderer:has(ytd-rich-shelf-renderer[is-shorts]),
         ytd-guide-entry-renderer:has(a[href="/shorts"]),
         ytd-mini-guide-entry-renderer:has(a[href="/shorts"]) {
             display: none !important;
+        }
+
+        /* YouTube keeps every feed and comment row live in the DOM, and WebKit pays
+           layout and paint on all of them. content-visibility lets it skip the ones
+           that are off-screen. 'auto <size>' rather than a bare length so real
+           measurements are remembered after first render — a fixed placeholder
+           gives a wrong scrollbar and jumps the scroll position. Ignored by Safari
+           below 18, so it degrades to today's behaviour. Deliberately not applied
+           to the watch page player column. */
+        ytd-rich-item-renderer,
+        ytd-video-renderer,
+        ytd-comment-thread-renderer {
+            content-visibility: auto;
+            contain-intrinsic-size: auto 300px;
         }
 
         ytd-masthead,
@@ -312,6 +396,7 @@
     let watchedVideo = null;
     let removeVideoListeners = null;
     let qualitySelectionRunning = false;
+    let lastPersistedQuality = '';
 
     function addListener(target, type, listener, options) {
         target.addEventListener(type, listener, options);
@@ -469,11 +554,18 @@
     }
 
     function persistPlayerQuality(quality) {
+        // Called on every selection attempt, during player init, on the main
+        // thread. localStorage reads are synchronous, so remember what was last
+        // written and skip the read + parse when nothing has changed.
+        if (lastPersistedQuality === quality) return;
         try {
             const current = localStorage.getItem('yt-player-quality');
             if (current) {
                 const parsed = JSON.parse(current);
-                if (parsed && parsed.data === quality) return;
+                if (parsed && parsed.data === quality) {
+                    lastPersistedQuality = quality;
+                    return;
+                }
             }
             const now = Date.now();
             localStorage.setItem('yt-player-quality', JSON.stringify({
@@ -481,6 +573,7 @@
                 expiration: now + MONTH_MS,
                 creation: now
             }));
+            lastPersistedQuality = quality;
         } catch (_) {}
     }
 
@@ -764,12 +857,28 @@
         // Note: attachVideoListeners must NOT disconnect this observer. Doing so
         // left the page unobserved for good after the first <video> attach, so
         // later element swaps (ad -> content, player remount) went unnoticed.
-        observer = new MutationObserver(function () {
-            cancelTimer(observerTimer);
-            observerTimer = schedule(function () {
-                observerTimer = 0;
-                attachVideoListeners();
-            }, OBSERVER_DEBOUNCE_MS);
+        // subtree:true is not optional here — #movie_player is a *grandchild* of
+        // #player, so a childList-only observer on either would miss the player
+        // remount and the ad -> content <video> swap. What it costs is that
+        // YouTube mutates this subtree roughly once a second just by rewriting
+        // .ytp-time-current, and each of those used to allocate and cancel a
+        // debounce timer. Rewriting textContent adds a Text node, so the nodeType
+        // check throws that entire class away before any timer work happens.
+        observer = new MutationObserver(function (records) {
+            for (const record of records) {
+                for (const node of record.addedNodes) {
+                    if (!node || node.nodeType !== 1) continue;
+                    const carriesVideo = node.tagName === 'VIDEO' ||
+                        (typeof node.querySelector === 'function' && node.querySelector('video'));
+                    if (!carriesVideo) continue;
+                    cancelTimer(observerTimer);
+                    observerTimer = schedule(function () {
+                        observerTimer = 0;
+                        attachVideoListeners();
+                    }, OBSERVER_DEBOUNCE_MS);
+                    return;
+                }
+            }
         });
         observer.observe(root, { childList: true, subtree: true });
     }
@@ -805,10 +914,39 @@
             const hint = document.createElement('link');
             hint.rel = 'preconnect';
             hint.href = host;
-            hint.crossOrigin = 'anonymous';
+            // No crossOrigin. These hosts are fetched by plain <img> and <script>
+            // with no crossorigin attribute, i.e. over the *non-CORS* connection
+            // pool. An anonymous preconnect warms the CORS pool instead, so the
+            // handshake is paid for and the socket is never reused.
             parent.appendChild(hint);
             preconnectHints.add(hint);
         }
+    }
+
+    // The whole codec policy above turns on one vendor hint. This is how you check
+    // it: watch droppedVideoFrames climb (or not) against the codec actually in
+    // use, on your own Mac, before deciding whether AV1 or PREFER_CLASSIC_MSE is
+    // helping. Off by default — it costs nothing when the flag is false.
+    function logPlaybackStats() {
+        if (!DEBUG_STATS || stopped) return;
+        try {
+            const video = getVideoElement();
+            const player = getPlayer();
+            if (video && typeof video.getVideoPlaybackQuality === 'function') {
+                const quality = video.getVideoPlaybackQuality();
+                const stats = (player && typeof player.getStatsForNerds === 'function')
+                    ? player.getStatsForNerds()
+                    : null;
+                console.log('[SuperTube]', {
+                    dropped: quality.droppedVideoFrames,
+                    total: quality.totalVideoFrames,
+                    codecs: stats && stats.codecs,
+                    resolution: stats && stats.resolution,
+                    blockingAv1: blockAv1
+                });
+            }
+        } catch (_) {}
+        schedule(logPlaybackStats, DEBUG_STATS_INTERVAL_MS);
     }
 
     function cleanup() {
@@ -841,6 +979,7 @@
         installNavigationListeners();
         installObserver();
         scheduleQualitySelection('startup', true);
+        if (DEBUG_STATS) schedule(logPlaybackStats, DEBUG_STATS_INTERVAL_MS);
     }
 
     function activate() {
