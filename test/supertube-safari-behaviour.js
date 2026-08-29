@@ -14,7 +14,8 @@
 // 2.2.0 adds: that a cached hardware-AV1 verdict is applied SYNCHRONOUSLY, before
 // decodingInfo() settles (the window the player actually asks in, which every
 // other check here misses because it runs after clock.flush()); that a stale
-// cache loses to the live probe; that AV1 survives when only one of the two
+// cache loses to the live probe; that a verdict signed by different hardware or
+// a different Safari major is ignored; that AV1 survives when only one of the two
 // probe configurations is power-efficient; that the observer's record filter
 // drops text-node churn without losing player remounts; that preconnects target
 // the non-CORS pool; and that a blocked XHR is as parseable as a blocked fetch.
@@ -23,6 +24,9 @@
 const vm = require('vm');
 const fs = require('fs');
 const path = require('path');
+
+// Mirrors the signature the script builds from navigator: cores '.' Safari major.
+const AV1_KEY = 'supertube-av1-hw-v2:8.18';
 
 const SOURCE = fs.readFileSync(
     path.join(__dirname, '..', 'Supertube.safari.user.js'), 'utf8');
@@ -141,6 +145,8 @@ function build({
     hasManagedMediaSource = true,
     powerEfficientAv1 = false,
     storedSeed = null,
+    hardwareConcurrency = 8,
+    safariVersion = '18',
     observationRoots = { '#player': makeEl('div') },
     playerApi = true,
     menuLabels = null
@@ -220,6 +226,9 @@ function build({
             setItem: (k, v) => { stored[k] = String(v); }
         },
         navigator: {
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 ' +
+                '(KHTML, like Gecko) Version/' + safariVersion + '.0 Safari/605.1.15',
+            hardwareConcurrency,
             sendBeacon: () => true,
             mediaCapabilities: {
                 // powerEfficientAv1 may be a function so a test can answer
@@ -280,7 +289,7 @@ function build({
     // Every check above runs after clock.flush(), i.e. after decodingInfo() has
     // settled. That is precisely the window the player actually asks in, so the
     // synchronous seed has to be asserted with no flush at all.
-    env = build({ powerEfficientAv1: true, storedSeed: { 'supertube-av1-hw-v1': '1' } });
+    env = build({ powerEfficientAv1: true, storedSeed: { [AV1_KEY]: '1' } });
     check('a cached hardware verdict unblocks AV1 before the probe resolves',
         env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === true);
 
@@ -291,14 +300,24 @@ function build({
     env = build({ powerEfficientAv1: true });
     await env.clock.flush();
     check('the probe writes its verdict back for the next load',
-        env.stored['supertube-av1-hw-v1'] === '1');
+        env.stored[AV1_KEY] === '1');
 
     // A stale cache must lose to the live probe rather than persisting forever.
-    env = build({ powerEfficientAv1: false, storedSeed: { 'supertube-av1-hw-v1': '1' } });
+    env = build({ powerEfficientAv1: false, storedSeed: { [AV1_KEY]: '1' } });
     await env.clock.flush();
     check('a stale cache is corrected once the probe disagrees',
         env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === false
-        && env.stored['supertube-av1-hw-v1'] === '0');
+        && env.stored[AV1_KEY] === '0');
+
+    // A verdict recorded on different hardware, or before a Safari major upgrade,
+    // must not be trusted — that is the whole point of signing the key.
+    env = build({ powerEfficientAv1: false, storedSeed: { [AV1_KEY]: '1' }, hardwareConcurrency: 12 });
+    check('a verdict cached on other hardware is ignored',
+        env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === false);
+
+    env = build({ powerEfficientAv1: false, storedSeed: { [AV1_KEY]: '1' }, safariVersion: '19' });
+    check('a verdict cached before a Safari major upgrade is ignored',
+        env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === false);
 
     // powerEfficient is answered per configuration: hardware that is not efficient
     // at the top of the bitrate ladder can still be efficient at the 4K60 stream

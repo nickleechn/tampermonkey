@@ -110,7 +110,22 @@
     // AV1 and falling back to software VP9 for 4K — the exact outcome this file
     // exists to prevent. The answer never changes for a given Mac, so cache it and
     // read it back synchronously on the next load.
-    const AV1_CACHE_KEY = 'supertube-av1-hw-v1';
+    //
+    // The cache is authoritative for one whole navigation: the probe's correction
+    // only ever lands after the player has already chosen. That is fine while the
+    // verdict is right and wrong for exactly one load when it is not, so the key
+    // carries a signature of the things that can change the answer — the machine's
+    // core count and the Safari major version. Swap Macs or take an OS update and
+    // the old entry is simply not found, costing one conservative load instead of
+    // one wrong one.
+    const AV1_CACHE_KEY = (function () {
+        let signature = '0.0';
+        try {
+            const version = (String(navigator.userAgent).match(/version\/(\d+)/i) || [])[1] || '0';
+            signature = String(navigator.hardwareConcurrency || 0) + '.' + version;
+        } catch (_) {}
+        return 'supertube-av1-hw-v2:' + signature;
+    })();
 
     // Start conservative: assume no hardware AV1 until proven otherwise, so a
     // player that initialises before the async probe resolves never gets handed
@@ -270,14 +285,19 @@
                 // Unexpected end of JSON input" — the very bug the fetch branch
                 // was already fixed for. `response` has to be defined explicitly:
                 // send() never ran, so the native getter yields null.
-                const wantsJson = this.responseType === 'json';
                 Object.defineProperty(this, 'readyState', { value: 4, configurable: true });
                 Object.defineProperty(this, 'status', { value: 200, configurable: true });
                 Object.defineProperty(this, 'statusText', { value: 'OK', configurable: true });
-                Object.defineProperty(this, 'responseText', { value: '{}', configurable: true });
-                Object.defineProperty(this, 'response', {
-                    value: wantsJson ? {} : '{}', configurable: true
-                });
+                // Real XHR throws InvalidStateError on responseText unless
+                // responseType is '' or 'text', so don't hand back both shapes at
+                // once. The blocked endpoints all use the default, but a fake that
+                // contradicts the spec is a trap for whoever reads this next.
+                if (this.responseType === 'json') {
+                    Object.defineProperty(this, 'response', { value: {}, configurable: true });
+                } else {
+                    Object.defineProperty(this, 'responseText', { value: '{}', configurable: true });
+                    Object.defineProperty(this, 'response', { value: '{}', configurable: true });
+                }
             } catch (_) {}
             try {
                 this.dispatchEvent(new Event('readystatechange'));
@@ -396,7 +416,6 @@
     let watchedVideo = null;
     let removeVideoListeners = null;
     let qualitySelectionRunning = false;
-    let lastPersistedQuality = '';
 
     function addListener(target, type, listener, options) {
         target.addEventListener(type, listener, options);
@@ -554,18 +573,17 @@
     }
 
     function persistPlayerQuality(quality) {
-        // Called on every selection attempt, during player init, on the main
-        // thread. localStorage reads are synchronous, so remember what was last
-        // written and skip the read + parse when nothing has changed.
-        if (lastPersistedQuality === quality) return;
+        // Deliberately re-reads localStorage rather than memoising the last value
+        // written. A memo is only correct while this tab is the only writer, and
+        // another tab settling on a lower quality would then be left in place
+        // because this one "already wrote" the value it wanted. The read costs
+        // microseconds and happens at most MAX_ATTEMPTS_PER_VIDEO times per video,
+        // which is not worth a cross-tab correctness hole.
         try {
             const current = localStorage.getItem('yt-player-quality');
             if (current) {
                 const parsed = JSON.parse(current);
-                if (parsed && parsed.data === quality) {
-                    lastPersistedQuality = quality;
-                    return;
-                }
+                if (parsed && parsed.data === quality) return;
             }
             const now = Date.now();
             localStorage.setItem('yt-player-quality', JSON.stringify({
@@ -573,7 +591,6 @@
                 expiration: now + MONTH_MS,
                 creation: now
             }));
-            lastPersistedQuality = quality;
         } catch (_) {}
     }
 
