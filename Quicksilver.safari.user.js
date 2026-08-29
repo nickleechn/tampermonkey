@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.0
+// @version      1.0.1
 // @description  Safari/WebKit build: learned LCP preload + critical-origin preconnect, hover/focus preconnect, learned connection tiering, navigation-transition learning, media priority hints, font-display patching and opt-in content-visibility. No Speculation Rules — WebKit has none.
 // @author       nickleechn
 // @match        *://*/*
@@ -517,16 +517,19 @@
         }
 
         const root = document.documentElement;
-        if (!root) return;
 
         // document-start can run before <head> exists, and a resource hint
-        // outside the document is not processed.
+        // outside the document is not processed. It can also run before <html>
+        // exists; returning there would discard the hint with no retry, losing
+        // the learned preload for the whole navigation. Fall back to watching
+        // `document` so <html> and then <head> are both caught.
+        const target = root || document;
         const observer = new MutationObserver(() => {
             if (!document.head) return;
             observer.disconnect();
             document.head.appendChild(node);
         });
-        observer.observe(root, { childList: true });
+        observer.observe(target, { childList: true, subtree: !root });
     }
 
     function viewportBucket() {
@@ -628,7 +631,16 @@
         // `swap` still repaints and reflows when the webfont arrives. On a slow
         // link that can be seconds after first paint; `optional` renders the
         // fallback and never swaps, so text is stable from the first frame.
-        const displayValue = getConnectionTier() === TIER_SLOW ? 'optional' : 'swap';
+        //
+        // This runs from a DOM-ready callback that can beat storageReady on the
+        // GM.* backend, and a tier read from an empty store answers TIER_FAST.
+        // Holding the result in a `const` would pin that optimistic answer for
+        // the session — exactly inverting the protection on the links it exists
+        // for — so re-read it once the store is primed and correct the rules we
+        // wrote. Only our own rules are revisited; a font-display the page set
+        // itself is left alone.
+        let displayValue = getConnectionTier() === TIER_SLOW ? 'optional' : 'swap';
+        const ownedRules = new Set();
 
         function patchSheet(sheet) {
             try {
@@ -636,7 +648,13 @@
                 if (!rules) return false;
 
                 for (const rule of rules) {
-                    if (rule instanceof CSSFontFaceRule && !rule.style.fontDisplay) {
+                    if (!(rule instanceof CSSFontFaceRule)) continue;
+
+                    if (!rule.style.fontDisplay) {
+                        rule.style.fontDisplay = displayValue;
+                        ownedRules.add(rule);
+                    } else if (ownedRules.has(rule)
+                        && rule.style.fontDisplay !== displayValue) {
                         rule.style.fontDisplay = displayValue;
                     }
                 }
@@ -665,6 +683,16 @@
         }
 
         patchStyleSheets();
+
+        // Resolves immediately when the store was already primed, so this costs
+        // one microtask on the synchronous GM_* path.
+        storageReady.then(() => {
+            const corrected = getConnectionTier() === TIER_SLOW ? 'optional' : 'swap';
+            if (corrected === displayValue) return;
+
+            displayValue = corrected;
+            patchStyleSheets();
+        });
 
         const observer = new MutationObserver(mutations => {
             let needsScan = false;
@@ -1183,8 +1211,13 @@
         if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
         if (url.origin !== location.origin) return false;
         if (url.pathname === location.pathname) return false;
-        if (DOWNLOAD_REGEX.test(url.pathname)) return false;
-        if (SENSITIVE_HREF_REGEX.test(url.pathname)) return false;
+
+        // Test the query too: /account?action=logout and /download?file=x.pdf
+        // both look inert as a bare pathname, and prefetching either has a
+        // side effect. A false positive here only costs a missed prediction.
+        const candidate = url.pathname + url.search;
+        if (DOWNLOAD_REGEX.test(candidate)) return false;
+        if (SENSITIVE_HREF_REGEX.test(candidate)) return false;
         return true;
     }
 
@@ -1297,6 +1330,14 @@
     const WARM_BUDGET = 6;
     let warmCount = 0;
     const warmed = new Set();
+
+    // The budget bounds work per navigation. An SPA never reloads, so without
+    // this reset the sixth warm of the first route disables document warming
+    // for the rest of the visit.
+    onRouteChange(() => {
+        warmCount = 0;
+        warmed.clear();
+    });
 
     function documentWarmingEnabled() {
         return rawRead(storeKey(WARM_FLAG_KEY)) === '1';
