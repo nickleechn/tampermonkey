@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      2.0.0
-// @description  Safari-only YouTube tuning: hardware-aware codec filtering, telemetry blocking, UI cleanup, and automatic highest-quality selection (1080p Premium when offered).
+// @version      2.1.0
+// @description  Safari-only YouTube tuning: hardware-aware codec filtering, telemetry blocking, UI cleanup, and automatic highest-quality selection capped at 4K (1080p Premium when offered).
 // @author       nickleechn
 // @match        https://www.youtube.com/*
 // @exclude      https://www.youtube.com/live_chat*
@@ -53,6 +53,18 @@
     // Turn off "autoplay next video" via the player API.
     const DISABLE_AUTOPLAY_NEXT = false;
 
+    // Highest quality this script will ever ask for. 8K and 5K have no hardware
+    // decode path on Apple Silicon in Safari, so selecting them drops playback into
+    // software VP9 and produces exactly the dropped frames this script exists to
+    // prevent — on a panel that cannot resolve them anyway. Set to 'highres' to
+    // remove the cap.
+    const MAX_QUALITY = 'hd2160';
+
+    // Floor handed to setPlaybackQualityRange as its minimum. Pinning min === max
+    // leaves the player no room to adapt, so a bandwidth dip becomes a rebuffer
+    // instead of a brief quality drop. Set to null to pin hard at MAX_QUALITY.
+    const MIN_QUALITY = 'hd1080';
+
     /* ==================================================================
      * PART A — Early hooks. Installed once, never torn down.
      * ================================================================== */
@@ -97,13 +109,22 @@
     }
 
     if (CODEC_PROFILE !== 'all') {
-        if (window.MediaSource && typeof MediaSource.isTypeSupported === 'function') {
-            const nativeIsTypeSupported = MediaSource.isTypeSupported.bind(MediaSource);
-            MediaSource.isTypeSupported = function (mime) {
+        // ManagedMediaSource (Safari 17+) declares its OWN static isTypeSupported in
+        // WebKit's IDL rather than inheriting MediaSource's. An own property shadows
+        // the inherited one, so patching MediaSource alone leaves it untouched — and
+        // callers feature-detect `self.ManagedMediaSource || self.MediaSource`, so on
+        // Safari 17+ the unpatched path is the one actually used and AV1 filtering
+        // silently stops working. Patch every constructor independently.
+        const patchIsTypeSupported = function (ctor) {
+            if (!ctor || typeof ctor.isTypeSupported !== 'function') return;
+            const nativeIsTypeSupported = ctor.isTypeSupported.bind(ctor);
+            ctor.isTypeSupported = function (mime) {
                 if (isBlockedCodec(mime)) return false;
                 return nativeIsTypeSupported(mime);
             };
-        }
+        };
+        patchIsTypeSupported(window.MediaSource);
+        patchIsTypeSupported(window.ManagedMediaSource);
         if (window.HTMLVideoElement) {
             const nativeVideoCanPlay = HTMLVideoElement.prototype.canPlayType;
             HTMLVideoElement.prototype.canPlayType = function (mime) {
@@ -161,7 +182,14 @@
                     // 204 is a null-body status: `new Response('', {status: 204})`
                     // throws TypeError, which previously fell through the catch
                     // and let every "blocked" request through untouched.
-                    return Promise.resolve(new Response(null, { status: 204 }));
+                    // A null-body 204 is well-formed, but callers that do
+                    // `res.json()` on it get "SyntaxError: Unexpected end of JSON
+                    // input". An empty JSON object satisfies both those callers and
+                    // the fire-and-forget ones.
+                    return Promise.resolve(new Response('{}', {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' }
+                    }));
                 }
             } catch (_) {}
             // Not .call(this, ...) — a destructured `fetch` would arrive with
@@ -407,9 +435,15 @@
             : [];
         const candidates = playableLevels.length ? playableLevels : levels;
 
-        const uniqueLevels = Array.from(new Set(candidates)).sort(function (left, right) {
-            return rankQuality(left) - rankQuality(right);
-        });
+        // A lower rank index means a higher resolution, so the cap is a lower
+        // bound on the index. Filter before sorting so uniqueLevels[0] is the best
+        // *allowed* level rather than the best available one.
+        const maxRank = rankQuality(MAX_QUALITY);
+        const uniqueLevels = Array.from(new Set(candidates))
+            .filter(function (quality) { return rankQuality(quality) >= maxRank; })
+            .sort(function (left, right) {
+                return rankQuality(left) - rankQuality(right);
+            });
         if (!uniqueLevels.length) return null;
 
         const bestQuality = uniqueLevels[0];
@@ -446,7 +480,12 @@
     function applyQualityViaApi(player, quality) {
         try {
             if (typeof player.setPlaybackQualityRange === 'function') {
-                player.setPlaybackQualityRange(quality, quality);
+                // Ceiling stays at the chosen quality; the floor gives ABR somewhere
+                // to go on a bandwidth dip. Never let the floor outrank the ceiling.
+                const floor = (MIN_QUALITY && rankQuality(MIN_QUALITY) >= rankQuality(quality))
+                    ? MIN_QUALITY
+                    : quality;
+                player.setPlaybackQualityRange(floor, quality);
                 return true;
             }
         } catch (_) {}
@@ -604,6 +643,10 @@
                 if (!getSettingsButton(player)) {
                     // Menu isn't built yet. Leave the video incomplete so a later
                     // scheduled attempt retries rather than marking it done here.
+                    // Refund the attempt: base quality is already applied, and a
+                    // premium-only miss must not burn MAX_ATTEMPTS_PER_VIDEO. The
+                    // APPLY_DELAYS_MS schedule still bounds the total retries.
+                    attempts -= 1;
                     return;
                 }
                 await wait(700);
@@ -612,6 +655,7 @@
                 if (await selectPremiumInMenu(player, choice.displayLabel)) {
                     premiumSelectedKey = expectedVideoKey;
                 } else {
+                    attempts -= 1;
                     return;
                 }
             }
@@ -693,6 +737,15 @@
     function installObserver() {
         if (typeof MutationObserver !== 'function') return;
         if (observer) observer.disconnect();
+
+        // Off the watch page there is no #player and no ytd-watch-flexy, so
+        // getObservationRoot() falls back to <body> and every card the infinite
+        // feed appends fires the callback. Nothing needs observing until a player
+        // exists.
+        if (!isWatchPage()) {
+            observer = null;
+            return;
+        }
 
         const root = getObservationRoot();
         if (!root) return;

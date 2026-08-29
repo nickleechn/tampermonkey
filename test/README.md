@@ -1,4 +1,4 @@
-# Quicksilver tests
+# Userscript tests
 
 ## `quicksilver-behaviour.js` — headless, current
 
@@ -27,6 +27,27 @@ speculation rules — and asserts what the port rests on: the WebKit-only guard,
 the geometric hero heuristic and its raised three-sighting gate, the connection
 tier learned from Navigation Timing, and the same scope limits on transition
 learning the Chrome build has.
+
+No browser required.
+
+## `supertube-safari-behaviour.js` — headless, current
+
+```bash
+node test/supertube-safari-behaviour.js
+```
+
+Evaluates `Supertube.safari.user.js` against a stubbed **WebKit** DOM and
+asserts what 2.1.0 rests on: that AV1 filtering survives Safari 17+, where
+`ManagedMediaSource` declares its *own* static `isTypeSupported` and so is not
+covered by patching `MediaSource`; that VP9 is never filtered, because 4K
+depends on it and H.264 tops out at 1080p; that selection is capped below the
+8K/5K tiers that have no hardware decode path on Apple Silicon; that the player
+keeps an ABR floor instead of being pinned; and that the `MutationObserver`
+never falls back to observing the whole feed.
+
+Every assertion in the codec, ceiling, observer and blocked-request groups fails
+against 2.0.0 — the suite was written to pin down real regressions, not to
+describe the code as it already was.
 
 No browser required.
 
