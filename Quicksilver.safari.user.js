@@ -57,6 +57,22 @@
 // CacheStorage migration (that cache only ever existed under the Chrome
 // script), and in-frame execution (@noframes — the surviving features are
 // document-scoped and a 300x250 ad frame has no hero to learn).
+//
+// Two things here have no counterpart in the Chrome build, because they answer
+// problems Safari has and Chrome does not:
+//
+//   Learned font preload (Part C). A webfont is the latest-discovered blocking
+//   resource on any page — HTML, then CSSOM, then layout, and only then does
+//   the request start. Chrome's build never needed this because its
+//   speculation rules had usually delivered the whole next document already.
+//   Here it is the largest remaining win, and it is measured from Resource
+//   Timing rather than guessed at.
+//
+//   Viewport preconnect (Part A). iOS has no hover, so on a phone the hover
+//   half of Part A never fired and touchstart gave about one handshake of
+//   warning. Warming origins as links scroll into view is the closest thing a
+//   touch screen produces to hover intent, tightly budgeted because a socket
+//   opened for a link nobody taps costs the server and the radio.
 
 (function () {
     'use strict';
@@ -171,6 +187,20 @@
     );
 
     const FONT_EXTENSION = /\.(?:woff2?|ttf|otf|eot)(?:[?#]|$)/i;
+    // A preload with a type the browser cannot render is a wasted request, and
+    // .eot is never usable in WebKit at all, so it is not in this table and
+    // anything absent from it is refused rather than preloaded untyped.
+    const FONT_MIME = {
+        woff2: 'font/woff2',
+        woff: 'font/woff',
+        ttf: 'font/ttf',
+        otf: 'font/otf'
+    };
+
+    function fontMimeFor(pathname) {
+        const match = /\.([a-z0-9]+)$/i.exec(pathname || '');
+        return match ? (FONT_MIME[match[1].toLowerCase()] || null) : null;
+    }
 
     // =========================================================================
     // Storage
@@ -190,6 +220,7 @@
 
     const LEARN_LCP_KEY = 'tm-qs-lcp';
     const LEARN_ORIGINS_KEY = 'tm-qs-origins';
+    const LEARN_FONTS_KEY = 'tm-qs-fonts';
     const LEARN_VITALS_KEY = 'tm-qs-vitals';
     const LEARN_TRANSITIONS_KEY = 'tm-qs-transitions';
     const CV_FLAG_KEY = 'tm-qs-content-visibility';
@@ -197,7 +228,7 @@
     const LEARN_INDEX_KEY = 'tm-qs-origin-index';
     const NET_KEY = 'tm-qs-net';
 
-    const ORIGIN_KEYS = [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_VITALS_KEY, LEARN_TRANSITIONS_KEY];
+    const ORIGIN_KEYS = [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_FONTS_KEY, LEARN_VITALS_KEY, LEARN_TRANSITIONS_KEY];
     const FLAG_KEYS = [CV_FLAG_KEY, WARM_FLAG_KEY];
     const GLOBAL_KEYS = [LEARN_INDEX_KEY, NET_KEY];
 
@@ -559,6 +590,17 @@
     // intent there is. Unlike a document warm this cannot double-fetch
     // anything: it opens a socket and sends no request.
 
+    // iOS has no hover at all, so on a phone Part A only ever fired at
+    // touchstart — roughly one handshake of warning. A link scrolling into
+    // view is seconds of warning instead, and it is the closest thing to
+    // hover intent a touch screen produces.
+    const VIEWPORT_PRECONNECT_BUDGET = 4;
+    const VIEWPORT_DNS_BUDGET = 12;
+    const VIEWPORT_LINK_BUDGET = 300;
+    const VIEWPORT_ROOT_MARGIN = '200px';
+
+    let viewportIntentState = 'off';
+
     function initPreconnectOnIntent() {
         const connected = new Map();
         const dnsPrefetched = new Set();
@@ -609,14 +651,92 @@
             }
         }
 
+        // A socket opened for a link nobody taps is not free — it costs the
+        // server a connection and the phone some radio time — so this is
+        // budgeted far more tightly than hover, which at least implies intent.
+        // DNS is the cheaper half and gets the larger share: no socket, no
+        // handshake, and on mobile a cold lookup is routinely 100ms+.
+        function initViewportIntent() {
+            if (typeof IntersectionObserver === 'undefined') return;
+
+            // Where hover exists it is the better signal, and running both
+            // would spend the budget twice for one intent.
+            try {
+                if (window.matchMedia && window.matchMedia('(hover: hover)').matches) return;
+            } catch (_) {}
+
+            if (getConnectionTier() !== TIER_FAST) {
+                viewportIntentState = 'paused';
+                return;
+            }
+
+            let socketBudget = VIEWPORT_PRECONNECT_BUDGET;
+            let dnsBudget = VIEWPORT_DNS_BUDGET;
+            viewportIntentState = 'on';
+
+            const observer = new IntersectionObserver(entries => {
+                for (const entry of entries) {
+                    if (!entry || !entry.isIntersecting) continue;
+
+                    // One link is one chance to learn its origin; leaving it
+                    // observed would re-deliver it on every scroll past.
+                    observer.unobserve(entry.target);
+
+                    const url = toUrl(entry.target.href);
+                    if (!url || url.origin === currentOrigin) continue;
+                    if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
+
+                    if (dnsBudget > 0 && !dnsPrefetched.has(url.origin)) {
+                        dnsBudget -= 1;
+                        dnsPrefetch(url.origin);
+                    }
+                    if (socketBudget > 0 && !connected.has(url.origin)) {
+                        socketBudget -= 1;
+                        preconnect(url.origin);
+                    }
+                }
+
+                // Both budgets spent: nothing further to learn, and an
+                // observer over hundreds of links in an infinite feed is a
+                // cost with no remaining upside.
+                if (dnsBudget <= 0 && socketBudget <= 0) {
+                    observer.disconnect();
+                    viewportIntentState = 'spent';
+                }
+            }, { rootMargin: VIEWPORT_ROOT_MARGIN });
+
+            // Deliberately no MutationObserver for links added later. The
+            // budgets are small enough that they are usually spent on the
+            // first screen, and self-limiting beats a permanent subscription
+            // on a feed that appends links forever. A second pass after load
+            // catches what hydration added.
+            function observeLinks() {
+                if (viewportIntentState !== 'on') return;
+
+                let budget = VIEWPORT_LINK_BUDGET;
+                try {
+                    for (const link of document.querySelectorAll('a[href]')) {
+                        if (budget-- <= 0) break;
+                        observer.observe(link);
+                    }
+                } catch (_) {}
+            }
+
+            observeLinks();
+            runWhenLoadedIdle(observeLinks);
+        }
+
         document.addEventListener('pointerover', e => maybePreconnect(e.target), { passive: true, capture: true });
         document.addEventListener('focusin', e => maybePreconnect(e.target), { passive: true, capture: true });
-        // iOS has no hover. touchstart lands roughly 100-300ms before the
-        // navigation, which is about one handshake — the whole win.
+        // touchstart lands roughly 100-300ms before the navigation, which is
+        // about one handshake — worth having even where viewport intent has
+        // already warmed the common origins.
         document.addEventListener('touchstart', e => {
             const touch = e.touches && e.touches[0];
             if (touch) maybePreconnect(e.target);
         }, { passive: true, capture: true });
+
+        initViewportIntent();
     }
 
     runWhenDomReady(initPreconnectOnIntent);
@@ -753,6 +873,7 @@
 
     const LEARN_LCP_MAX_ENTRIES = 60;
     const LEARN_ORIGIN_MAX_ENTRIES = 8;
+    const LEARN_FONT_MAX_ENTRIES = 6;
     const LEARN_VITALS_SAMPLES = 12;
     const LEARN_MAX_AGE = 14 * 24 * HOUR;
     // Higher than the Chrome build's 2, because the observation is a
@@ -849,6 +970,64 @@
                 // Fonts and other CSS-initiated subresources fetch in CORS mode
                 // and will not reuse a credential-mismatched connection.
                 if (entry.c) hint.crossOrigin = 'anonymous';
+                appendToHead(hint);
+                used += 1;
+            } catch (_) {}
+        }
+
+        applyLearnedFonts(tier);
+    }
+
+    // A webfont is the latest-discovered blocking resource on the page: the
+    // browser needs HTML, then CSSOM, then layout before it knows the font
+    // exists, so its request starts three round trips deep. Nothing else this
+    // script learns is discovered that late, which is why a font record is
+    // worth more than the hero record it sits next to — and unlike the hero it
+    // is measured from Resource Timing rather than guessed at from geometry.
+    function applyLearnedFonts(tier) {
+        // On a slow link the font is not going to arrive before the block
+        // period ends anyway; Part B has already set font-display:optional, so
+        // the fallback is what renders and the bytes would buy nothing.
+        const budget = tier === TIER_SLOW ? 0 : (tier === TIER_MODERATE ? 1 : 2);
+        if (!budget) return;
+
+        const store = readStore(LEARN_FONTS_KEY);
+        const fonts = (store && Array.isArray(store.fonts)) ? store.fonts : [];
+
+        let used = 0;
+        for (const entry of fonts) {
+            if (used >= budget) break;
+            if (!entry || typeof entry.f !== 'string') continue;
+            if ((Number(entry.n) || 0) < LEARN_ORIGIN_MIN_SIGHTINGS) continue;
+            const updatedAt = Number(entry.u) || 0;
+            if (updatedAt && Date.now() - updatedAt > LEARN_MAX_AGE) continue;
+
+            const url = toUrl(entry.f);
+            if (!url) continue;
+            const type = fontMimeFor(url.pathname);
+            if (!type) continue;
+
+            try {
+                const hint = document.createElement('link');
+                hint.rel = 'preload';
+                hint.as = 'font';
+                hint.href = url.href;
+                hint.setAttribute('type', type);
+                // Not optional and not a same-origin exception: fonts are
+                // always fetched in anonymous CORS mode, so a preload without
+                // crossorigin lands in a different cache partition and the
+                // page downloads the font a second time — strictly worse than
+                // not preloading it.
+                hint.crossOrigin = 'anonymous';
+                // A hashed filename dies at the next deploy. Evicting on the
+                // 404 stops it costing a request a day for two weeks.
+                hint.addEventListener('error', () => {
+                    const current = readStore(LEARN_FONTS_KEY);
+                    if (!current || !Array.isArray(current.fonts)) return;
+                    const kept = current.fonts.filter(f => f && f.f !== entry.f);
+                    if (kept.length === current.fonts.length) return;
+                    writeStore(LEARN_FONTS_KEY, { fonts: kept, at: Date.now() });
+                }, { once: true });
                 appendToHead(hint);
                 used += 1;
             } catch (_) {}
@@ -1066,13 +1245,78 @@
         });
     }
 
-    function persistOrigins() {
-        let entries;
+    function resourceEntries() {
         try {
-            entries = performance.getEntriesByType('resource') || [];
+            return performance.getEntriesByType('resource') || [];
         } catch (_) {
-            return;
+            return [];
         }
+    }
+
+    function persistFonts() {
+        const observed = new Map();
+
+        for (const entry of resourceEntries()) {
+            // A font pulled in late is a lazy widget's, not the one the first
+            // screen of text is waiting on.
+            if (!entry || entry.startTime > LEARN_EARLY_RESOURCE_MS) continue;
+
+            const url = toUrl(entry.name);
+            if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) continue;
+            if (!FONT_EXTENSION.test(url.pathname)) continue;
+            // Only formats WebKit can actually use are worth a record.
+            if (!fontMimeFor(url.pathname)) continue;
+
+            // Query strings on font URLs are cache-busters, and keeping them
+            // would make every deploy look like a different font.
+            const href = (url.origin + url.pathname).slice(0, 300);
+            const existing = observed.get(href);
+            if (existing) existing.first = Math.min(existing.first, entry.startTime);
+            else observed.set(href, { font: href, first: entry.startTime });
+        }
+
+        if (!observed.size) return;
+
+        const store = readStore(LEARN_FONTS_KEY) || {};
+        const previous = Array.isArray(store.fonts) ? store.fonts : [];
+        const merged = new Map();
+        const now = Date.now();
+
+        for (const entry of previous) {
+            if (!entry || typeof entry.f !== 'string') continue;
+            const updatedAt = Number(entry.u) || 0;
+            if (updatedAt && now - updatedAt > LEARN_MAX_AGE) continue;
+            merged.set(entry.f, {
+                f: entry.f,
+                n: Number(entry.n) || 0,
+                t: Number(entry.t) || 0,
+                u: updatedAt
+            });
+        }
+
+        for (const info of observed.values()) {
+            const existing = merged.get(info.font);
+            if (existing) {
+                existing.n += 1;
+                existing.t = Math.min(existing.t || info.first, info.first);
+                existing.u = now;
+            } else {
+                merged.set(info.font, { f: info.font, n: 1, t: info.first, u: now });
+            }
+        }
+
+        // A site with eight weights loads them all; the two the first screen
+        // waits on are the ones fetched earliest and every time.
+        const ranked = Array.from(merged.values())
+            .sort((a, b) => (b.n - a.n) || (a.t - b.t))
+            .slice(0, LEARN_FONT_MAX_ENTRIES);
+
+        writeStore(LEARN_FONTS_KEY, { fonts: ranked, at: now });
+    }
+
+    function persistOrigins() {
+        const entries = resourceEntries();
+        if (!entries.length) return;
 
         const observed = new Map();
         for (const entry of entries) {
@@ -1700,6 +1944,7 @@
 
         const lcpStore = readStore(LEARN_LCP_KEY);
         const originStore = readStore(LEARN_ORIGINS_KEY);
+        const fontStore = readStore(LEARN_FONTS_KEY);
         const vitals = readStore(LEARN_VITALS_KEY);
         const transitions = readStore(LEARN_TRANSITIONS_KEY);
         const record = lcpStore && lcpStore[route];
@@ -1712,6 +1957,27 @@
         lines.push('ACTIVE ON THIS PAGE');
 
         feature('●', 'Hover preconnect', 'DNS + TLS opened on hover, focus or touch');
+
+        const viewportDetail = {
+            on: 'warming origins as links scroll into view',
+            spent: 'budget spent — origins on this page are already warm',
+            paused: 'paused — connection is ' + tierName(tier),
+            off: 'not needed — this device has hover'
+        }[viewportIntentState];
+        feature(viewportIntentState === 'off' ? '○' : (viewportIntentState === 'paused' ? '○' : '●'),
+            'Viewport preconnect', viewportDetail);
+
+        const confidentFonts = ((fontStore && Array.isArray(fontStore.fonts)) ? fontStore.fonts : [])
+            .filter(f => f && (Number(f.n) || 0) >= LEARN_ORIGIN_MIN_SIGHTINGS && fontMimeFor(f.f));
+        if (tier === TIER_SLOW) {
+            feature('○', 'Learned font preload', 'paused — the fallback renders instead on a slow link');
+        } else if (confidentFonts.length) {
+            feature('●', 'Learned font preload', confidentFonts.length + ' font'
+                + (confidentFonts.length === 1 ? '' : 's') + ' fetched before the CSS asks for them');
+        } else {
+            feature('◐', 'Learned font preload',
+                'needs ' + LEARN_ORIGIN_MIN_SIGHTINGS + ' visits to learn which fonts load first');
+        }
 
         if (learnedLcpUrl) {
             feature('●', 'Learned hero preload', 'preloading this route’s hero image');
@@ -1761,6 +2027,8 @@
         lines.push('  Pages with a hero record   ' + (lcpStore ? Object.keys(lcpStore).length : 0));
         lines.push('  Critical origins           ' + ((originStore && Array.isArray(originStore.origins))
             ? originStore.origins.length : 0));
+        lines.push('  Critical fonts             ' + ((fontStore && Array.isArray(fontStore.fonts))
+            ? fontStore.fonts.length : 0));
         lines.push('  Navigation sources         ' + (transitions ? Object.keys(transitions).length : 0));
         lines.push('  Median FCP                 ' + fcpText);
         lines.push('');
@@ -1866,6 +2134,7 @@
         runWhenLoadedIdle(() => {
             safely(recordNetSample);
             safely(persistOrigins);
+            safely(persistFonts);
         });
         runWhenLoadedIdle(() => safely(initContentVisibility));
     }).catch(() => {});
