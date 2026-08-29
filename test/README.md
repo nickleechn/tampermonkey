@@ -42,12 +42,12 @@ asserts what 2.1.0 rests on: that AV1 filtering survives Safari 17+, where
 covered by patching `MediaSource`; that VP9 is never filtered, because 4K
 depends on it and H.264 tops out at 1080p; that selection is capped below the
 8K/5K tiers that have no hardware decode path on Apple Silicon; that the player
-keeps an ABR floor instead of being pinned; and that the `MutationObserver`
+keeps an ABR floor instead of being pinned; that the settings-menu fallback
+honours the same ceiling as the player-API path; and that the `MutationObserver`
 never falls back to observing the whole feed.
 
-Every assertion in the codec, ceiling, observer and blocked-request groups fails
-against 2.0.0 — the suite was written to pin down real regressions, not to
-describe the code as it already was.
+Seven of its seventeen assertions fail against 2.0.0 — the suite was written to
+pin down real regressions, not to describe code that already worked.
 
 No browser required.
 

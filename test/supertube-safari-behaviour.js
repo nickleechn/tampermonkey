@@ -6,9 +6,10 @@
 // 2.1.0 rests on: that AV1 filtering survives Safari 17+'s ManagedMediaSource
 // (which declares its own static isTypeSupported and so is NOT covered by
 // patching MediaSource), that VP9 is never filtered because 4K depends on it,
-// that quality selection is capped below the software-decode-only 8K/5K tiers,
-// that the player keeps an ABR floor instead of being pinned, and that the
-// MutationObserver never falls back to observing the whole feed.
+// that quality selection is capped below the software-decode-only 8K/5K tiers
+// on BOTH the player-API path and the settings-menu fallback, that the player
+// keeps an ABR floor instead of being pinned, and that the MutationObserver
+// never falls back to observing the whole feed.
 //
 // No browser required.
 const vm = require('vm');
@@ -90,16 +91,53 @@ function makePlayer(levels, qualityData) {
     return player;
 }
 
+// A player with NO quality API, forcing selectHighestQuality down the
+// settings-menu fallback. Models the two-step menu: the root panel offers a
+// "Quality" row, clicking it swaps in the resolution rows.
+function makeMenuPlayer(labels) {
+    const player = makeEl('div');
+    player.picked = null;
+
+    const settingsButton = makeEl('button');
+    settingsButton.setAttribute('aria-expanded', 'false');
+
+    const qualityRow = makeEl('div');
+    qualityRow.textContent = 'Quality';
+    qualityRow.click = () => { player.menuState = 'quality'; };
+
+    const options = labels.map((label) => {
+        const item = makeEl('div');
+        item.textContent = label;
+        item.setAttribute('aria-label', label);
+        item.setAttribute('aria-checked', 'false');
+        item.click = () => { player.picked = label; };
+        return item;
+    });
+
+    player.menuState = 'root';
+    player.querySelector = (sel) =>
+        (sel === '.ytp-settings-button' ? settingsButton : null);
+    player.querySelectorAll = (sel) => {
+        if (!String(sel).includes('ytp-menuitem')) return [];
+        return player.menuState === 'quality' ? options : [qualityRow];
+    };
+    return player;
+}
+
 function build({
     href = 'https://www.youtube.com/watch?v=abc123',
     levels = ['hd2160', 'hd1080', 'hd720'],
     qualityData = null,
     hasManagedMediaSource = true,
     powerEfficientAv1 = false,
-    observationRoots = { '#player': makeEl('div') }
+    observationRoots = { '#player': makeEl('div') },
+    playerApi = true,
+    menuLabels = null
 } = {}) {
     const clock = makeClock();
-    const player = makePlayer(levels, qualityData);
+    const player = playerApi
+        ? makePlayer(levels, qualityData)
+        : makeMenuPlayer(menuLabels || []);
     const observed = [];
     const stored = {};
 
@@ -180,7 +218,10 @@ function build({
     vm.createContext(sandbox);
     vm.runInContext(SOURCE, sandbox, { filename: 'Supertube.safari.user.js' });
 
-    return { sandbox, player, observed, stored, clock, MediaSource, ManagedMediaSource };
+    return {
+        sandbox, player, observed, stored, clock, MediaSource, ManagedMediaSource,
+        picked: () => player.picked
+    };
 }
 
 (async () => {
@@ -236,6 +277,26 @@ function build({
     check('the floor never outranks the ceiling on a low-quality video',
         !!range && range[1] === 'hd720' && range[2] === 'hd720',
         range ? `range=[${range[1]}, ${range[2]}]` : 'n/a');
+
+    console.log('\nQuality ceiling — settings-menu fallback');
+
+    // The menu path runs whenever the player API is missing or fails. It reads
+    // resolutions out of label text rather than level ids, so it needs the cap
+    // applied separately — it is not covered by the chooseTargetQuality filter.
+    env = build({ menuLabels: ['4320p', '2160p60', '1080p', '720p'], playerApi: false });
+    await env.clock.flush();
+    check('the menu fallback refuses 8K and takes 4K',
+        env.picked() === '2160p60', `picked=${env.picked()}`);
+
+    env = build({ menuLabels: ['1440p', '1080p', '720p'], playerApi: false });
+    await env.clock.flush();
+    check('the menu fallback still takes the best level under the cap',
+        env.picked() === '1440p', `picked=${env.picked()}`);
+
+    env = build({ menuLabels: ['2160p', '1080p Premium', '1080p'], playerApi: false });
+    await env.clock.flush();
+    check('the menu fallback prefers resolution over the Premium label',
+        env.picked() === '2160p', `picked=${env.picked()}`);
 
     console.log('\nObserver scope');
 

@@ -245,6 +245,13 @@
         'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'
     ];
     const PREMIUM_RE = /\b(?:premium|enhanced bitrate)\b/i;
+    // The menu fallback reads resolutions out of label text ("2160p60"), not level
+    // ids, so MAX_QUALITY has to be expressible as a height for it to share the cap.
+    const QUALITY_HEIGHTS = {
+        highres: 4320, hd2880: 2880, hd2160: 2160, hd1440: 1440, hd1080: 1080,
+        hd720: 720, large: 480, medium: 360, small: 240, tiny: 144
+    };
+    const MAX_QUALITY_HEIGHT = QUALITY_HEIGHTS[MAX_QUALITY] || Infinity;
     // Apex googlevideo.com does not warm the real CDN hosts, and the per-session
     // rr*---sn-*.googlevideo.com name is unknowable ahead of time, so media
     // preconnects are not attempted at all.
@@ -525,7 +532,11 @@
     }
 
     function chooseHighestMenuQuality(items) {
-        const choices = items.map(parseQuality).filter(Boolean);
+        // Cap here too. This path runs whenever the player API is missing or
+        // setPlaybackQualityRange fails, and without the filter it happily selects
+        // 8K straight past MAX_QUALITY.
+        const choices = items.map(parseQuality).filter(Boolean)
+            .filter(function (choice) { return choice.resolution <= MAX_QUALITY_HEIGHT; });
         choices.sort(function (left, right) {
             if (right.resolution !== left.resolution) return right.resolution - left.resolution;
             if (right.premium !== left.premium) return Number(right.premium) - Number(left.premium);
