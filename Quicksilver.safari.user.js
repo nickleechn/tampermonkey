@@ -716,7 +716,19 @@
                 let budget = VIEWPORT_LINK_BUDGET;
                 try {
                     for (const link of document.querySelectorAll('a[href]')) {
-                        if (budget-- <= 0) break;
+                        if (budget <= 0) break;
+
+                        // Spent only on links that could actually warm
+                        // something. Counting every anchor instead means a
+                        // page whose first 300 links are same-origin nav —
+                        // a docs sidebar, a category index — exhausts the cap
+                        // before reaching the cross-origin links further down,
+                        // and the feature silently does nothing at all.
+                        const url = toUrl(link.href);
+                        if (!url || url.origin === currentOrigin) continue;
+                        if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
+
+                        budget -= 1;
                         observer.observe(link);
                     }
                 } catch (_) {}
@@ -874,6 +886,7 @@
     const LEARN_LCP_MAX_ENTRIES = 60;
     const LEARN_ORIGIN_MAX_ENTRIES = 8;
     const LEARN_FONT_MAX_ENTRIES = 6;
+    const FONT_URL_MAX_LENGTH = 300;
     const LEARN_VITALS_SAMPLES = 12;
     const LEARN_MAX_AGE = 14 * 24 * HOUR;
     // Higher than the Chrome build's 2, because the observation is a
@@ -1269,7 +1282,13 @@
 
             // Query strings on font URLs are cache-busters, and keeping them
             // would make every deploy look like a different font.
-            const href = (url.origin + url.pathname).slice(0, 300);
+            const href = url.origin + url.pathname;
+            // Truncating instead of skipping would store a path that resolves
+            // to nothing: the record is emitted verbatim as a preload href, so
+            // a clipped URL 404s on every visit until the error handler
+            // evicts it, and two hashed paths sharing a prefix would collide
+            // into one inflated record.
+            if (href.length > FONT_URL_MAX_LENGTH) continue;
             const existing = observed.get(href);
             if (existing) existing.first = Math.min(existing.first, entry.startTime);
             else observed.set(href, { font: href, first: entry.startTime });
@@ -1284,6 +1303,14 @@
 
         for (const entry of previous) {
             if (!entry || typeof entry.f !== 'string') continue;
+            // The same validation the collection path applies. Under the
+            // localStorage fallback this store is writable by every script on
+            // the origin, and six unusable entries with a high sighting count
+            // would hold every slot while emission filtered them all out —
+            // the feature dead with a full-looking store.
+            if (entry.f.length > FONT_URL_MAX_LENGTH) continue;
+            const previousUrl = toUrl(entry.f);
+            if (!previousUrl || !fontMimeFor(previousUrl.pathname)) continue;
             const updatedAt = Number(entry.u) || 0;
             if (updatedAt && now - updatedAt > LEARN_MAX_AGE) continue;
             merged.set(entry.f, {

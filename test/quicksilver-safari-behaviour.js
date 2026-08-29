@@ -661,6 +661,49 @@ function heroRecord(seen, url = 'https://cdn.example.com/hero.jpg', viewport = '
         env2.head.children.filter(c => c.rel === 'dns-prefetch').length === 12);
     check('a spent observer stops watching', env2.observedLinks() === 0);
 
+    console.log('\nHardening (external review)');
+
+    // The observation cap must be spent on links that could warm something,
+    // not on same-origin nav that can never reach the socket budget.
+    const buriedLinks = [];
+    for (let i = 0; i < 320; i += 1) buriedLinks.push(anchorTo('https://example.com/p/' + i));
+    buriedLinks.push(anchorTo('https://cdn.example.net/asset'));
+    env2 = build({ readyState: 'complete', hover: false, anchors: buriedLinks });
+    await env2.settled();
+    env2.scrollIntoView();
+    check('a cross-origin link below 300 same-origin links is still warmed',
+        env2.head.children.some(c => c.rel === 'preconnect' && c.href === 'https://cdn.example.net'));
+
+    // A record is emitted as a preload href verbatim, so it must never be a
+    // clipped path that resolves to nothing.
+    const longPath = 'https://example.com/f/' + 'x'.repeat(400) + '.woff2';
+    env2 = build({ resourceEntries: [fontEntry(longPath, 300), fontEntry('https://example.com/f/ok.woff2', 310)] });
+    await env2.settled();
+    env2.load();
+    const storedFonts = (env2.read('tm-qs-fonts') || { fonts: [] }).fonts.map(f => f.f);
+    check('an over-long font URL is skipped, not truncated',
+        storedFonts.length === 1 && storedFonts[0] === 'https://example.com/f/ok.woff2',
+        JSON.stringify(storedFonts.map(u => u.slice(0, 40))));
+
+    // Under the localStorage fallback this store is writable by the page.
+    env2 = build({
+        gm: fontStore([
+            { f: 'https://example.com/f/junk1.eot', n: 99, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk2.eot', n: 98, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk3.eot', n: 97, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk4.eot', n: 96, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk5.eot', n: 95, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk6.eot', n: 94, t: 1, u: Date.now() }
+        ]),
+        resourceEntries: [fontEntry('https://example.com/f/real.woff2', 300)]
+    });
+    await env2.settled();
+    env2.load();
+    const survivors = (env2.read('tm-qs-fonts') || { fonts: [] }).fonts.map(f => f.f);
+    check('unusable stored entries cannot hold every slot',
+        survivors.includes('https://example.com/f/real.woff2') && !survivors.some(u => u.endsWith('.eot')),
+        JSON.stringify(survivors));
+
     const failed = results.filter(([, ok]) => !ok);
     console.log('');
     console.log(failed.length
