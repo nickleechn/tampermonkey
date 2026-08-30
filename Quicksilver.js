@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      4.0.0
+// @version      4.0.1
 // @description  Chrome-only: connection-tiered Speculation Rules prefetch/prerender, learned LCP preload + origin preconnect, navigation-transition prediction, media priority hints, and opt-in content-visibility. Avoids sensitive links and degrades gracefully on slow connections.
 // @author       You
 // @match        *://*/*
@@ -15,6 +15,15 @@
 // @run-at       document-start
 // ==/UserScript==
 
+// 4.0.1 — pointerdown warming no longer strands the first link it tries on a
+// strict-CSP origin. The securitypolicyviolation that tells us inline
+// speculation rules are blocked arrives after speculate() has already
+// returned, so the link was recorded as warmed and every later press on it
+// took the early return instead of the <link rel=prefetch> fallback. The warm
+// record now tracks which mechanism was used, and the violation handler
+// re-warms the link that was in flight rather than waiting for a press that
+// may never come.
+//
 // 4.0.0 — two changes worth knowing about, both driven by measurement rather
 // than taste.
 //
@@ -367,6 +376,10 @@
         let currentHint = null;
         let currentRuleScript = null;
         let rulesBlocked = false;
+        // Which mechanism warmed currentHref. Without this the href alone is
+        // an ambiguous record: a link warmed by a speculation rule that CSP
+        // then blocked looks identical to one that is genuinely warm.
+        let currentMethod = null;
 
         // Inline speculation-rules scripts need CSP 'inline-speculation-rules'.
         // On a strict-CSP origin every pointerdown would otherwise be a blocked
@@ -374,7 +387,19 @@
         document.addEventListener('securitypolicyviolation', event => {
             if (event && typeof event.violatedDirective === 'string'
                 && event.violatedDirective.indexOf('script-src') === 0) {
+                const first = !rulesBlocked;
                 rulesBlocked = true;
+
+                // The blocked script was this link's only warm, and the click
+                // it was meant to cover is usually already on its way. Re-warm
+                // now down the hint path instead of waiting for another
+                // pointerdown on the same link.
+                if (first && currentHref && currentMethod === 'rules') {
+                    const href = currentHref;
+                    currentHref = null;
+                    currentMethod = null;
+                    warm(href);
+                }
             }
         });
 
@@ -425,11 +450,17 @@
         }
 
         function warm(href) {
-            if (currentHref === href) return;
+            const method = (supportsSpeculationRules && !rulesBlocked) ? 'rules' : 'hint';
+            // Re-warming the same href is a no-op only while the mechanism
+            // stays the same. Once CSP has ruled speculation rules out, the
+            // link that was warmed under the old assumption still needs its
+            // fallback.
+            if (currentHref === href && currentMethod === method) return;
             currentHref = href;
+            currentMethod = method;
 
             try {
-                if (supportsSpeculationRules && !rulesBlocked) speculate(href);
+                if (method === 'rules') speculate(href);
                 else prefetchHint(href);
             } catch (_) {}
         }
