@@ -28,6 +28,11 @@ the geometric hero heuristic and its raised three-sighting gate, the connection
 tier learned from Navigation Timing, and the same scope limits on transition
 learning the Chrome build has.
 
+Also covers the two parts with no Chrome counterpart: the learned font preload
+— including the unconditional `crossorigin`, without which the page downloads
+the font twice — and the iOS viewport preconnect with its socket and DNS
+budgets.
+
 No browser required.
 
 ## `supertube-safari-behaviour.js` — headless, current

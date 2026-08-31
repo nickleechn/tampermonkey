@@ -65,7 +65,12 @@ function build({
     legacyWebKit = false,
     // 'complete' models a manager that injects after parsing, so every
     // runWhenDomReady callback fires synchronously as the script evaluates.
-    readyState = 'loading'
+    readyState = 'loading',
+    resourceEntries = [],
+    // Desktop Safari has hover; a phone does not, which is the whole reason
+    // viewport intent exists.
+    hover = true,
+    anchors = []
 } = {}) {
     const winListeners = new Map();
     const docListeners = new Map();
@@ -83,7 +88,12 @@ function build({
         head, body: makeEl('body'), documentElement: makeEl('html'),
         images, styleSheets: [],
         createElement: makeEl,
-        querySelectorAll: selector => (String(selector).includes('video') ? videos : []),
+        querySelectorAll: selector => {
+            const text = String(selector);
+            if (text.includes('video')) return videos;
+            if (text.includes('a[href]')) return anchors;
+            return [];
+        },
         querySelector: () => null,
         addEventListener: (t, f) => add(docListeners, t, f),
         removeEventListener() {}, dispatchEvent: () => true
@@ -101,6 +111,7 @@ function build({
             getEntriesByType: type => {
                 if (type === 'navigation') return navEntries;
                 if (type === 'paint') return paintEntries;
+                if (type === 'resource') return resourceEntries;
                 return [];
             }
         },
@@ -115,6 +126,7 @@ function build({
         clearInterval() {},
         fetch: () => Promise.resolve({ body: null }),
         MutationObserver: class { observe() {} disconnect() {} },
+        matchMedia: query => ({ matches: String(query).includes('hover: hover') ? hover : !hover }),
         PerformanceObserver: class { observe() {} },
         Element: class {},
         Image: class { constructor() { this.src = ''; } },
@@ -141,6 +153,19 @@ function build({
         window.GM_deleteValue = k => store.delete(k);
     }
 
+    const intersectionObservers = [];
+    window.IntersectionObserver = class {
+        constructor(callback) {
+            this.callback = callback;
+            this.targets = [];
+            this.live = true;
+            intersectionObservers.push(this);
+        }
+        observe(target) { if (this.live) this.targets.push(target); }
+        unobserve(target) { this.targets = this.targets.filter(t => t !== target); }
+        disconnect() { this.live = false; this.targets = []; }
+    };
+
     window.window = window;
     window.self = window;
     window.top = window;
@@ -152,7 +177,7 @@ function build({
         'setInterval', 'clearInterval', 'requestAnimationFrame', 'fetch', 'MutationObserver',
         'PerformanceObserver', 'Element', 'Image', 'HTMLImageElement', 'HTMLLinkElement',
         'HTMLIFrameElement', 'CSSFontFaceRule', 'CSS', 'localStorage', 'GM_registerMenuCommand',
-        'GM', 'GM_getValue', 'GM_setValue', 'GM_deleteValue'
+        'GM', 'GM_getValue', 'GM_setValue', 'GM_deleteValue', 'matchMedia', 'IntersectionObserver'
     ]) if (key in window) context[key] = window[key];
 
     vm.runInContext(
@@ -181,6 +206,15 @@ function build({
         },
         // A same-document navigation: the router swaps the DOM, then the
         // polling watcher notices, which is the ordering the real thing has.
+        // Scroll the observed links into view.
+        scrollIntoView(targets) {
+            for (const observer of intersectionObservers.slice()) {
+                if (!observer.live) continue;
+                const seen = (targets || observer.targets).slice();
+                observer.callback(seen.map(target => ({ target, isIntersecting: true })));
+            }
+        },
+        observedLinks: () => intersectionObservers.reduce((n, o) => n + o.targets.length, 0),
         navigate(nextPath) {
             context.location = new URL('https://example.com' + nextPath);
             for (const tick of intervals.slice()) tick();
@@ -505,6 +539,170 @@ function heroRecord(seen, url = 'https://cdn.example.com/hero.jpg', viewport = '
     await env2.settled();
     check('two sightings is enough for a measured origin',
         env2.head.children.filter(c => c.rel === 'preconnect').length === 1);
+
+    console.log('\nLearned font preload');
+
+    const fontEntry = (name, startTime) => ({ name, startTime, initiatorType: 'css', transferSize: 20000 });
+    const fontStore = list => ({
+        'tm-qs-fonts::https://example.com': JSON.stringify({
+            fonts: list, at: Date.now()
+        })
+    });
+
+    env2 = build({
+        resourceEntries: [
+            fontEntry('https://example.com/f/inter.woff2?v=8', 300),
+            fontEntry('https://example.com/f/inter-bold.woff2', 350),
+            // Too late to be what the first screen waits on.
+            fontEntry('https://example.com/f/icons.woff2', 9000),
+            // WebKit cannot use it, so it is not worth a record.
+            fontEntry('https://example.com/f/legacy.eot', 320)
+        ]
+    });
+    await env2.settled();
+    env2.load();
+    const learnedFonts = env2.read('tm-qs-fonts');
+    const fontUrls = (learnedFonts ? learnedFonts.fonts : []).map(f => f.f);
+    check('early fonts are recorded', fontUrls.includes('https://example.com/f/inter.woff2'));
+    check('the cache-busting query is dropped',
+        !JSON.stringify(fontUrls).includes('v=8'), JSON.stringify(fontUrls));
+    check('a late font is not recorded', !fontUrls.some(u => u.includes('icons')));
+    check('an unusable format is not recorded', !fontUrls.some(u => u.includes('legacy')));
+
+    env2 = build({ gm: fontStore([{ f: 'https://example.com/f/inter.woff2', n: 1, t: 300, u: Date.now() }]) });
+    await env2.settled();
+    check('one sighting does not preload a font',
+        !env2.head.children.some(c => c.as === 'font'));
+
+    env2 = build({
+        gm: fontStore([
+            { f: 'https://example.com/f/a.woff2', n: 4, t: 300, u: Date.now() },
+            { f: 'https://example.com/f/b.woff2', n: 3, t: 320, u: Date.now() },
+            { f: 'https://example.com/f/c.woff2', n: 3, t: 340, u: Date.now() }
+        ])
+    });
+    await env2.settled();
+    let fontHints = env2.head.children.filter(c => c.as === 'font');
+    check('two sightings preloads the font', fontHints.length > 0);
+    check('the font budget is two on a fast link', fontHints.length === 2);
+    // Without crossorigin the preload lands in a different cache partition and
+    // the page fetches the font a second time — worse than not preloading.
+    check('a font preload is always anonymous CORS',
+        fontHints.every(c => c.crossOrigin === 'anonymous'));
+    check('a font preload carries its type',
+        fontHints.every(c => c.attributes.type === 'font/woff2'));
+
+    env2 = build({
+        gm: Object.assign(
+            {},
+            fontStore([{ f: 'https://example.com/f/a.woff2', n: 4, t: 300, u: Date.now() }]),
+            { 'tm-qs-net': JSON.stringify({ s: [0, 1, 2].map(() => ({ t: 1400, at: Date.now() })) }) }
+        )
+    });
+    await env2.settled();
+    check('a slow link preloads no fonts, the fallback renders',
+        env2.head.children.filter(c => c.as === 'font').length === 0);
+
+    env2 = build({
+        gm: fontStore([{ f: 'https://example.com/f/a.woff2', n: 4, t: 300, u: Date.now() - (20 * 24 * 60 * 60 * 1000) }])
+    });
+    await env2.settled();
+    check('a stale font record is not used',
+        env2.head.children.filter(c => c.as === 'font').length === 0);
+
+    console.log('\nViewport preconnect (iOS)');
+
+    const anchorTo = href => Object.assign(makeEl('a'), { href });
+    const phoneLinks = [
+        anchorTo('https://cdn.example.net/a'),
+        anchorTo('https://cdn.example.net/b'),
+        anchorTo('https://img.example.org/c'),
+        anchorTo('https://example.com/same-origin')
+    ];
+
+    env2 = build({ readyState: 'complete', hover: false, anchors: phoneLinks });
+    await env2.settled();
+    env2.scrollIntoView();
+    let hints = env2.head.children;
+    check('links scrolling into view warm their origin',
+        hints.some(c => c.rel === 'preconnect' && c.href === 'https://cdn.example.net'));
+    check('one origin is warmed once, not once per link',
+        hints.filter(c => c.rel === 'preconnect' && c.href === 'https://cdn.example.net').length === 1);
+    check('the current origin is never warmed',
+        !hints.some(c => c.href === 'https://example.com'));
+    check('DNS is prefetched too',
+        hints.some(c => c.rel === 'dns-prefetch' && c.href === 'https://img.example.org'));
+
+    env2 = build({ readyState: 'complete', hover: true, anchors: phoneLinks });
+    await env2.settled();
+    env2.scrollIntoView();
+    check('a device with hover does not use viewport intent',
+        !env2.head.children.some(c => c.rel === 'preconnect'));
+
+    env2 = build({
+        readyState: 'complete', hover: false, anchors: phoneLinks,
+        gm: { 'tm-qs-net': JSON.stringify({ s: [0, 1, 2].map(() => ({ t: 1400, at: Date.now() })) }) }
+    });
+    await env2.settled();
+    env2.scrollIntoView();
+    check('a slow link does not open speculative sockets',
+        !env2.head.children.some(c => c.rel === 'preconnect'));
+
+    // Budget: four sockets, then the observer stops watching entirely.
+    const manyLinks = [];
+    for (let i = 0; i < 20; i += 1) manyLinks.push(anchorTo('https://host' + i + '.example.net/x'));
+    env2 = build({ readyState: 'complete', hover: false, anchors: manyLinks });
+    await env2.settled();
+    env2.scrollIntoView();
+    check('the socket budget is capped at four',
+        env2.head.children.filter(c => c.rel === 'preconnect').length === 4,
+        env2.head.children.filter(c => c.rel === 'preconnect').length + ' preconnects');
+    check('the DNS budget is capped at twelve',
+        env2.head.children.filter(c => c.rel === 'dns-prefetch').length === 12);
+    check('a spent observer stops watching', env2.observedLinks() === 0);
+
+    console.log('\nHardening (external review)');
+
+    // The observation cap must be spent on links that could warm something,
+    // not on same-origin nav that can never reach the socket budget.
+    const buriedLinks = [];
+    for (let i = 0; i < 320; i += 1) buriedLinks.push(anchorTo('https://example.com/p/' + i));
+    buriedLinks.push(anchorTo('https://cdn.example.net/asset'));
+    env2 = build({ readyState: 'complete', hover: false, anchors: buriedLinks });
+    await env2.settled();
+    env2.scrollIntoView();
+    check('a cross-origin link below 300 same-origin links is still warmed',
+        env2.head.children.some(c => c.rel === 'preconnect' && c.href === 'https://cdn.example.net'));
+
+    // A record is emitted as a preload href verbatim, so it must never be a
+    // clipped path that resolves to nothing.
+    const longPath = 'https://example.com/f/' + 'x'.repeat(400) + '.woff2';
+    env2 = build({ resourceEntries: [fontEntry(longPath, 300), fontEntry('https://example.com/f/ok.woff2', 310)] });
+    await env2.settled();
+    env2.load();
+    const storedFonts = (env2.read('tm-qs-fonts') || { fonts: [] }).fonts.map(f => f.f);
+    check('an over-long font URL is skipped, not truncated',
+        storedFonts.length === 1 && storedFonts[0] === 'https://example.com/f/ok.woff2',
+        JSON.stringify(storedFonts.map(u => u.slice(0, 40))));
+
+    // Under the localStorage fallback this store is writable by the page.
+    env2 = build({
+        gm: fontStore([
+            { f: 'https://example.com/f/junk1.eot', n: 99, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk2.eot', n: 98, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk3.eot', n: 97, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk4.eot', n: 96, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk5.eot', n: 95, t: 1, u: Date.now() },
+            { f: 'https://example.com/f/junk6.eot', n: 94, t: 1, u: Date.now() }
+        ]),
+        resourceEntries: [fontEntry('https://example.com/f/real.woff2', 300)]
+    });
+    await env2.settled();
+    env2.load();
+    const survivors = (env2.read('tm-qs-fonts') || { fonts: [] }).fonts.map(f => f.f);
+    check('unusable stored entries cannot hold every slot',
+        survivors.includes('https://example.com/f/real.woff2') && !survivors.some(u => u.endsWith('.eot')),
+        JSON.stringify(survivors));
 
     const failed = results.filter(([, ok]) => !ok);
     console.log('');
