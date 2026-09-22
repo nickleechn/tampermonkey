@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      4.0.1
+// @version      4.1.0
 // @description  Chrome-only: connection-tiered Speculation Rules prefetch/prerender, learned LCP preload + origin preconnect, navigation-transition prediction, media priority hints, and opt-in content-visibility. Avoids sensitive links and degrades gracefully on slow connections.
 // @author       You
 // @match        *://*/*
@@ -15,6 +15,49 @@
 // @run-at       document-start
 // ==/UserScript==
 
+// 4.1.0 — more aggressive where it costs bytes, stricter where it could cost
+// correctness.
+//
+// The correctness fix first, because every aggressive change depends on it.
+// The sensitive-link list only knew account-ish path words, and destructive
+// GETs mostly aren't shaped like that. Hacker News votes, hides and flags are
+// plain links (vote?id=…&how=up&auth=…), so hovering an upvote arrow for the
+// 200ms 'moderate' window cast the vote. Links are now also refused when the
+// href carries a CSRF-style token (auth=, token=, nonce, sid=, sesskey…),
+// because a URL that embeds a per-user token is an action by construction,
+// and the path list gained the common action verbs. Declarative patterns
+// now match those words at any depth, not only as the first segment.
+//
+// Chrome 143 redefined 'eager' for document rules: 10ms of hover on desktop,
+// a short viewport dwell on mobile, capped at two in flight. It is no longer
+// "fetch every link", so the 40-link budget that guarded against that is gone
+// and same-origin prefetch is eager on every non-slow tier. Rules install at
+// DOMContentLoaded rather than after load, so early hovers count.
+//
+// Also: learned critical origins act on the second visit (a preconnect is
+// cheap); a single observed transition earns a prefetch and two earn a
+// prerender, now on the moderate tier too; cross-origin links prefetch on
+// pointerdown; the hero record survives zoom and small resizes when the
+// browser resolves srcset itself; the learned-origin budget is 6 on fast
+// links; Parts 2–5 no longer run inside iframes. The hero preload keeps its
+// two-sighting gate: that gate is what stops a homepage with a daily
+// rotating hero from preloading yesterday's image at high priority.
+//
+// Found by testing on live sites rather than stubs:
+// - YouTube enforces Trusted Types, so assigning the rules JSON to a
+//   script's text threw, and every caller's try/catch swallowed it: no
+//   speculation there at all, in any 4.x. A private pass-through policy now
+//   carries it.
+// - Which exposed the bigger YouTube problem: its router answers link clicks
+//   in-page, so a speculated document is never used. One click-driven
+//   pushState now marks an origin as an SPA and switches link speculation
+//   and prediction off there (learning continues).
+// - target="" (YouTube) and target="_self" (BBC's whole nav) stay in the
+//   tab, and are no longer excluded as if they opened a new one.
+// - Status reports measured outcomes, this site and all sites: how many
+//   same-site link clicks landed on a prefetched or prerendered page versus
+//   missed, and how often the hero preload was the image that painted.
+//
 // 4.0.1 — pointerdown warming no longer strands the first link it tries on a
 // strict-CSP origin. The securitypolicyviolation that tells us inline
 // speculation rules are blocked arrives after speculate() has already
@@ -58,6 +101,12 @@
         || /Chrome\//.test(navigator.userAgent);
     if (!isChromium) return;
 
+    const chromiumMajor = (() => {
+        const brand = uaBrands && uaBrands.find(b => /Chromium|Google Chrome/i.test(b.brand));
+        const version = brand ? brand.version : (/Chrome\/(\d+)/.exec(navigator.userAgent) || [])[1];
+        return Number.parseInt(version, 10) || 0;
+    })();
+
     // =========================================================================
     // Shared helpers
     // =========================================================================
@@ -80,6 +129,44 @@
 
     const conn = navigator.connection;
     const supportsSpeculationRules = Boolean(HTMLScriptElement.supports && HTMLScriptElement.supports('speculationrules'));
+
+    // Set once Part 6 has read storage, and flipped live by the SPA detector
+    // there. Declared up here because Parts 2 and 4 read it and can run
+    // before Part 6's constants exist when the script is injected late.
+    let knownSpa = false;
+
+    // YouTube and other Trusted Types origins reject a plain string assigned
+    // to a script's text. Every caller wraps this in try/catch, so before
+    // 4.1.0 that TypeError silently switched all speculation off there. The
+    // pass-through policy never leaves this closure and only ever sees JSON
+    // built by this script.
+    let trustedScriptPolicy;
+
+    function makeRulesScript(rules) {
+        const script = document.createElement('script');
+        script.type = 'speculationrules';
+        const text = JSON.stringify(rules);
+
+        try {
+            script.textContent = text;
+        } catch (error) {
+            // Compared by name: the error comes from the page's realm, not
+            // the userscript sandbox's, so instanceof would miss it.
+            if (!error || error.name !== 'TypeError' || typeof trustedTypes === 'undefined') throw error;
+            if (trustedScriptPolicy === undefined) {
+                try {
+                    trustedScriptPolicy = trustedTypes.createPolicy('quicksilver', { createScript: s => s });
+                } catch (_) {
+                    // A trusted-types directive that doesn't list our name.
+                    trustedScriptPolicy = null;
+                }
+            }
+            if (!trustedScriptPolicy) throw error;
+            script.textContent = trustedScriptPolicy.createScript(text);
+        }
+
+        return script;
+    }
 
     // The Prioritized Task Scheduling API exposes `scheduler` as a Window
     // global, not on navigator (navigator.scheduling is a different API with
@@ -184,19 +271,50 @@
     ];
     const DOWNLOAD_REGEX = new RegExp('\\.(?:' + DOWNLOAD_EXTENSIONS.map(ext => ext.slice(1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')(?:[?#]|$)', 'i');
 
-    const SENSITIVE_PATH_SEGMENTS = 'logout|signout|log-out|sign-out|checkout|cart|account|admin|orders?|payments?|delete|auth|login|signin|sign-in|session|destroy|revoke|unsubscribe|remove|transfer';
-    const SENSITIVE_PATH_PATTERNS = [
-        '/logout*', '/signout*', '/log-out*', '/sign-out*',
-        '/checkout*', '/cart*', '/account*', '/admin*',
-        '/order*', '/orders*', '/payment*', '/payments*',
-        '/delete*', '/auth*', '/login*', '/signin*', '/sign-in*',
-        '/session*', '/destroy*', '/revoke*', '/unsubscribe*',
-        '/remove*', '/transfer*'
+    // Speculation issues a real, credentialed GET, and prerender runs the
+    // page too, so any link whose GET *does* something must never match.
+    // The account words were the original list; the action verbs are what
+    // sites without CSRF-protected forms put in link paths (Hacker News:
+    // vote, hide, flag, fave).
+    const SENSITIVE_PATH_WORDS = [
+        'logout', 'signout', 'log-out', 'sign-out', 'checkout', 'cart', 'account', 'admin',
+        'order', 'payment', 'delete', 'auth', 'login', 'signin', 'sign-in', 'session',
+        'destroy', 'revoke', 'unsubscribe', 'remove', 'transfer',
+        'vote', 'upvote', 'downvote', 'unvote', 'hide', 'unhide', 'flag', 'unflag',
+        'fave', 'unfave', 'favorite', 'favourite', 'like', 'unlike', 'follow', 'unfollow',
+        'subscribe', 'report', 'markread', 'mark-read', 'mark_read', 'archive', 'trash', 'spam',
+        'cancel', 'confirm', 'approve', 'reject', 'accept', 'decline', 'leave', 'reset',
+        'enable', 'disable', 'toggle'
     ];
+    // URL patterns cannot express a segment boundary, so these are prefix
+    // matches at any depth and exclude more than the regex below does
+    // (/author, /reports). That errs the right way, and Part 4 still warms
+    // an over-excluded link on pointerdown using the precise regex.
+    const SENSITIVE_PATH_PATTERNS = SENSITIVE_PATH_WORDS.flatMap(word => ['/' + word + '*', '/*/' + word + '*']);
+    const SENSITIVE_ANY_ORIGIN_PATTERNS = SENSITIVE_PATH_PATTERNS.map(pattern => '*://*' + pattern);
     const SENSITIVE_HREF_REGEX = new RegExp(
-        '\\/(?:' + SENSITIVE_PATH_SEGMENTS + ')(?:[\\/?#-]|$)',
+        '\\/(?:' + SENSITIVE_PATH_WORDS.join('|') + ')s?(?:[\\/?#.;_-]|$)',
         'i'
     );
+
+    // Matched anywhere in the raw href, query string included. The path list
+    // can't see ucp.php?mode=logout or index.php?action=logout, and a URL
+    // carrying a per-user CSRF token (HN auth=, phpBB sid=/hash=, WordPress
+    // _wpnonce, Moodle sesskey) is an action link by construction: nobody
+    // puts a token on a URL that only reads.
+    const SENSITIVE_HREF_SUBSTRINGS = [
+        'logout', 'log-out', 'log_out', 'signout', 'sign-out', 'sign_out', 'delete', 'unsubscribe',
+        'auth=', 'token=', 'nonce', 'csrf', 'xsrf', 'sesskey', 'sesc=', 'sid=', 'hash=',
+        'mark=', 'action='
+    ];
+    const SENSITIVE_SUBSTRING_REGEX = new RegExp(
+        SENSITIVE_HREF_SUBSTRINGS.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'),
+        'i'
+    );
+
+    function isSensitiveHref(pathname, rawHref) {
+        return SENSITIVE_HREF_REGEX.test(pathname) || SENSITIVE_SUBSTRING_REGEX.test(rawHref || pathname);
+    }
 
     // =========================================================================
     // Part 2: Speculation Rules prefetch/prerender (Chrome, aggressive)
@@ -212,26 +330,28 @@
     ];
     const EXPECTS_NO_VARY_SEARCH = 'params=(' + NO_VARY_SEARCH_PARAMS.map(p => '"' + p + '"').join(' ') + ')';
 
-    // Above this many links, blanket-eager prefetch stops being a head start
-    // and becomes self-inflicted congestion: Chrome will happily run dozens of
-    // prefetches against the same connection the current page is still using.
-    const EAGER_PREFETCH_LINK_BUDGET = 40;
+    let blanketRulesScript = null;
 
     function initSpeculationRules() {
         const tier = getConnectionTier();
-        if (!supportsSpeculationRules || tier === TIER_SLOW) return;
+        if (!supportsSpeculationRules || tier === TIER_SLOW || knownSpa) return;
 
-        // Path-segment excludes — avoid substring traps like href*='order'→border.
+        // Path words go through href_matches (segment-anchored, so no
+        // href*='order'→border trap); the substring list is deliberately
+        // unanchored, because its entries live in the query string.
         const excludeSelectors = [
             "a[href^='javascript:']",
             "a[href^='mailto:']",
             "a[href^='tel:']",
             "a[href*='download' i]",
-            "a[target]",
+            // BBC marks nav links target="_self" and YouTube target="";
+            // both stay in this tab and are fair game.
+            "a[target]:not([target='']):not([target='_self' i])",
             "a[download]",
             "a[rel~='nofollow']",
             "a[rel~='external']",
-            ...DOWNLOAD_EXTENSIONS.map(ext => "a[href$='" + ext + "' i]")
+            ...DOWNLOAD_EXTENSIONS.map(ext => "a[href$='" + ext + "' i]"),
+            ...SENSITIVE_HREF_SUBSTRINGS.map(s => "a[href*='" + s + "' i]")
         ].join(', ');
 
         const eligibleLinks = {
@@ -242,23 +362,34 @@
             ]
         };
 
-        let linkCount = 0;
-        try {
-            linkCount = document.querySelectorAll('a[href]').length;
-        } catch (_) {}
-
-        // 'moderate' is hover-triggered: nearly the same perceived win as
-        // 'eager' on a link-dense page, at a fraction of the bytes.
-        const prefetchEagerness = (tier === TIER_FAST && linkCount <= EAGER_PREFETCH_LINK_BUDGET)
-            ? 'eager'
-            : 'moderate';
-
+        // Since Chrome 143 'eager' on a document rule means 10ms of hover on
+        // desktop and a short viewport dwell on mobile, two in flight at most
+        // (FIFO). That is intent-gated and bounded, so it is safe on any tier
+        // the script speculates on at all. Before 143 it meant "every link on
+        // the page, now", so older builds keep the 200ms hover of 'moderate'.
         const rules = {
-            prefetch: [{
-                where: eligibleLinks,
-                eagerness: prefetchEagerness,
-                expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
-            }]
+            prefetch: [
+                {
+                    where: eligibleLinks,
+                    eagerness: chromiumMajor >= 143 ? 'eager' : 'moderate',
+                    expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
+                },
+                // Cross-origin links on pointerdown: the click is usually on
+                // its way, so this buys the gap before it lands. Cross-site
+                // prefetches go without cookies, but a same-site subdomain's
+                // may carry them, and pointerdown is not consent (see Part 4),
+                // so the action paths are excluded here too, host-agnostic.
+                {
+                    where: {
+                        and: [
+                            { not: { href_matches: '/*' } },
+                            { not: { href_matches: SENSITIVE_ANY_ORIGIN_PATTERNS } },
+                            { not: { selector_matches: excludeSelectors } }
+                        ]
+                    },
+                    eagerness: 'conservative'
+                }
+            ]
         };
 
         // Prerender downloads *and* executes the target page. That is the right
@@ -289,14 +420,21 @@
         }
 
         try {
-            const script = document.createElement('script');
-            script.type = 'speculationrules';
-            script.textContent = JSON.stringify(rules);
+            const script = makeRulesScript(rules);
             (document.head || document.documentElement).appendChild(script);
+            blanketRulesScript = script;
         } catch (_) {}
     }
 
-    runWhenLoadedIdle(initSpeculationRules);
+    // DOMContentLoaded, not load-then-idle: document rules match links as
+    // they appear and fire only on hover, so installing late just throws
+    // away every hover that happens while images are still loading. Top
+    // frame only, like Parts 3–5 — a 300x250 ad frame has no navigation
+    // worth speeding up, and its same-origin links are ad click URLs.
+    // One task later than DOMContentLoaded strictly needs: if Tampermonkey
+    // injects late, runWhenDomReady calls straight through, before Part 6
+    // has read this origin's SPA flag further down.
+    if (isTopFrame) runWhenDomReady(() => setTimeout(initSpeculationRules, 0));
 
     // =========================================================================
     // Part 3: preconnect + dns-prefetch on hover/focus
@@ -358,11 +496,33 @@
         document.addEventListener('focusin', e => maybePreconnect(e.target), { passive: true, capture: true });
     }
 
-    runWhenDomReady(initPreconnectOnIntent);
+    if (isTopFrame) runWhenDomReady(initPreconnectOnIntent);
 
     // =========================================================================
     // Part 4: pointerdown prefetch supplement (Chrome gaps / older builds)
     // =========================================================================
+
+    // A same-origin link this script would warm. Shared with the outcome
+    // counter in Part 6, which only scores clicks on links like these.
+    function isSpeculableLink(link) {
+        if (!link || !link.href) return false;
+
+        const url = toUrl(link.href);
+        if (!url) return false;
+        if (url.origin !== location.origin) return false;
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+        if (url.pathname + url.search === location.pathname + location.search) return false;
+
+        const href = link.getAttribute('href') || '';
+        if (DOWNLOAD_REGEX.test(href)) return false;
+        // Pointerdown is not a click: a confirm() in the click handler,
+        // or a drag off the link, means the user never agreed to this GET.
+        if (isSensitiveHref(url.pathname, href) || /download/i.test(href)) return false;
+        const target = (link.getAttribute('target') || '').toLowerCase();
+        if ((target && target !== '_self') || link.download || /\b(?:nofollow|external)\b/i.test(link.rel || '')) return false;
+
+        return true;
+    }
 
     function initPointerdownPrefetch() {
         if (getConnectionTier() === TIER_SLOW) return;
@@ -403,23 +563,6 @@
             }
         });
 
-        function isEligible(link) {
-            if (!link || !link.href) return false;
-
-            const url = toUrl(link.href);
-            if (!url) return false;
-            if (url.origin !== location.origin) return false;
-            if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-            if (url.pathname + url.search === location.pathname + location.search) return false;
-
-            const href = link.getAttribute('href') || '';
-            if (DOWNLOAD_REGEX.test(href)) return false;
-            if (SENSITIVE_HREF_REGEX.test(url.pathname) || /download/i.test(href)) return false;
-            if (link.target || link.download || /\b(?:nofollow|external)\b/i.test(link.rel || '')) return false;
-
-            return true;
-        }
-
         // A URL-scoped speculation rule beats <link rel=prefetch> here: the
         // navigation consults the speculation-rules prefetch cache, and on a
         // fast link prerender hands over an already-rendered page instead of
@@ -430,9 +573,7 @@
             const rules = {};
             rules[action] = [{ urls: [href], eagerness: 'immediate' }];
 
-            const script = document.createElement('script');
-            script.type = 'speculationrules';
-            script.textContent = JSON.stringify(rules);
+            const script = makeRulesScript(rules);
 
             if (currentRuleScript) currentRuleScript.remove();
             (document.head || document.documentElement).appendChild(script);
@@ -462,17 +603,29 @@
             try {
                 if (method === 'rules') speculate(href);
                 else prefetchHint(href);
-            } catch (_) {}
+            } catch (_) {
+                // makeRulesScript throws only when Trusted Types refuses the
+                // rules and no policy could be made — as final as a CSP block.
+                if (method !== 'rules') return;
+                rulesBlocked = true;
+                currentMethod = 'hint';
+                try {
+                    prefetchHint(href);
+                } catch (_) {}
+            }
         }
 
         document.addEventListener('pointerdown', e => {
+            // An in-page router answers the click itself; the document we
+            // would fetch is never used.
+            if (knownSpa) return;
             if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
             const link = getClosestLinkTarget(e.target);
-            if (isEligible(link)) warm(link.href);
+            if (isSpeculableLink(link)) warm(link.href);
         }, { passive: true, capture: true });
     }
 
-    runWhenDomReady(initPointerdownPrefetch);
+    if (isTopFrame) runWhenDomReady(initPointerdownPrefetch);
 
     // =========================================================================
     // Part 5: font-display swap injection
@@ -560,7 +713,7 @@
         }, { once: true });
     }
 
-    runWhenDomReady(initFontDisplaySwap);
+    if (isTopFrame) runWhenDomReady(initFontDisplaySwap);
 
     // =========================================================================
     // Part 6: cross-visit learning (LCP preload + critical-origin preconnect)
@@ -576,14 +729,24 @@
     const LEARN_ORIGINS_KEY = 'tm-qs-origins';
     const LEARN_VITALS_KEY = 'tm-qs-vitals';
     const LEARN_TRANSITIONS_KEY = 'tm-qs-transitions';
+    const LEARN_SPA_KEY = 'tm-qs-spa';
+    const STATS_KEY = 'tm-qs-stats';
+    const PENDING_NAV_KEY = 'tm-qs-pending-nav';
+    // Not origin-scoped: the all-sites totals behind the status report.
+    const STATS_ALL_KEY = 'tm-qs-stats-all';
     const CV_FLAG_KEY = 'tm-qs-content-visibility';
     const LEARN_LCP_MAX_ENTRIES = 60;
     const LEARN_ORIGIN_MAX_ENTRIES = 8;
     const LEARN_VITALS_SAMPLES = 12;
     const LEARN_MAX_AGE = 14 * 24 * HOUR;
-    // Act only on the third sighting: a page redesign should cost one wasted
-    // preload, not one on every visit until the record ages out.
-    const LEARN_MIN_SIGHTINGS = 2;
+    // The hero acts on the third visit, after two sightings of the same
+    // image. That gate is a stability test, not a delay: a homepage whose
+    // hero rotates daily resets the count on every visit and never
+    // qualifies, where a one-sighting gate would preload yesterday's image
+    // at fetchpriority=high on every visit, against the real LCP.
+    const LEARN_LCP_MIN_SIGHTINGS = 2;
+    // A wrong preconnect costs one idle socket, so one sighting is enough.
+    const LEARN_ORIGIN_MIN_SIGHTINGS = 1;
     const LEARN_EARLY_RESOURCE_MS = 4000;
     // LCP candidates stop arriving at the first user interaction, and in
     // practice well before this after load. Snapshotting here is what lets a
@@ -601,7 +764,7 @@
     // though, so keys are namespaced and the origin set is bounded.
     const LEARN_INDEX_KEY = 'tm-qs-origin-index';
     const LEARN_MAX_ORIGINS = 150;
-    const ORIGIN_KEYS = [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_VITALS_KEY, LEARN_TRANSITIONS_KEY];
+    const ORIGIN_KEYS = [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_VITALS_KEY, LEARN_TRANSITIONS_KEY, LEARN_SPA_KEY, STATS_KEY, PENDING_NAV_KEY];
     const hasGmStorage = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
 
     function storeKey(key) {
@@ -747,30 +910,46 @@
         installRouteWatcher();
     }
 
+    // A router answering a link click is the SPA signature. A push that no
+    // click preceded is something else: Wikipedia's replaceState redirect
+    // fixups, or a news page rewriting its URL as you scroll.
+    const LINK_CLICK_WINDOW_MS = 1000;
+    let lastLinkClickAt = 0;
+
     function installRouteWatcher() {
         if (routeWatcherInstalled) return;
         routeWatcherInstalled = true;
 
+        // Capture on document runs before the router's own click handler.
+        document.addEventListener('click', event => {
+            if (getClosestLinkTarget(event.target)) lastLinkClickAt = Date.now();
+        }, { passive: true, capture: true });
+
         // Deferred a turn: pushState updates location *before* returning, but
         // the Navigation API's navigate event fires before the new URL is
         // committed, so reading it fresh on the next task is correct for both.
-        const fire = () => setTimeout(() => {
-            for (const handler of routeChangeHandlers) {
-                try {
-                    handler();
-                } catch (_) {}
-            }
-        }, 0);
+        // What kind of change it was is captured now, though, while the click
+        // that caused it is still recent.
+        const fire = push => {
+            const info = { push, afterLinkClick: Date.now() - lastLinkClickAt < LINK_CLICK_WINDOW_MS };
+            setTimeout(() => {
+                for (const handler of routeChangeHandlers) {
+                    try {
+                        handler(info);
+                    } catch (_) {}
+                }
+            }, 0);
+        };
 
         // The Navigation API reports every same-document navigation without
         // touching page globals, so it is strongly preferred over patching
         // history.pushState.
         if (window.navigation && typeof window.navigation.addEventListener === 'function') {
-            window.navigation.addEventListener('navigate', fire);
+            window.navigation.addEventListener('navigate', event => fire(Boolean(event) && event.navigationType === 'push'));
             return;
         }
 
-        window.addEventListener('popstate', fire);
+        window.addEventListener('popstate', () => fire(false));
 
         // Fallback only. A pushState-only router fires nothing else at all, so
         // without this the whole SPA case goes dark on builds that predate the
@@ -782,11 +961,124 @@
                 if (typeof original !== 'function') continue;
                 target[method] = function (...args) {
                     const result = original.apply(this, args);
-                    fire();
+                    fire(method === 'pushState');
                     return result;
                 };
             }
         } catch (_) {}
+    }
+
+    // -------------------------------------------------------------------------
+    // SPA detection
+    // -------------------------------------------------------------------------
+    //
+    // On a site whose router answers link clicks in-page (YouTube, GitHub),
+    // a prefetched or prerendered document is never used: the click becomes
+    // a pushState and a JSON fetch. Every hover-speculation there is a whole
+    // page load thrown away, and 4.1.0's eager prefetch would multiply that.
+    // One observed click-driven soft navigation switches Parts 2, 4 and 9
+    // off for the origin; learning carries on.
+
+    const SPA_FLAG_REFRESH = 24 * HOUR;
+
+    function isKnownSpa() {
+        const flag = readStore(LEARN_SPA_KEY);
+        return Boolean(flag) && Date.now() - (Number(flag.at) || 0) < LEARN_MAX_AGE;
+    }
+
+    function initSpaDetection() {
+        let lastRoute = pageKey();
+
+        onRouteChange(info => {
+            const next = pageKey();
+            if (next === lastRoute) return;
+            lastRoute = next;
+            if (!info || !info.push || !info.afterLinkClick) return;
+
+            // Kept alive by use and aged out like everything else, so a site
+            // that drops its client-side router gets speculation back.
+            const flag = readStore(LEARN_SPA_KEY);
+            if (!flag || Date.now() - (Number(flag.at) || 0) > SPA_FLAG_REFRESH) {
+                writeStore(LEARN_SPA_KEY, { at: Date.now() });
+            }
+
+            if (knownSpa) return;
+            knownSpa = true;
+            // Stop paying for this visit too, not only future ones.
+            if (blanketRulesScript) {
+                blanketRulesScript.remove();
+                blanketRulesScript = null;
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Measured outcomes
+    // -------------------------------------------------------------------------
+    //
+    // 3.x reported a cache hit rate, which measured its own machinery. These
+    // count what the user actually got: a navigation served from a prefetch
+    // or prerender or not, and a hero preload that was the real LCP or not.
+
+    function bumpStats(section, outcome) {
+        const bump = previous => {
+            const stats = (previous && typeof previous === 'object' && !Array.isArray(previous)) ? previous : {};
+            const bucket = (stats[section] && typeof stats[section] === 'object') ? stats[section] : {};
+            bucket[outcome] = (Number(bucket[outcome]) || 0) + 1;
+            stats[section] = bucket;
+            if (!stats.since) stats.since = Date.now();
+            return stats;
+        };
+
+        writeStore(STATS_KEY, bump(readStore(STATS_KEY)));
+
+        // The localStorage fallback is per-origin by nature; there is no
+        // "all sites" to add to.
+        if (!hasGmStorage) return;
+        rawWrite(STATS_ALL_KEY, JSON.stringify(bump(readAllStats())));
+    }
+
+    function readAllStats() {
+        try {
+            return JSON.parse(rawRead(STATS_ALL_KEY) || 'null');
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // A same-site arrival is only a *miss* if it came from a click on a link
+    // speculation could have served. New tabs, form posts, excluded links
+    // and redirects arrive with a same-origin referrer too, and counting
+    // them would make a site where every eligible click was prerendered
+    // read as 60%. So the click leaves a marker for the page it opens.
+    const PENDING_NAV_MAX_AGE = MINUTE;
+
+    function initOutcomeMarker() {
+        document.addEventListener('click', event => {
+            if (knownSpa || !supportsSpeculationRules || getConnectionTier() === TIER_SLOW) return;
+            // Modified clicks open a new tab or window: not this navigation.
+            if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+            const link = getClosestLinkTarget(event.target);
+            if (!isSpeculableLink(link)) return;
+            writeStore(PENDING_NAV_KEY, { href: link.href, at: Date.now() });
+        }, { passive: true, capture: true });
+    }
+
+    function recordNavigationOutcome(nav) {
+        const pending = readStore(PENDING_NAV_KEY);
+        if (pending) deleteStore(PENDING_NAV_KEY);
+
+        // activationStart is non-zero only on a prerendered page (the moment
+        // the user arrived); deliveryType names a navigation that Chrome
+        // answered from a prefetch. Hits count without the marker: a
+        // prerender activates instantly, possibly before the old page's
+        // write has reached this one.
+        if (nav && Number(nav.activationStart) > 0) return bumpStats('nav', 'prerender');
+        if (nav && nav.deliveryType === 'navigational-prefetch') return bumpStats('nav', 'prefetch');
+
+        const clicked = pending && pending.href === location.href
+            && Date.now() - (Number(pending.at) || 0) < PENDING_NAV_MAX_AGE;
+        if (clicked) bumpStats('nav', 'miss');
     }
 
     // -------------------------------------------------------------------------
@@ -812,13 +1104,40 @@
         observer.observe(root, { childList: true });
     }
 
-    // A responsive hero served via srcset resolves to a different candidate at
-    // a different width or DPR, so a record is only reusable at a similar
-    // viewport — otherwise the preload fetches a variant the page never uses.
-    function viewportBucket() {
-        const width = Math.round((window.innerWidth || 0) / 160) * 160;
-        const dpr = Math.round(window.devicePixelRatio || 1);
-        return width + 'x' + dpr;
+    // A different viewport can mean a different layout and so a different
+    // hero, so a record is only reused at a similar width. 320px buckets
+    // survive a nudged window edge; 160px ones did not.
+    const VIEWPORT_BUCKET_PX = 320;
+
+    function viewportWidthBucket() {
+        return Math.round((window.innerWidth || 0) / VIEWPORT_BUCKET_PX) * VIEWPORT_BUCKET_PX;
+    }
+
+    function currentDpr() {
+        return Math.round(window.devicePixelRatio || 1);
+    }
+
+    function recordBucket(record) {
+        // 4.0.x stored "1280x2" at 160px granularity. Re-bucket it rather
+        // than make every learned hero start over.
+        if (typeof record.vw === 'string') {
+            const match = /^(\d+)x(\d+)$/.exec(record.vw);
+            if (!match) return null;
+            return {
+                width: Math.round(Number(match[1]) / VIEWPORT_BUCKET_PX) * VIEWPORT_BUCKET_PX,
+                dpr: Number(match[2])
+            };
+        }
+        return { width: Number(record.vw), dpr: Number(record.dpr) };
+    }
+
+    function matchesViewport(record) {
+        const bucket = recordBucket(record);
+        if (!bucket || bucket.width !== viewportWidthBucket()) return false;
+        // With srcset replayed as imagesrcset the browser picks the density
+        // itself, so zoom (which changes devicePixelRatio) only invalidates a
+        // src-only hero, whose URL was chosen for the old density.
+        return Boolean(record.srcset) || bucket.dpr === currentDpr();
     }
 
     function pageKey() {
@@ -836,6 +1155,19 @@
     }
 
     let emittedPreloadFor = null;
+    // Which route a hero preload went out for, and every URL that would
+    // count as it being right: with imagesrcset the browser may pick any
+    // candidate, all of which are the same image.
+    let heroPreload = null;
+
+    function preloadUrls(record) {
+        const urls = [record.url];
+        for (const candidate of String(record.srcset || '').split(',')) {
+            const url = toUrl(candidate.trim().split(/\s+/)[0]);
+            if (url) urls.push(url.href);
+        }
+        return urls;
+    }
 
     function applyLearnedHints(route) {
         const key = route || pageKey();
@@ -847,13 +1179,14 @@
         if (
             record
             && typeof record.url === 'string'
-            && (Number(record.seen) || 0) >= LEARN_MIN_SIGHTINGS
-            && record.vw === viewportBucket()
+            && (Number(record.seen) || 0) >= LEARN_LCP_MIN_SIGHTINGS
+            && matchesViewport(record)
             && Date.now() - (Number(record.at) || 0) < LEARN_MAX_AGE
             && emittedPreloadFor !== record.url
         ) {
             learnedLcpUrl = record.url;
             emittedPreloadFor = record.url;
+            heroPreload = { route: key, urls: preloadUrls(record) };
 
             try {
                 const link = document.createElement('link');
@@ -890,13 +1223,13 @@
 
         const originStore = readStore(LEARN_ORIGINS_KEY);
         const origins = (originStore && Array.isArray(originStore.origins)) ? originStore.origins : [];
-        const budget = tier === TIER_SLOW ? 2 : (tier === TIER_MODERATE ? 3 : 4);
+        const budget = tier === TIER_SLOW ? 2 : (tier === TIER_MODERATE ? 3 : 6);
 
         let used = 0;
         for (const entry of origins) {
             if (used >= budget) break;
             if (!entry || typeof entry.o !== 'string') continue;
-            if ((Number(entry.n) || 0) < LEARN_MIN_SIGHTINGS) continue;
+            if ((Number(entry.n) || 0) < LEARN_ORIGIN_MIN_SIGHTINGS) continue;
             if (entry.o === location.origin) continue;
             const updatedAt = Number(entry.u) || 0;
             if (updatedAt && Date.now() - updatedAt > LEARN_MAX_AGE) continue;
@@ -965,6 +1298,12 @@
             if (!route || persistedRoute === route) return;
             persistedRoute = route;
 
+            if (heroPreload && heroPreload.route === route) {
+                const painted = observed && observed.url ? toUrl(observed.url) : null;
+                bumpStats('hero', painted && heroPreload.urls.includes(painted.href) ? 'hit' : 'miss');
+                heroPreload = null;
+            }
+
             if (!observed || !observed.url) {
                 // No image LCP for this route: redesigned to a text headline,
                 // or the hero is gone. Returning early would leave the old
@@ -985,15 +1324,15 @@
 
             const store = readStore(LEARN_LCP_KEY) || {};
             const previous = store[route];
-            const bucket = viewportBucket();
-            const sameTarget = Boolean(previous && previous.url === url.href && previous.vw === bucket);
+            const sameTarget = Boolean(previous && previous.url === url.href && matchesViewport(previous));
 
             store[route] = {
                 url: url.href,
                 cors: observed.cors,
                 srcset: observed.srcset,
                 sizes: observed.sizes,
-                vw: bucket,
+                vw: viewportWidthBucket(),
+                dpr: currentDpr(),
                 at: Date.now(),
                 // A changed target resets confidence rather than accumulating
                 // it, so a redesigned page stops being preloaded immediately.
@@ -1151,6 +1490,11 @@
     }
 
     if (isTopFrame) {
+        knownSpa = isKnownSpa();
+        // Registered before Parts 6 and 9 hook route changes, so the flag is
+        // already set by the time their handlers look at it.
+        initSpaDetection();
+        initOutcomeMarker();
         applyLearnedHints();
         initLearning();
         runWhenLoadedIdle(() => {
@@ -1186,7 +1530,10 @@
 
     const TRANSITION_MAX_SOURCES = 120;
     const TRANSITION_MAX_TARGETS = 4;
-    const TRANSITION_MIN_CONFIDENCE = 2;
+    // A wrong prefetch wastes bytes; a wrong prerender runs a whole page. So
+    // one real navigation earns a prefetch, and it takes two for a prerender.
+    const TRANSITION_PREFETCH_CONFIDENCE = 1;
+    const TRANSITION_PRERENDER_CONFIDENCE = 2;
 
     let predictedTargets = [];
     let currentPredictionScript = null;
@@ -1229,10 +1576,10 @@
         if (!entry || !entry.t) return [];
 
         return Object.entries(entry.t)
-            .filter(([, count]) => (Number(count) || 0) >= TRANSITION_MIN_CONFIDENCE)
+            .filter(([, count]) => (Number(count) || 0) >= TRANSITION_PREFETCH_CONFIDENCE)
             .sort((a, b) => b[1] - a[1])
             .slice(0, 2)
-            .map(([path, count]) => ({ path, count }));
+            .map(([path, count]) => ({ path, count: Number(count) || 0 }));
     }
 
     function isSpeculationEligible(url) {
@@ -1243,45 +1590,48 @@
         if (DOWNLOAD_REGEX.test(url.pathname)) return false;
         // Prerender *executes* the target. A destructive GET behind one of
         // these paths would be run, not merely fetched.
-        if (SENSITIVE_HREF_REGEX.test(url.pathname)) return false;
+        if (isSensitiveHref(url.pathname)) return false;
         return true;
     }
 
     function speculateOnPrediction() {
         if (!supportsSpeculationRules) return;
         if (getConnectionTier() === TIER_SLOW) return;
+        if (knownSpa) {
+            // The router will answer the next click in-page; a live
+            // prediction from before the site showed that is pure cost.
+            if (currentPredictionScript) currentPredictionScript.remove();
+            currentPredictionScript = null;
+            return;
+        }
 
         const candidates = predictNext(pageKey());
         if (!candidates.length) return;
 
-        const hrefs = [];
+        const eligible = [];
         for (const candidate of candidates) {
             const url = toUrl(candidate.path, location.origin);
             if (!isSpeculationEligible(url)) continue;
-            hrefs.push(url.href);
+            eligible.push({ path: candidate.path, count: candidate.count, href: url.href });
         }
 
-        if (!hrefs.length) return;
-        predictedTargets = candidates.filter(c => {
-            const url = toUrl(c.path, location.origin);
-            return url && hrefs.includes(url.href);
-        });
+        if (!eligible.length) return;
+        predictedTargets = eligible;
 
-        // Prerender only where the connection can absorb a full page load in
-        // the background; otherwise take the cheaper bytes-only win.
-        const action = getConnectionTier() === TIER_FAST ? 'prerender' : 'prefetch';
+        // Only the single strongest prediction is prerendered, which is also
+        // why it is allowed on the moderate tier: one background page load
+        // for a destination seen twice is a good trade even on 3G. Chrome
+        // caps concurrent prerenders hard, so anything else is prefetched.
         const rules = {};
-        // Chrome caps concurrent prerenders hard, so this stays at one for
-        // prerender and allows the cheaper pair for prefetch.
-        rules[action] = [{
-            urls: action === 'prerender' ? hrefs.slice(0, 1) : hrefs,
-            eagerness: 'immediate'
-        }];
+        const top = eligible[0];
+        const prerenderTop = top.count >= TRANSITION_PRERENDER_CONFIDENCE;
+        if (prerenderTop) rules.prerender = [{ urls: [top.href], eagerness: 'immediate' }];
+
+        const prefetchHrefs = eligible.slice(prerenderTop ? 1 : 0).map(c => c.href);
+        if (prefetchHrefs.length) rules.prefetch = [{ urls: prefetchHrefs, eagerness: 'immediate' }];
 
         try {
-            const script = document.createElement('script');
-            script.type = 'speculationrules';
-            script.textContent = JSON.stringify(rules);
+            const script = makeRulesScript(rules);
             // One prediction is live at a time. Removing a rules script cancels
             // its speculation, which is what we want when a route change makes
             // the previous prediction obsolete — and without this a long
@@ -1300,9 +1650,11 @@
         // reload of /item, letting a single real navigation reach the
         // confidence gate by itself. Only a fresh navigation is a choice.
         let navType = 'navigate';
+        let navEntry = null;
         try {
             const nav = performance.getEntriesByType('navigation');
-            if (nav && nav[0] && nav[0].type) navType = nav[0].type;
+            navEntry = (nav && nav[0]) || null;
+            if (navEntry && navEntry.type) navType = navEntry.type;
         } catch (_) {}
 
         // A full navigation: the referrer is the page we came from. Chrome's
@@ -1312,6 +1664,13 @@
             const from = toUrl(document.referrer);
             if (from && from.origin === location.origin) {
                 recordTransition(from.pathname, previousRoute);
+                // Same-site link navigations are the ones speculation could
+                // have served, so they are the hit-rate denominator. Skipped
+                // where speculation is off on purpose (SPA, slow link), so
+                // a deliberate "no" doesn't read as a miss.
+                if (supportsSpeculationRules && !knownSpa && getConnectionTier() !== TIER_SLOW) {
+                    recordNavigationOutcome(navEntry);
+                }
             }
         }
 
@@ -1561,7 +1920,13 @@
         const lines = [];
         const feature = (mark, name, detail) => lines.push('  ' + mark + ' ' + name + '\n      ' + detail);
 
-        lines.push('Quicksilver 4.0.0 — ' + location.origin + route);
+        // Read from the header so the two can't drift apart again (4.0.1
+        // shipped reporting itself as 4.0.0).
+        let version = '';
+        try {
+            version = GM_info.script.version || '';
+        } catch (_) {}
+        lines.push('Quicksilver ' + (version ? version + ' ' : '') + '— ' + location.origin + route);
         lines.push('');
         lines.push('ACTIVE ON THIS PAGE');
 
@@ -1572,13 +1937,14 @@
 
         if (!supportsSpeculationRules) feature('○', 'Link speculation', 'not supported by this Chrome build');
         else if (tier === TIER_SLOW) feature('○', 'Link speculation', 'paused — connection is ' + tierName);
+        else if (knownSpa) feature('○', 'Link speculation', SPA_OFF_REASON);
         else feature('●', 'Link speculation', anchors + ' eligible links on this page');
 
         if (learnedLcpUrl) {
             feature('●', 'Learned hero preload', 'preloading this route’s hero image');
         } else if (record) {
             const seen = Number(record.seen) || 0;
-            const need = Math.max(0, LEARN_MIN_SIGHTINGS - seen);
+            const need = Math.max(0, LEARN_LCP_MIN_SIGHTINGS - seen);
             feature('◐', 'Learned hero preload', need > 0
                 ? 'seen ' + seen + '× — ' + need + ' more visit' + (need === 1 ? '' : 's') + ' before it acts'
                 : 'record exists but did not match this viewport');
@@ -1590,12 +1956,16 @@
             feature('○', 'Next-page prediction', 'not supported by this Chrome build');
         } else if (tier === TIER_SLOW) {
             feature('○', 'Next-page prediction', 'paused — connection is ' + tierName);
+        } else if (knownSpa) {
+            feature('○', 'Next-page prediction', SPA_OFF_REASON);
         } else if (predictedTargets.length) {
             const next = predictedTargets[0];
-            feature('●', 'Next-page prediction', next.path + ' (seen ' + next.count + '×)');
+            const how = next.count >= TRANSITION_PRERENDER_CONFIDENCE ? 'prerendering' : 'prefetching';
+            feature('●', 'Next-page prediction', how + ' ' + next.path + ' (seen ' + next.count + '×)');
         } else {
             feature('◐', 'Next-page prediction',
-                'learns where you go from here — needs ' + TRANSITION_MIN_CONFIDENCE + ' visits along the same path');
+                'learns where you go from here — prefetches after ' + TRANSITION_PREFETCH_CONFIDENCE
+                + ' visit along the same path, prerenders after ' + TRANSITION_PRERENDER_CONFIDENCE);
         }
 
         feature(contentVisibilityEnabled() ? '●' : '○', 'Aggressive rendering',
@@ -1617,7 +1987,57 @@
         lines.push('  Median LCP                 ' + lcpText);
         lines.push('  Connection                 ' + tierName + ' (' + ((conn && conn.effectiveType) || 'unknown') + ')');
 
+        const siteStats = readStore(STATS_KEY);
+        const allStats = hasGmStorage ? readAllStats() : null;
+        const siteNav = navCounts(siteStats);
+        const allNav = navCounts(allStats);
+
+        lines.push('');
+        lines.push('MEASURED OUTCOMES');
+        lines.push('  Same-site link clicks, this site');
+        lines.push('      ' + describeNav(siteNav));
+        if (allStats) {
+            lines.push('  Same-site link clicks, all sites');
+            lines.push('      ' + describeNav(allNav));
+        }
+        lines.push('  Hero preload was the real LCP');
+        lines.push('      this site: ' + describeHero(siteStats)
+            + (allStats ? '   all sites: ' + describeHero(allStats) : ''));
+
+        // Zero hits over a real sample almost never means every guess was
+        // wrong: it means Chrome isn't speculating at all.
+        const sample = allStats ? allNav : siteNav;
+        if (sample.total >= 10 && sample.served === 0) {
+            lines.push('');
+            lines.push('  Nothing has been served from a speculation in ' + sample.total + ' navigations.');
+            lines.push('  Check Chrome Settings → Performance → "Preload pages", and Energy');
+            lines.push('  Saver, which switches preloading off.');
+        }
+
         return lines.join('\n');
+    }
+
+    const SPA_OFF_REASON = 'off — this site answers link clicks in-page, so a prefetched page is never used';
+
+    function navCounts(stats) {
+        const nav = (stats && stats.nav && typeof stats.nav === 'object') ? stats.nav : {};
+        const prerender = Number(nav.prerender) || 0;
+        const prefetch = Number(nav.prefetch) || 0;
+        const miss = Number(nav.miss) || 0;
+        return { prerender, prefetch, miss, served: prerender + prefetch, total: prerender + prefetch + miss };
+    }
+
+    function describeNav(counts) {
+        if (!counts.total) return 'none measured yet';
+        return Math.round(counts.served * 100 / counts.total) + '% hit (' + counts.served + ' of ' + counts.total
+            + ') — prerendered ' + counts.prerender + ', prefetched ' + counts.prefetch + ', missed ' + counts.miss;
+    }
+
+    function describeHero(stats) {
+        const hero = (stats && stats.hero && typeof stats.hero === 'object') ? stats.hero : {};
+        const hit = Number(hero.hit) || 0;
+        const total = hit + (Number(hero.miss) || 0);
+        return total ? hit + ' of ' + total : 'none yet';
     }
 
     if (typeof GM_registerMenuCommand !== 'undefined') {
