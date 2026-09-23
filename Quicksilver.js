@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      4.1.0
+// @version      4.2.0
 // @description  Chrome-only: connection-tiered Speculation Rules prefetch/prerender, learned LCP preload + origin preconnect, navigation-transition prediction, media priority hints, and opt-in content-visibility. Avoids sensitive links and degrades gracefully on slow connections.
 // @author       You
 // @match        *://*/*
@@ -13,8 +13,56 @@
 // @grant        GM_deleteValue
 // @grant        unsafeWindow
 // @run-at       document-start
+// @noframes
 // ==/UserScript==
 
+// 4.2.0 — speculate wherever the click is already committed, and follow
+// links into new tabs.
+//
+// - Pointerdown speculates on every connection, slow and data-saver
+//   included, and prerenders (not just prefetches) on 3g. A pointerdown is
+//   ~100ms ahead of its click, so what it fetches is what the click would
+//   have fetched: nearly zero waste, which is why hover stays off on slow.
+// - target="_blank" links are prerendered on Chrome 138+: document rules
+//   read the target off the link, and pointerdown uses target_hint. Prefetch
+//   still skips them, because a prefetch can't follow into a new tab.
+// - Prediction prefetches the top three destinations and prerenders the
+//   two strongest on a fast link (one on 3g), well under Chrome's limits of
+//   10 immediate prerenders and 50 prefetches.
+// - The action-link lists were checked against Jev (TypeSafe), asked
+//   whether a cookie-carrying GET to each of 42 real link shapes would act.
+//   It found gaps (/mark-all-read, /basket/add, /wishlist/add, poll
+//   answers, /dismiss, /set-language) and over-exclusions: the blanket
+//   'action=' refused Wikipedia's history and edit pages, and the precise
+//   check refused article slugs that start with a verb and plural index
+//   pages. Query values are now matched as =<verb>, and a final path
+//   segment counts only if it is the verb plus at most one short suffix.
+//
+// Fixed after an independent review of this release:
+// - Hover rules matched action paths with href_matches URL patterns, which
+//   are case-sensitive: /Account/LogOff and /Cart/Remove/5 were prefetched
+//   on hover while pointerdown refused them. They are case-insensitive
+//   selectors now. logoff/signoff were missing entirely, and pages that act
+//   by being viewed (/message/unread/, /notifications, /inbox) are refused.
+// - Compound and camelCase actions (/remove-from-cart/5, /cancelOrder) got
+//   past the precise check; a bare <a download> got past pointerdown.
+// - Transition learning could never add a fifth destination and never let
+//   the first four expire. Targets now carry their own last-seen time.
+// - A text LCP that outgrew an earlier logo left the logo recorded as the
+//   hero; <picture> heroes replayed the <img> fallback srcset (a JPEG the
+//   page never used); prerendered pages inflated the LCP median.
+// - Report-only or unrelated script-src violations switched pointerdown
+//   to the weaker hint path. The SPA flag now needs the pushed URL to be
+//   the clicked link, so infinite scroll can't trip it and slow routers
+//   get a wider window. Icon fonts keep their blocking font-display, and
+//   @noframes keeps the script (and its menu) out of iframes.
+//
+// Considered and left out: 'eager' prerender (a 10ms hover would start and
+// cancel whole page loads as the pointer crosses a list, while eager
+// prefetch already starts the HTML), cross-origin hover prefetch (tells a
+// third party what you hovered), and prerender_until_script (origin trial,
+// so a page needs its own token).
+//
 // 4.1.0 — more aggressive where it costs bytes, stricter where it could cost
 // correctness.
 //
@@ -106,6 +154,8 @@
         const version = brand ? brand.version : (/Chrome\/(\d+)/.exec(navigator.userAgent) || [])[1];
         return Number.parseInt(version, 10) || 0;
     })();
+    // target="_blank" prerender (document rules, and target_hint on lists).
+    const NEW_TAB_PRERENDER_CHROME = 138;
 
     // =========================================================================
     // Shared helpers
@@ -278,42 +328,79 @@
     // vote, hide, flag, fave).
     const SENSITIVE_PATH_WORDS = [
         'logout', 'signout', 'log-out', 'sign-out', 'checkout', 'cart', 'account', 'admin',
-        'order', 'payment', 'delete', 'auth', 'login', 'signin', 'sign-in', 'session',
-        'destroy', 'revoke', 'unsubscribe', 'remove', 'transfer',
+        'order', 'orders', 'payment', 'payments', 'delete', 'auth', 'login', 'signin', 'sign-in',
+        'session', 'destroy', 'revoke', 'unsubscribe', 'remove', 'transfer',
         'vote', 'upvote', 'downvote', 'unvote', 'hide', 'unhide', 'flag', 'unflag',
         'fave', 'unfave', 'favorite', 'favourite', 'like', 'unlike', 'follow', 'unfollow',
-        'subscribe', 'report', 'markread', 'mark-read', 'mark_read', 'archive', 'trash', 'spam',
+        'subscribe', 'report', 'markread', 'mark-read', 'mark_read', 'mark-all', 'archive', 'trash', 'spam',
         'cancel', 'confirm', 'approve', 'reject', 'accept', 'decline', 'leave', 'reset',
-        'enable', 'disable', 'toggle'
+        'enable', 'disable', 'toggle',
+        // Added in 4.2.0 after asking Jev (TypeSafe) to judge 42 real link
+        // shapes: each of these was a GET it rated as acting, that 4.1.0
+        // would have speculated.
+        'add', 'answer', 'rsvp', 'dismiss', 'setlang', 'set-language', 'set-locale', 'set-currency',
+        // Missing through 4.1.0: OWA's /owa/logoff.owa, SAP, Logoff.aspx.
+        'logoff', 'log-off', 'signoff', 'sign-off',
+        // Pages that act by being viewed: old.reddit's /message/unread/
+        // marks messages read when fetched, and notification pages mark
+        // themselves seen. Harmless to click, wrong to fetch unasked.
+        'unread', 'inbox', 'message', 'messages', 'notification', 'notifications'
     ];
-    // URL patterns cannot express a segment boundary, so these are prefix
-    // matches at any depth and exclude more than the regex below does
-    // (/author, /reports). That errs the right way, and Part 4 still warms
-    // an over-excluded link on pointerdown using the precise regex.
-    const SENSITIVE_PATH_PATTERNS = SENSITIVE_PATH_WORDS.flatMap(word => ['/' + word + '*', '/*/' + word + '*']);
-    const SENSITIVE_ANY_ORIGIN_PATTERNS = SENSITIVE_PATH_PATTERNS.map(pattern => '*://*' + pattern);
+    // Hover rules match these as case-insensitive href substrings, "/word"
+    // anywhere or "word" at the start of a relative href. Through 4.1.0
+    // they were href_matches URL patterns, which are case-sensitive:
+    // /account* never matched ASP.NET's /Account/LogOff, nor /Cart/Remove/5.
+    // Substrings are prefixes at any depth, so they also refuse /author,
+    // /reports, /2025/06/like-a-pro — erring the right way for hover, with
+    // Part 4 still warming those on pointerdown via the precise check below.
+    const SENSITIVE_PATH_SELECTORS = SENSITIVE_PATH_WORDS.flatMap(word => [
+        "a[href*='/" + word + "' i]",
+        "a[href^='" + word + "' i]"
+    ]);
+    // The precise check, used where a guess is expensive (pointerdown,
+    // prediction). A segment is an action if it is the verb, optionally with
+    // one short suffix (/vote, /delete-account, /logout.php,
+    // /mark-all-read); or a verb-led compound followed by another segment,
+    // which is its argument (/remove-from-cart/5, /vote-up-comment/5). Not
+    // a final slug that happens to start with a verb (/like-a-pro-guide,
+    // /report-finds-rise/) and not a plural index (/reports) — both of which
+    // Jev rated as ordinary pages.
     const SENSITIVE_HREF_REGEX = new RegExp(
-        '\\/(?:' + SENSITIVE_PATH_WORDS.join('|') + ')s?(?:[\\/?#.;_-]|$)',
+        '\\/(?:' + SENSITIVE_PATH_WORDS.join('|') + ')'
+        + '(?:(?:[-_.][a-z0-9]+)?(?:[\\/?#;]|$)|(?:[-_][a-z0-9]+)+\\/[^/?#])',
         'i'
     );
+    // camelCase and PascalCase compounds: /cancelOrder, /DeleteItem. Case
+    // matters here, so the first letter of each word is spelled both ways.
+    const SENSITIVE_CAMEL_REGEX = new RegExp(
+        '\\/(?:' + SENSITIVE_PATH_WORDS
+            .filter(word => /^[a-z]+$/.test(word))
+            .map(word => '[' + word[0] + word[0].toUpperCase() + ']' + word.slice(1))
+            .join('|') + ')(?=[A-Z])'
+    );
 
-    // Matched anywhere in the raw href, query string included. The path list
-    // can't see ucp.php?mode=logout or index.php?action=logout, and a URL
+    // Matched anywhere in the raw href, query string included. A URL
     // carrying a per-user CSRF token (HN auth=, phpBB sid=/hash=, WordPress
     // _wpnonce, Moodle sesskey) is an action link by construction: nobody
     // puts a token on a URL that only reads.
     const SENSITIVE_HREF_SUBSTRINGS = [
         'logout', 'log-out', 'log_out', 'signout', 'sign-out', 'sign_out', 'delete', 'unsubscribe',
         'auth=', 'token=', 'nonce', 'csrf', 'xsrf', 'sesskey', 'sesc=', 'sid=', 'hash=',
-        'mark=', 'action='
+        'mark-all-read', 'markallread', 'logoff', 'log-off', 'log_off', 'signoff', 'sign-off'
     ];
+    // The same verbs as query values: ?action=trash, ?do=vote, ?mode=hide.
+    // This replaces 4.1.0's blanket 'action=', which also refused harmless
+    // pages like Wikipedia's ?action=history and ?action=edit.
+    const SENSITIVE_QUERY_SUBSTRINGS = SENSITIVE_PATH_WORDS.map(word => '=' + word);
+    const SENSITIVE_SUBSTRINGS = SENSITIVE_HREF_SUBSTRINGS.concat(SENSITIVE_QUERY_SUBSTRINGS);
     const SENSITIVE_SUBSTRING_REGEX = new RegExp(
-        SENSITIVE_HREF_SUBSTRINGS.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'),
+        SENSITIVE_SUBSTRINGS.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'),
         'i'
     );
 
     function isSensitiveHref(pathname, rawHref) {
-        return SENSITIVE_HREF_REGEX.test(pathname) || SENSITIVE_SUBSTRING_REGEX.test(rawHref || pathname);
+        return SENSITIVE_HREF_REGEX.test(pathname) || SENSITIVE_CAMEL_REGEX.test(pathname)
+            || SENSITIVE_SUBSTRING_REGEX.test(rawHref || pathname);
     }
 
     // =========================================================================
@@ -334,57 +421,68 @@
 
     function initSpeculationRules() {
         const tier = getConnectionTier();
-        if (!supportsSpeculationRules || tier === TIER_SLOW || knownSpa) return;
+        if (!supportsSpeculationRules || knownSpa) return;
 
         // Path words go through href_matches (segment-anchored, so no
         // href*='order'→border trap); the substring list is deliberately
         // unanchored, because its entries live in the query string.
-        const excludeSelectors = [
+        const baseExcludes = [
             "a[href^='javascript:']",
             "a[href^='mailto:']",
             "a[href^='tel:']",
             "a[href*='download' i]",
-            // BBC marks nav links target="_self" and YouTube target="";
-            // both stay in this tab and are fair game.
-            "a[target]:not([target='']):not([target='_self' i])",
             "a[download]",
             "a[rel~='nofollow']",
             "a[rel~='external']",
             ...DOWNLOAD_EXTENSIONS.map(ext => "a[href$='" + ext + "' i]"),
-            ...SENSITIVE_HREF_SUBSTRINGS.map(s => "a[href*='" + s + "' i]")
-        ].join(', ');
+            ...SENSITIVE_SUBSTRINGS.map(s => "a[href*='" + s + "' i]"),
+            ...SENSITIVE_PATH_SELECTORS
+        ];
+        // BBC marks nav links target="_self" and YouTube target=""; both stay
+        // in this tab and are fair game. A prefetch cannot follow a link into
+        // a new tab, but since Chrome 138 a prerender can, and document rules
+        // read target="_blank" off the link itself.
+        const leavesTab = "a[target]:not([target='']):not([target='_self' i])";
+        const prefetchExcludes = baseExcludes.concat(leavesTab).join(', ');
+        const prerenderExcludes = baseExcludes.concat(chromiumMajor >= NEW_TAB_PRERENDER_CHROME
+            ? leavesTab + ":not([target='_blank' i])"
+            : leavesTab).join(', ');
 
-        const eligibleLinks = {
+        const sameOriginLinks = excludes => ({
             and: [
                 { href_matches: '/*' },
-                { not: { href_matches: SENSITIVE_PATH_PATTERNS } },
-                { not: { selector_matches: excludeSelectors } }
+                { not: { selector_matches: excludes } }
             ]
-        };
+        });
 
         // Since Chrome 143 'eager' on a document rule means 10ms of hover on
         // desktop and a short viewport dwell on mobile, two in flight at most
-        // (FIFO). That is intent-gated and bounded, so it is safe on any tier
-        // the script speculates on at all. Before 143 it meant "every link on
-        // the page, now", so older builds keep the 200ms hover of 'moderate'.
+        // (FIFO). Before 143 it meant "every link on the page, now", so older
+        // builds keep the 200ms hover of 'moderate'. On a slow or data-saver
+        // connection nothing fires on hover, but pointerdown still does: by
+        // then the click is ~100ms away and will spend those bytes anyway.
+        const hoverEagerness = tier === TIER_SLOW
+            ? 'conservative'
+            : (chromiumMajor >= 143 ? 'eager' : 'moderate');
+
         const rules = {
             prefetch: [
                 {
-                    where: eligibleLinks,
-                    eagerness: chromiumMajor >= 143 ? 'eager' : 'moderate',
+                    where: sameOriginLinks(prefetchExcludes),
+                    eagerness: hoverEagerness,
                     expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
                 },
                 // Cross-origin links on pointerdown: the click is usually on
                 // its way, so this buys the gap before it lands. Cross-site
                 // prefetches go without cookies, but a same-site subdomain's
                 // may carry them, and pointerdown is not consent (see Part 4),
-                // so the action paths are excluded here too, host-agnostic.
+                // so the same exclusions apply; being substring selectors,
+                // they are host-agnostic.
                 {
                     where: {
                         and: [
                             { not: { href_matches: '/*' } },
-                            { not: { href_matches: SENSITIVE_ANY_ORIGIN_PATTERNS } },
-                            { not: { selector_matches: excludeSelectors } }
+                            { not: { selector_matches: prefetchExcludes } }
                         ]
                     },
                     eagerness: 'conservative'
@@ -392,13 +490,13 @@
             ]
         };
 
-        // Prerender downloads *and* executes the target page. That is the right
-        // trade only when the connection can absorb it; on 3g the same budget
-        // is better spent finishing the page the user is actually looking at.
+        // Prerender downloads *and* executes the target page. On hover that is
+        // the right trade only when the connection can absorb a guess; on 3g
+        // Part 4 still prerenders on pointerdown, when it is no longer one.
         if (tier === TIER_FAST) {
             rules.prerender = [
                 {
-                    where: eligibleLinks,
+                    where: sameOriginLinks(prerenderExcludes),
                     eagerness: 'moderate',
                     expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
                 },
@@ -409,8 +507,7 @@
                     where: {
                         and: [
                             { selector_matches: "a[rel~='next']" },
-                            { not: { selector_matches: excludeSelectors } },
-                            { not: { href_matches: SENSITIVE_PATH_PATTERNS } }
+                            { not: { selector_matches: prerenderExcludes } }
                         ]
                     },
                     eagerness: 'immediate',
@@ -499,8 +596,12 @@
     if (isTopFrame) runWhenDomReady(initPreconnectOnIntent);
 
     // =========================================================================
-    // Part 4: pointerdown prefetch supplement (Chrome gaps / older builds)
+    // Part 4: pointerdown warming (every tier, CSP and Trusted Types fallback)
     // =========================================================================
+
+    function opensNewTab(link) {
+        return (link.getAttribute('target') || '').toLowerCase() === '_blank';
+    }
 
     // A same-origin link this script would warm. Shared with the outcome
     // counter in Part 6, which only scores clicks on links like these.
@@ -519,13 +620,24 @@
         // or a drag off the link, means the user never agreed to this GET.
         if (isSensitiveHref(url.pathname, href) || /download/i.test(href)) return false;
         const target = (link.getAttribute('target') || '').toLowerCase();
-        if ((target && target !== '_self') || link.download || /\b(?:nofollow|external)\b/i.test(link.rel || '')) return false;
+        if (target === '_blank') {
+            // Only a prerender can follow a link into a new tab, and only on
+            // Chrome 138+; on a slow link nothing here prerenders.
+            if (chromiumMajor < NEW_TAB_PRERENDER_CHROME || getConnectionTier() === TIER_SLOW) return false;
+        } else if (target && target !== '_self') {
+            return false;
+        }
+        // .download is "" for a bare <a download>, so ask for the attribute.
+        if (link.getAttribute('download') !== null || /\b(?:nofollow|external)\b/i.test(link.rel || '')) return false;
 
         return true;
     }
 
+    // Runs on every tier. A pointerdown is ~100ms ahead of the click it
+    // starts, so what it fetches is what the click would have fetched:
+    // almost no waste even on a slow or data-saver connection, where the
+    // hover rules in Part 2 are off.
     function initPointerdownPrefetch() {
-        if (getConnectionTier() === TIER_SLOW) return;
 
         // Deliberately not a growing memo of every link ever warmed: only one
         // speculation is installed at a time, and removing a rules script
@@ -540,12 +652,18 @@
         // an ambiguous record: a link warmed by a speculation rule that CSP
         // then blocked looks identical to one that is genuinely warm.
         let currentMethod = null;
+        let currentNewTab = false;
 
         // Inline speculation-rules scripts need CSP 'inline-speculation-rules'.
         // On a strict-CSP origin every pointerdown would otherwise be a blocked
         // script plus a violation report, with no fallback ever reached.
         document.addEventListener('securitypolicyviolation', event => {
-            if (event && typeof event.violatedDirective === 'string'
+            // A report-only policy blocks nothing, and a violation for some
+            // other script says nothing about inline rules; either used to
+            // switch pointerdown to the weaker hint path for good.
+            if (!event || event.disposition === 'report') return;
+            if (event.blockedURI && event.blockedURI !== 'inline') return;
+            if (typeof event.violatedDirective === 'string'
                 && event.violatedDirective.indexOf('script-src') === 0) {
                 const first = !rulesBlocked;
                 rulesBlocked = true;
@@ -558,20 +676,26 @@
                     const href = currentHref;
                     currentHref = null;
                     currentMethod = null;
-                    warm(href);
+                    warm(href, currentNewTab);
                 }
             }
         });
 
         // A URL-scoped speculation rule beats <link rel=prefetch> here: the
-        // navigation consults the speculation-rules prefetch cache, and on a
-        // fast link prerender hands over an already-rendered page instead of
-        // just bytes. Only one is kept alive at a time — Chrome caps concurrent
-        // prerenders, and a rule for a link the user moved past is pure cost.
-        function speculate(href) {
-            const action = getConnectionTier() === TIER_FAST ? 'prerender' : 'prefetch';
+        // navigation consults the speculation-rules prefetch cache, and
+        // prerender hands over an already-rendered page instead of just
+        // bytes. Prerender on 3g too: the page's subresources are about to
+        // load anyway. Only one is kept alive at a time — Chrome caps
+        // concurrent prerenders, and a rule for a link the user moved past is
+        // pure cost.
+        function speculate(href, newTab) {
+            const action = getConnectionTier() === TIER_SLOW ? 'prefetch' : 'prerender';
+            const rule = { urls: [href], eagerness: 'immediate' };
+            // List rules can't read the link's target the way document rules
+            // do, so a new-tab prerender has to say where it will activate.
+            if (newTab) rule.target_hint = '_blank';
             const rules = {};
-            rules[action] = [{ urls: [href], eagerness: 'immediate' }];
+            rules[action] = [rule];
 
             const script = makeRulesScript(rules);
 
@@ -590,7 +714,9 @@
             currentHint = hint;
         }
 
-        function warm(href) {
+        // A <link rel=prefetch> lands in the HTTP cache, which a new tab on
+        // the same site shares, so the hint path serves new-tab links too.
+        function warm(href, newTab) {
             const method = (supportsSpeculationRules && !rulesBlocked) ? 'rules' : 'hint';
             // Re-warming the same href is a no-op only while the mechanism
             // stays the same. Once CSP has ruled speculation rules out, the
@@ -599,9 +725,10 @@
             if (currentHref === href && currentMethod === method) return;
             currentHref = href;
             currentMethod = method;
+            currentNewTab = newTab;
 
             try {
-                if (method === 'rules') speculate(href);
+                if (method === 'rules') speculate(href, newTab);
                 else prefetchHint(href);
             } catch (_) {
                 // makeRulesScript throws only when Trusted Types refuses the
@@ -621,7 +748,7 @@
             if (knownSpa) return;
             if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
             const link = getClosestLinkTarget(e.target);
-            if (isSpeculableLink(link)) warm(link.href);
+            if (isSpeculableLink(link)) warm(link.href, opensNewTab(link));
         }, { passive: true, capture: true });
     }
 
@@ -630,6 +757,8 @@
     // =========================================================================
     // Part 5: font-display swap injection
     // =========================================================================
+
+    const ICON_FONT_FAMILY = /icon|awesome|glyph|symbol|fontello|icomoon|material|dashicons|octicon|feather|ionic|remixicon/i;
 
     function initFontDisplaySwap() {
         if (typeof CSSFontFaceRule === 'undefined') return;
@@ -646,9 +775,13 @@
                 if (!rules) return false;
 
                 for (const rule of rules) {
-                    if (rule instanceof CSSFontFaceRule && !rule.style.fontDisplay) {
-                        rule.style.fontDisplay = displayValue;
-                    }
+                    if (!(rule instanceof CSSFontFaceRule) || rule.style.fontDisplay) continue;
+                    // An icon font has no readable fallback: 'swap' flashes
+                    // ligature text or empty boxes, and 'optional' on a slow
+                    // link can leave the hamburger menu blank all visit
+                    // (Font Awesome 4.7, Glyphicons declare no display).
+                    if (ICON_FONT_FAMILY.test(rule.style.getPropertyValue('font-family'))) continue;
+                    rule.style.fontDisplay = displayValue;
                 }
 
                 return true;
@@ -913,8 +1046,21 @@
     // A router answering a link click is the SPA signature. A push that no
     // click preceded is something else: Wikipedia's replaceState redirect
     // fixups, or a news page rewriting its URL as you scroll.
-    const LINK_CLICK_WINDOW_MS = 1000;
+    // The pushed URL must also be the clicked link's: Jetpack's infinite
+    // scroll pushes /page/2/ right after a click on an in-page #anchor, and
+    // that is not a router answering the click. Matching the URL is what
+    // lets the window be wide enough for routers that push only after their
+    // data arrives (Next.js app router, Turbo) on a slow response.
+    const LINK_CLICK_WINDOW_MS = 5000;
     let lastLinkClickAt = 0;
+    let lastLinkClickHref = null;
+
+    function withoutHash(href) {
+        const url = toUrl(href);
+        if (!url) return null;
+        url.hash = '';
+        return url.href;
+    }
 
     function installRouteWatcher() {
         if (routeWatcherInstalled) return;
@@ -922,7 +1068,10 @@
 
         // Capture on document runs before the router's own click handler.
         document.addEventListener('click', event => {
-            if (getClosestLinkTarget(event.target)) lastLinkClickAt = Date.now();
+            const link = getClosestLinkTarget(event.target);
+            if (!link) return;
+            lastLinkClickAt = Date.now();
+            lastLinkClickHref = withoutHash(link.href);
         }, { passive: true, capture: true });
 
         // Deferred a turn: pushState updates location *before* returning, but
@@ -931,7 +1080,8 @@
         // What kind of change it was is captured now, though, while the click
         // that caused it is still recent.
         const fire = push => {
-            const info = { push, afterLinkClick: Date.now() - lastLinkClickAt < LINK_CLICK_WINDOW_MS };
+            const recent = Date.now() - lastLinkClickAt < LINK_CLICK_WINDOW_MS;
+            const info = { push, clickedHref: recent ? lastLinkClickHref : null };
             setTimeout(() => {
                 for (const handler of routeChangeHandlers) {
                     try {
@@ -993,7 +1143,8 @@
             const next = pageKey();
             if (next === lastRoute) return;
             lastRoute = next;
-            if (!info || !info.push || !info.afterLinkClick) return;
+            if (!info || !info.push || !info.clickedHref) return;
+            if (info.clickedHref !== withoutHash(location.href)) return;
 
             // Kept alive by use and aged out like everything else, so a site
             // that drops its client-side router gets speculation back.
@@ -1055,7 +1206,7 @@
 
     function initOutcomeMarker() {
         document.addEventListener('click', event => {
-            if (knownSpa || !supportsSpeculationRules || getConnectionTier() === TIER_SLOW) return;
+            if (knownSpa || !supportsSpeculationRules) return;
             // Modified clicks open a new tab or window: not this navigation.
             if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
             const link = getClosestLinkTarget(event.target);
@@ -1268,9 +1419,15 @@
             const observer = new PerformanceObserver(list => {
                 for (const entry of list.getEntries()) {
                     // LCP is reported repeatedly as larger candidates appear;
-                    // the final one wins. Text LCP has no url — nothing to
-                    // preload there, so those entries are ignored.
-                    if (!entry || !entry.url) continue;
+                    // the final one wins. Text LCP has no url and nothing to
+                    // preload — but it does replace an earlier image: a logo
+                    // that painted first and then lost to a headline is not
+                    // the hero, and used to be recorded as one.
+                    if (!entry) continue;
+                    if (!entry.url) {
+                        pending = null;
+                        continue;
+                    }
 
                     // Snapshot now, not at persist time: entry.element is null
                     // once the element leaves the document, which is routine for
@@ -1278,12 +1435,21 @@
                     // as null then is exactly the CORS-mode mismatch that turns
                     // the preload into a second full download.
                     const element = entry.element;
+                    // Inside <picture>, the browser chose entry.url from a
+                    // <source> (often AVIF or WebP). The <img>'s own srcset is
+                    // only the fallback, so replaying it would preload a JPEG
+                    // the page never uses; preload the exact URL instead.
+                    const inPicture = Boolean(element && element.parentElement
+                        && element.parentElement.tagName === 'PICTURE');
+                    const readAttr = name => (!inPicture && element && element.getAttribute)
+                        ? element.getAttribute(name)
+                        : null;
                     pending = {
                         url: entry.url,
                         startTime: entry.startTime,
                         cors: (element && element.crossOrigin) || null,
-                        srcset: (element && element.getAttribute) ? element.getAttribute('srcset') : null,
-                        sizes: (element && element.getAttribute) ? element.getAttribute('sizes') : null,
+                        srcset: readAttr('srcset'),
+                        sizes: readAttr('sizes'),
                         // Bound to the route that was current when the hero
                         // painted. Reading location.pathname at persist time is
                         // what used to file an SPA's hero under the wrong page.
@@ -1343,7 +1509,8 @@
 
             const vitals = readStore(LEARN_VITALS_KEY) || {};
             const samples = Array.isArray(vitals.lcp) ? vitals.lcp.filter(Number.isFinite) : [];
-            samples.push(Math.round(observed.startTime));
+            // A prerendered page's clock starts at prerender, not arrival.
+            samples.push(Math.round(Math.max(0, observed.startTime - navigationActivationStart())));
             writeStore(LEARN_VITALS_KEY, { lcp: samples.slice(-LEARN_VITALS_SAMPLES) });
         }
 
@@ -1413,6 +1580,15 @@
         // Activation of a prerendered document is the moment the user really
         // arrives; the settle clock starts from here. Never fires otherwise.
         document.addEventListener('prerenderingchange', scheduleSettle, { once: true });
+    }
+
+    function navigationActivationStart() {
+        try {
+            const nav = performance.getEntriesByType('navigation')[0];
+            return (nav && Number(nav.activationStart)) || 0;
+        } catch (_) {
+            return 0;
+        }
     }
 
     function persistOrigins() {
@@ -1534,6 +1710,12 @@
     // one real navigation earns a prefetch, and it takes two for a prerender.
     const TRANSITION_PREFETCH_CONFIDENCE = 1;
     const TRANSITION_PRERENDER_CONFIDENCE = 2;
+    // Chrome allows 10 immediate prerenders and 50 immediate prefetches per
+    // page; these stay far under that, since each prerender is a live page
+    // held in memory. On 3g only the strongest guess is prerendered.
+    const PREDICTION_MAX_TARGETS = 3;
+    const PREDICTION_MAX_PRERENDERS_FAST = 2;
+    const PREDICTION_MAX_PRERENDERS_MODERATE = 1;
 
     let predictedTargets = [];
     let currentPredictionScript = null;
@@ -1547,16 +1729,22 @@
         const now = Date.now();
 
         const entry = (store[from] && typeof store[from] === 'object') ? store[from] : { t: {}, at: 0 };
-        const targets = (entry.t && typeof entry.t === 'object') ? entry.t : {};
+        const targets = readTargets(entry, now);
 
-        targets[to] = (Number(targets[to]) || 0) + 1;
+        targets[to] = { n: (targets[to] ? targets[to].n : 0) + 1, at: now };
 
         // Keep only the strongest few targets per source. A page that leads
         // everywhere predicts nothing, and storing its whole fan-out just
-        // spends quota to dilute the ranking.
+        // spends quota to dilute the ranking. The destination just taken
+        // always stays: through 4.1.0 a new one tied at 1 with the incumbents,
+        // sorted last and was cut, so once a page had four targets it could
+        // never learn another, and the source's refreshed timestamp kept the
+        // stale four alive indefinitely.
         const ranked = Object.entries(targets)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, TRANSITION_MAX_TARGETS);
+            .filter(([path]) => path !== to)
+            .sort((a, b) => (b[1].n - a[1].n) || (b[1].at - a[1].at))
+            .slice(0, TRANSITION_MAX_TARGETS - 1);
+        ranked.push([to, targets[to]]);
 
         store[from] = { t: Object.fromEntries(ranked), at: now };
 
@@ -1570,16 +1758,29 @@
         writeStore(LEARN_TRANSITIONS_KEY, Object.fromEntries(live));
     }
 
+    // Targets are { n, at } since 4.2.0. A 4.1.x bare count inherits the
+    // source's timestamp, and each target now ages out on its own.
+    function readTargets(entry, now) {
+        const raw = (entry && entry.t && typeof entry.t === 'object') ? entry.t : {};
+        const targets = {};
+        for (const [path, value] of Object.entries(raw)) {
+            const n = typeof value === 'number' ? value : Number(value && value.n) || 0;
+            const at = typeof value === 'number' ? Number(entry.at) || 0 : Number(value && value.at) || 0;
+            if (n > 0 && now - at < LEARN_MAX_AGE) targets[path] = { n, at };
+        }
+        return targets;
+    }
+
     function predictNext(fromPath) {
         const store = readStore(LEARN_TRANSITIONS_KEY);
         const entry = store && store[String(fromPath || '').slice(0, 200)];
         if (!entry || !entry.t) return [];
 
-        return Object.entries(entry.t)
-            .filter(([, count]) => (Number(count) || 0) >= TRANSITION_PREFETCH_CONFIDENCE)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 2)
-            .map(([path, count]) => ({ path, count: Number(count) || 0 }));
+        return Object.entries(readTargets(entry, Date.now()))
+            .filter(([, target]) => target.n >= TRANSITION_PREFETCH_CONFIDENCE)
+            .sort((a, b) => (b[1].n - a[1].n) || (b[1].at - a[1].at))
+            .slice(0, PREDICTION_MAX_TARGETS)
+            .map(([path, target]) => ({ path, count: target.n }));
     }
 
     function isSpeculationEligible(url) {
@@ -1618,16 +1819,19 @@
         if (!eligible.length) return;
         predictedTargets = eligible;
 
-        // Only the single strongest prediction is prerendered, which is also
-        // why it is allowed on the moderate tier: one background page load
-        // for a destination seen twice is a good trade even on 3G. Chrome
-        // caps concurrent prerenders hard, so anything else is prefetched.
+        // Destinations seen twice are prerendered, the strongest two on a fast
+        // link and one on 3g, where a background page load is still a good
+        // trade for a place the user keeps going. The rest are prefetched.
         const rules = {};
-        const top = eligible[0];
-        const prerenderTop = top.count >= TRANSITION_PRERENDER_CONFIDENCE;
-        if (prerenderTop) rules.prerender = [{ urls: [top.href], eagerness: 'immediate' }];
+        const prerenderBudget = getConnectionTier() === TIER_FAST
+            ? PREDICTION_MAX_PRERENDERS_FAST
+            : PREDICTION_MAX_PRERENDERS_MODERATE;
+        const prerendered = eligible
+            .filter(c => c.count >= TRANSITION_PRERENDER_CONFIDENCE)
+            .slice(0, prerenderBudget);
+        if (prerendered.length) rules.prerender = [{ urls: prerendered.map(c => c.href), eagerness: 'immediate' }];
 
-        const prefetchHrefs = eligible.slice(prerenderTop ? 1 : 0).map(c => c.href);
+        const prefetchHrefs = eligible.filter(c => !prerendered.includes(c)).map(c => c.href);
         if (prefetchHrefs.length) rules.prefetch = [{ urls: prefetchHrefs, eagerness: 'immediate' }];
 
         try {
@@ -1666,9 +1870,10 @@
                 recordTransition(from.pathname, previousRoute);
                 // Same-site link navigations are the ones speculation could
                 // have served, so they are the hit-rate denominator. Skipped
-                // where speculation is off on purpose (SPA, slow link), so
-                // a deliberate "no" doesn't read as a miss.
-                if (supportsSpeculationRules && !knownSpa && getConnectionTier() !== TIER_SLOW) {
+                // where speculation is off on purpose (SPA), so a deliberate
+                // "no" doesn't read as a miss. Slow links count: pointerdown
+                // still speculates there.
+                if (supportsSpeculationRules && !knownSpa) {
                     recordNavigationOutcome(navEntry);
                 }
             }
@@ -1936,7 +2141,7 @@
         } catch (_) {}
 
         if (!supportsSpeculationRules) feature('○', 'Link speculation', 'not supported by this Chrome build');
-        else if (tier === TIER_SLOW) feature('○', 'Link speculation', 'paused — connection is ' + tierName);
+        else if (tier === TIER_SLOW) feature('◐', 'Link speculation', 'on pointerdown only — connection is ' + tierName);
         else if (knownSpa) feature('○', 'Link speculation', SPA_OFF_REASON);
         else feature('●', 'Link speculation', anchors + ' eligible links on this page');
 

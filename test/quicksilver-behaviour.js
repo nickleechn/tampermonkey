@@ -41,6 +41,7 @@ function makeEl(tag) {
 
 const FAST = { effectiveType: '4g', rtt: 80, downlink: 10, saveData: false };
 const MODERATE = { effectiveType: '3g', rtt: 300, downlink: 1.5, saveData: false };
+const SLOW = { effectiveType: '4g', rtt: 80, downlink: 10, saveData: true };
 const SCRIPT_VERSION = (fs.readFileSync(path.join(__dirname, '..', 'Quicksilver.js'), 'utf8')
     .match(/@version\s+(\S+)/) || [])[1];
 
@@ -150,9 +151,9 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
         },
         // `click` presses a link first, the way a router-driven navigation
         // starts; `push: false` models replaceState.
-        navigateTo(p, { push = true, click = false } = {}) {
+        navigateTo(p, { push = true, click = false, clickHref = p } = {}) {
             if (click) {
-                const link = { href: 'https://site.test' + p, getAttribute: () => p };
+                const link = { href: new URL(clickHref, sandbox.location.href).href, getAttribute: () => clickHref };
                 const target = Object.assign(Object.create(sandbox.Element.prototype), { closest: () => link });
                 fire(docListeners, 'click', { target });
             }
@@ -411,8 +412,8 @@ const transOf = h => JSON.parse(h.store.get('tm-qs-transitions::https://site.tes
     check('blanket rules install at DOMContentLoaded, before load', Boolean(blRules));
     check('same-origin prefetch is eager', Boolean(sameOrigin) && sameOrigin.eagerness === 'eager');
     const blText = JSON.stringify(blRules || {});
-    check('declarative excludes cover action verbs at any depth',
-        blText.includes('"/*/vote*"') && blText.includes('"/hide*"'));
+    check('declarative excludes cover action verbs at any depth, case-insensitively',
+        blText.includes("a[href*='/vote' i]") && blText.includes("a[href^='hide' i]"));
     check('declarative excludes cover CSRF-token query strings',
         blText.includes("a[href*='auth=' i]") && blText.includes("a[href*='sesskey' i]"));
     const crossOrigin = blRules && blRules.prefetch.find(r => JSON.stringify(r.where).includes('{"not":{"href_matches":"/*"}}'));
@@ -442,6 +443,16 @@ const transOf = h => JSON.parse(h.store.get('tm-qs-transitions::https://site.tes
     check('pointerdown refuses vote, logout and nonce links', pd.specRules() === '', pd.specRules() || 'nothing installed');
     pd.pointerdown('item?id=1');
     check('pointerdown still warms an ordinary link', pd.specRules().includes('https://site.test/item?id=1'));
+
+    // ---- 4.2.0: lists re-checked against Jev ----------------------------------
+    const warms = href => { pd.head.children.length = 0; pd.pointerdown(href); return pd.specRules() !== ''; };
+    check('refused: /notifications/mark-all-read', !warms('/notifications/mark-all-read'));
+    check('refused: /basket/add and /wishlist/add/12', !warms('/basket/add?item=12') && !warms('/wishlist/add/12'));
+    check('refused: ?do=vote and ?action=trash as query values', !warms('/forum.php?do=vote&id=3') && !warms('/post.php?action=trash&post=9'));
+    check('refused: /delete-account and /logout.php', !warms('/delete-account') && !warms('/logout.php'));
+    check('warmed: Wikipedia ?action=history', warms('/w/index.php?title=X&action=history'));
+    check('warmed: an article slug that starts with a verb', warms('/2025/06/like-a-pro-guide'));
+    check('warmed: a plural index page', warms('/reports/annual-2025'));
 
     // ---- 4.1.0: learned origins and viewport matching ----------------------
     const orig = build({ gm: { 'tm-qs-origins::https://site.test': JSON.stringify({
@@ -489,7 +500,29 @@ const transOf = h => JSON.parse(h.store.get('tm-qs-transitions::https://site.tes
     check('pointerdown warms a target="_self" link', self.specRules().includes('/weather'));
     self.head.children.length = 0;
     self.pointerdown('/elsewhere', { target: '_blank' });
-    check('pointerdown skips a target="_blank" link', self.specRules() === '');
+    check('pointerdown prerenders a target="_blank" link into the new tab',
+        self.specRules().includes('"prerender":[{"urls":["https://site.test/elsewhere"],"eagerness":"immediate","target_hint":"_blank"}]'),
+        self.specRules() || 'nothing installed');
+    self.head.children.length = 0;
+    self.pointerdown('/named', { target: 'preview' });
+    check('pointerdown skips a link into a named window', self.specRules() === '');
+
+    const oldTab = build({ pathname: '/news', chromeVersion: 137 });
+    oldTab.domReady();
+    await wait(20);
+    const oldPrerender = JSON.stringify(oldTab.blanketRules()?.prerender || []);
+    oldTab.head.children.length = 0;
+    oldTab.pointerdown('/elsewhere', { target: '_blank' });
+    check('before Chrome 138, target="_blank" is left alone', oldTab.specRules() === '');
+    check('before Chrome 138, blanket prerender excludes new-tab links',
+        oldPrerender.includes("a[target]:not([target='']):not([target='_self' i])")
+        && !oldPrerender.includes("not([target='_blank' i])"));
+
+    const blNewTab = JSON.stringify(bl.blanketRules() || {});
+    check('Chrome 138+: blanket prerender admits new-tab links, prefetch still skips them',
+        JSON.stringify(bl.blanketRules()?.prerender?.[0] || {}).includes(":not([target='_blank' i])")
+        && !JSON.stringify(bl.blanketRules()?.prefetch?.[0] || {}).includes(":not([target='_blank' i])"),
+        blNewTab.length + ' chars');
 
     // ---- 4.1.0: SPA detection ---------------------------------------------
     const spaKey = 'tm-qs-spa::https://site.test';
@@ -521,6 +554,14 @@ const transOf = h => JSON.parse(h.store.get('tm-qs-transitions::https://site.tes
     legacySpa.navigateTo('/watch', { click: true });
     await wait(40);
     check('pushState fallback also detects the SPA', legacySpa.store.has(spaKey));
+
+    const scrollAfterAnchor = build({ pathname: '/blog/' });
+    scrollAfterAnchor.load();
+    await wait(20);
+    scrollAfterAnchor.navigateTo('/blog/page/2/', { click: true, clickHref: '/blog/#comments' });
+    await wait(40);
+    check('a push to a URL other than the clicked link is not an SPA signal (infinite scroll)',
+        !scrollAfterAnchor.store.has(spaKey));
 
     const known = build({ gm: Object.assign({ [spaKey]: JSON.stringify({ at: Date.now() }) }, seeded({ '/next': 5 })) });
     known.domReady();
@@ -559,18 +600,169 @@ const transOf = h => JSON.parse(h.store.get('tm-qs-transitions::https://site.tes
         const target = Object.assign(Object.create(h.sandbox.Element.prototype), { closest: () => link });
         h.fireDoc('click', { button: 0, target });
     };
-    clickOn(clicker, '/item?id=3', { target: '_blank' });
-    check('a new-tab link leaves no marker', !clicker.store.has('tm-qs-pending-nav::https://site.test'));
+    clickOn(clicker, '/item?id=3', { target: 'preview' });
+    check('a link into a named window leaves no marker', !clicker.store.has('tm-qs-pending-nav::https://site.test'));
+    clickOn(clicker, '/item?id=4', { target: '_blank' });
+    check('a new-tab link leaves a marker (it is prerenderable now)',
+        (clicker.store.get('tm-qs-pending-nav::https://site.test') || '').includes('/item?id=4'));
     clickOn(clicker, '/item?id=3');
     check('an eligible click leaves a marker for the next page',
         (clicker.store.get('tm-qs-pending-nav::https://site.test') || '').includes('https://site.test/item?id=3'));
+
+    // ---- 4.2.0: pointerdown on every tier -----------------------------------
+    const slow = build({ connection: SLOW, pathname: '/news' });
+    slow.domReady();
+    await wait(20);
+    const slowRules = slow.blanketRules();
+    check('slow link: blanket rules still install, pointerdown only',
+        Boolean(slowRules) && slowRules.prefetch.every(r => r.eagerness === 'conservative') && !slowRules.prerender,
+        JSON.stringify(slowRules && slowRules.prefetch.map(r => r.eagerness)));
+    slow.head.children.length = 0;
+    slow.pointerdown('/item?id=9');
+    check('slow link: pointerdown prefetches, never prerenders',
+        slow.specRules().includes('"prefetch":[{"urls":["https://site.test/item?id=9"]') && !slow.specRules().includes('prerender'));
+    slow.head.children.length = 0;
+    slow.pointerdown('/elsewhere', { target: '_blank' });
+    check('slow link: a new-tab link is not warmed (prefetch cannot follow it)', slow.specRules() === '');
+    slow.menu.get('Quicksilver: Status')();
+    check('status says slow links speculate on pointerdown', (slow.alerts[0] || '').includes('on pointerdown only'));
+
+    const modPd = build({ connection: MODERATE, pathname: '/news' });
+    modPd.domReady();
+    await wait(20);
+    modPd.head.children.length = 0;
+    modPd.pointerdown('/item?id=5');
+    check('3g: pointerdown prerenders', modPd.specRules().includes('"prerender":[{"urls":["https://site.test/item?id=5"]'));
+
+    const slowStats = build({ connection: SLOW, referrer: 'https://site.test/list',
+        navEntries: [{ type: 'navigate', activationStart: 0, deliveryType: 'navigational-prefetch' }] });
+    await wait(20);
+    check('slow link: outcomes are counted', (statsOf(slowStats).nav || {}).prefetch === 1);
+
+    // ---- 4.2.0: wider prediction budgets ------------------------------------
+    const three = seeded({ '/a': 4, '/b': 3, '/c': 1 });
+    const pFast = build({ gm: three });
+    pFast.load();
+    await wait(80);
+    const pFastRule = pFast.specRules();
+    check('fast: two strong predictions prerender, the third prefetches',
+        pFastRule.includes('"prerender":[{"urls":["https://site.test/a","https://site.test/b"]')
+        && pFastRule.includes('"prefetch":[{"urls":["https://site.test/c"]'),
+        (pFastRule.match(/\{"prerender":\[\{"urls":[^}]*\}\][^}]*\}/) || [''])[0].slice(0, 160));
+    const pMod = build({ gm: three, connection: MODERATE });
+    pMod.load();
+    await wait(80);
+    const pModRule = pMod.specRules();
+    check('3g: one prediction prerenders, the rest prefetch',
+        pModRule.includes('"prerender":[{"urls":["https://site.test/a"]')
+        && pModRule.includes('"prefetch":[{"urls":["https://site.test/b","https://site.test/c"]'));
+
+    // ---- 4.2.0 review fixes ---------------------------------------------------
+    const rv = build({ pathname: '/home' });
+    rv.domReady();
+    await wait(20);
+    const rvRules = JSON.stringify(rv.blanketRules() || {});
+    const rvWarms = (href, attrs) => { rv.head.children.length = 0; rv.pointerdown(href, attrs); return rv.specRules() !== ''; };
+    check('refused regardless of case: /Account/LogOff, /Cart/Remove/5, /Orders/Cancel/7',
+        !rvWarms('/Account/LogOff') && !rvWarms('/Cart/Remove/5') && !rvWarms('/Orders/Cancel/7'));
+    check('refused: the logoff family (/owa/logoff.owa, /sap/public/bc/icf/logoff)',
+        !rvWarms('/owa/logoff.owa') && !rvWarms('/sap/public/bc/icf/logoff'));
+    check('refused: read-on-view pages (/message/unread/, /notifications)',
+        !rvWarms('/message/unread/') && !rvWarms('/notifications'));
+    check('refused: compound and camelCase actions (/remove-from-cart/5, /cancelOrder, /DeleteItem)',
+        !rvWarms('/remove-from-cart/5') && !rvWarms('/vote-up-comment/5') && !rvWarms('/cancelOrder') && !rvWarms('/DeleteItem?id=3'));
+    check('warmed: WordPress-style slug with trailing slash', rvWarms('/blog/like-a-pro-guide/'));
+    check('refused: a bare <a download>', !rvWarms('/files/export', { download: '' }));
+    check('hover rules exclude mixed-case paths via case-insensitive selectors',
+        rvRules.includes("a[href*='/account' i]") && rvRules.includes("a[href*='/logoff' i]") && !rvRules.includes('/*/'));
+
+    const unreadPrediction = build({ gm: seeded({ '/message/unread/': 5 }) });
+    unreadPrediction.load();
+    await wait(80);
+    check('prediction refuses a read-on-view page', !unreadPrediction.specRules().includes('unread'));
+
+    const now = Date.now();
+    const full = build({ pathname: '/fresh', referrer: 'https://site.test/list', gm: { 'tm-qs-transitions::https://site.test': JSON.stringify({
+        '/list': { t: { '/a': { n: 3, at: now - 1000 }, '/b': { n: 3, at: now - 1000 }, '/c': { n: 3, at: now - 1000 }, '/d': { n: 3, at: now - 1000 } }, at: now - 1000 } }) } });
+    await wait(20);
+    const fullTargets = (transOf(full)['/list'] || {}).t || {};
+    check('a new destination is learned even when four are already stored',
+        Boolean(fullTargets['/fresh']) && Object.keys(fullTargets).length === 4, Object.keys(fullTargets).join(','));
+
+    const staleTargets = build({ gm: { 'tm-qs-transitions::https://site.test': JSON.stringify({
+        '/article': { t: { '/old': { n: 9, at: now - 15 * 24 * 3600 * 1000 }, '/new': { n: 2, at: now } }, at: now } }) } });
+    staleTargets.load();
+    await wait(80);
+    check('targets age out on their own, even while the source stays active',
+        !staleTargets.specRules().includes('/old') && staleTargets.specRules().includes('/new'));
+
+    const legacyCounts = build({ gm: seeded({ '/next': 3 }) });
+    legacyCounts.load();
+    await wait(80);
+    check('4.1.x bare-count targets still predict', legacyCounts.specRules().includes('/next'));
+
+    const textWins = build();
+    textWins.domReady();
+    await wait(20);
+    textWins.emitLcp({ url: 'https://cdn.site.test/logo.png', startTime: 300, element: makeEl('img') });
+    textWins.emitLcp({ url: '', startTime: 900, element: makeEl('h1') });
+    textWins.load();
+    const picture = build({ pathname: '/gallery' });
+    picture.domReady();
+    await wait(20);
+    const pictureImg = makeEl('img');
+    pictureImg.parentElement = { tagName: 'PICTURE' };
+    pictureImg.setAttribute('srcset', 'hero-800.jpg 800w, hero-1600.jpg 1600w');
+    picture.emitLcp({ url: 'https://cdn.site.test/hero-1600.avif', startTime: 700, element: pictureImg });
+    picture.load();
+    const activated = build({ pathname: '/landed', navEntries: [{ type: 'navigate', activationStart: 400 }] });
+    activated.domReady();
+    await wait(20);
+    activated.emitLcp({ url: 'https://cdn.site.test/h.jpg', startTime: 1000, element: makeEl('img') });
+    activated.load();
+    await wait(3400);
+    check('a text LCP that outgrows an earlier logo leaves no hero record', !lcpOf(textWins)['/article']);
+    const pictureRec = lcpOf(picture)['/gallery'];
+    check('a <picture> hero records the exact URL and no fallback srcset',
+        Boolean(pictureRec) && pictureRec.url.endsWith('.avif') && !pictureRec.srcset);
+    const vitalsOf = h => JSON.parse(h.store.get('tm-qs-vitals::https://site.test') || '{}');
+    check('LCP samples are measured from activation', (vitalsOf(activated).lcp || [])[0] === 600,
+        JSON.stringify(vitalsOf(activated).lcp));
+
+    const csp = build({ pathname: '/home' });
+    csp.domReady();
+    await wait(20);
+    csp.fireDoc('securitypolicyviolation', { disposition: 'report', violatedDirective: 'script-src-elem', blockedURI: 'inline' });
+    csp.fireDoc('securitypolicyviolation', { disposition: 'enforce', violatedDirective: 'script-src-elem', blockedURI: 'https://ads.test/x.js' });
+    csp.head.children.length = 0;
+    csp.pointerdown('/item?id=1');
+    check('report-only or unrelated script-src violations keep speculation rules',
+        csp.specRules().includes('prerender'), csp.specRules() || 'no rules');
+    csp.fireDoc('securitypolicyviolation', { disposition: 'enforce', violatedDirective: 'script-src-elem', blockedURI: 'inline' });
+    csp.head.children.length = 0;
+    csp.pointerdown('/item?id=2');
+    check('an enforced inline block still falls back to <link rel=prefetch>',
+        csp.head.children.some(c => c.rel === 'prefetch' && String(c.href).includes('/item?id=2')));
+
+    const fonts = build();
+    const fontRule = family => Object.assign(Object.create(fonts.sandbox.CSSFontFaceRule.prototype), {
+        style: { fontDisplay: '', getPropertyValue: k => (k === 'font-family' ? family : '') } });
+    const iconRule = fontRule('"FontAwesome"');
+    const textRule = fontRule('"Inter"');
+    fonts.sandbox.document.styleSheets.push({ cssRules: [iconRule, textRule] });
+    fonts.domReady();
+    await wait(20);
+    check('font-display is set on text fonts but not on icon fonts',
+        textRule.style.fontDisplay === 'swap' && iconRule.style.fontDisplay === '');
+
+    check('the script declares @noframes', /\/\/ @noframes/.test(fs.readFileSync(path.join(__dirname, '..', 'Quicksilver.js'), 'utf8')));
 
     const old = build({ chromeVersion: 140 });
     old.domReady();
     await wait(20);
     check('before Chrome 143, same-origin prefetch stays moderate', old.blanketRules()?.prefetch[0].eagerness === 'moderate');
     const crossText = JSON.stringify(bl.blanketRules()?.prefetch[1] || {});
-    check('cross-origin rule excludes action paths on any host', crossText.includes('"*://*/*/vote*"'));
+    check('cross-origin rule excludes action paths on any host', crossText.includes("a[href*='/vote' i]"));
     check('all-sites totals are kept alongside', JSON.parse(miss.store.get('tm-qs-stats-all') || '{}').nav?.miss === 1);
 
     const typed = build({ navEntries: [{ type: 'navigate' }] });
