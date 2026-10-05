@@ -17,6 +17,12 @@
 // left alone, the origin gate and budget, and hero hit-rate scoring. It also
 // stubs the three APIs this build now feature-detects — LCP, the Navigation
 // API and <link rel=prefetch> — and checks each is used when present.
+//
+// 1.2.0 (Safari 27): Speculation Rules prefetch where the feature flag is on —
+// on press without the toggle, on every tier, for learned next pages, never
+// for action links or known SPAs, through a Trusted Types policy when the
+// page enforces them, and falling back to the opt-in path under a strict CSP;
+// and sizes="auto" never replayed into a preload.
 const vm = require('vm');
 const fs = require('fs');
 const path = require('path');
@@ -42,8 +48,15 @@ function makeEl(tag) {
         getAttribute(k) { return k in this.attributes ? this.attributes[k] : null; },
         hasAttribute(k) { return k in this.attributes; },
         removeAttribute(k) { delete this.attributes[k]; },
-        addEventListener() {}, removeEventListener() {}, remove() {},
-        appendChild(c) { this.children.push(c); return c; },
+        addEventListener() {}, removeEventListener() {},
+        // Detaches for real, so "one rule replaces the last" is observable.
+        remove() {
+            if (!this.parentNode) return;
+            const siblings = this.parentNode.children;
+            if (siblings.indexOf(this) >= 0) siblings.splice(siblings.indexOf(this), 1);
+            this.parentNode = null;
+        },
+        appendChild(c) { this.children.push(c); c.parentNode = this; return c; },
         attachShadow() { this.shadowRoot = makeEl('shadow-root'); return this.shadowRoot; },
         querySelectorAll: () => [], querySelector: () => null, closest: () => null,
         matches: () => false,
@@ -77,7 +90,10 @@ function build({
     readyState = 'loading',
     // The three APIs 1.1.0 feature-detects, each absent unless asked for.
     lcpEntries = null, navigationApi = false, linkPrefetch = false,
-    innerWidth = 1280, devicePixelRatio = 2
+    innerWidth = 1280, devicePixelRatio = 2,
+    // Safari 26.2+ with the Speculation Rules feature flag switched on, and a
+    // page that requires Trusted Types (YouTube does).
+    speculationRules = false, trustedTypesEnforced = false
 } = {}) {
     const winListeners = new Map();
     const docListeners = new Map();
@@ -100,6 +116,16 @@ function build({
             const el = makeEl(tag);
             if (String(tag).toLowerCase() === 'link') {
                 el.relList = { supports: type => linkPrefetch && type === 'prefetch' };
+            }
+            if (String(tag).toLowerCase() === 'script' && trustedTypesEnforced) {
+                let text = '';
+                Object.defineProperty(el, 'textContent', {
+                    get: () => text,
+                    set: value => {
+                        if (typeof value === 'string') throw new TypeError('This document requires TrustedScript assignment.');
+                        text = String(value);
+                    }
+                });
             }
             return el;
         },
@@ -159,6 +185,18 @@ function build({
     if (navigationApi) {
         window.navigation = { addEventListener: (t, f) => add(navListeners, t, f) };
     }
+    if (speculationRules) {
+        window.HTMLScriptElement = { supports: type => type === 'speculationrules' };
+    }
+    const policies = [];
+    if (trustedTypesEnforced) {
+        window.trustedTypes = {
+            createPolicy: (name, rules) => {
+                policies.push(name);
+                return { createScript: text => ({ toString: () => rules.createScript(text) }) };
+            }
+        };
+    }
 
     if (asyncGm) {
         window.GM = {
@@ -195,7 +233,13 @@ function build({
 
     return {
         window, document, head, store, menu, images, winListeners, docListeners, fire, drain,
-        fetches, intervals,
+        fetches, intervals, policies,
+        rules(kind) {
+            return head.children
+                .filter(c => c.type === 'speculationrules')
+                .map(c => JSON.parse(c.textContent))
+                .filter(r => !kind || r[kind]);
+        },
         // A link the script's `instanceof Element` check accepts.
         link(href, attrs = {}) {
             const el = Object.create(window.Element.prototype);
@@ -820,6 +864,152 @@ function heroRecord(seen, url = 'https://cdn.example.com/hero.jpg', viewport = '
     env2.fire(env2.winListeners, 'DOMContentLoaded');
     check('a text font gets a non-blocking font-display', textRule.style.fontDisplay === 'swap');
     check('an icon font keeps its blocking one', iconRule.style.fontDisplay === '');
+
+    console.log('\nSpeculation Rules prefetch (Safari 27, feature flag on)');
+
+    const SLOW_NET = { 'tm-qs-net': JSON.stringify({ s: [0, 1, 2].map(() => ({ t: 1400, at: Date.now() })) }) };
+
+    env2 = build({ speculationRules: true });
+    await env2.settled();
+    env2.press(env2.link('/blog/next-post'));
+    let pressRules = env2.rules('prefetch');
+    check('a press prefetches through speculation rules, no toggle needed',
+        pressRules.length === 1 && pressRules[0].prefetch[0].urls[0] === 'https://example.com/blog/next-post'
+        && env2.fetches.length === 0, JSON.stringify(pressRules));
+    check('as a list rule WebKit accepts, prefetch only',
+        pressRules.length === 1 && pressRules[0].prefetch[0].source === 'list' && !pressRules[0].prerender);
+
+    env2.press(env2.link('/blog/another-post'));
+    pressRules = env2.rules('prefetch');
+    check('a second press replaces the first rule rather than adding to it',
+        pressRules.length === 1 && pressRules[0].prefetch[0].urls[0] === 'https://example.com/blog/another-post',
+        pressRules.length + ' rule scripts');
+
+    env2 = build({ speculationRules: true });
+    await env2.settled();
+    env2.press(env2.link('/vote?id=1&how=up&auth=abc123'));
+    env2.press(env2.link('/Account/LogOff'));
+    check('action links are refused on this path too', env2.rules().length === 0);
+
+    env2 = build({ speculationRules: true, gm: SLOW_NET });
+    await env2.settled();
+    env2.press(env2.link('/blog/next-post'));
+    check('a press prefetches on a slow link too: it is the navigation, early',
+        env2.rules('prefetch').length === 1);
+
+    env2 = build({
+        speculationRules: true,
+        gm: { 'tm-qs-spa::https://example.com': JSON.stringify({ at: Date.now() }) }
+    });
+    await env2.settled();
+    env2.press(env2.link('/blog/next-post'));
+    check('a known SPA gets no speculation', env2.rules().length === 0);
+
+    env2 = build({
+        speculationRules: true,
+        gm: {
+            'tm-qs-transitions::https://example.com': JSON.stringify({
+                '/article': { t: { '/next': { n: 2, at: Date.now() }, '/rare': { n: 1, at: Date.now() } }, at: Date.now() }
+            })
+        }
+    });
+    await env2.settled();
+    env2.load();
+    const predicted = env2.rules('prefetch');
+    check('a learned next page is prefetched once seen twice',
+        predicted.length === 1 && predicted[0].prefetch[0].urls.join() === 'https://example.com/next',
+        JSON.stringify(predicted));
+
+    env2 = build({ speculationRules: true, trustedTypesEnforced: true });
+    await env2.settled();
+    env2.press(env2.link('/blog/next-post'));
+    pressRules = env2.rules('prefetch');
+    check('a page enforcing Trusted Types still gets its rule, through a private policy',
+        pressRules.length === 1 && env2.policies.includes('quicksilver'), JSON.stringify(env2.policies));
+
+    env2 = build({ speculationRules: true, gm: WARM_ON });
+    await env2.settled();
+    env2.press(env2.link('/blog/next-post'));
+    check('with rules on, the fetch() path stands down', env2.fetches.length === 0 && env2.rules().length === 1);
+    env2.fire(env2.docListeners, 'securitypolicyviolation',
+        { disposition: 'enforce', blockedURI: 'inline', violatedDirective: 'script-src-elem' });
+    check('a CSP block removes the rule and re-warms the pressed link the opt-in way',
+        env2.rules().length === 0 && env2.fetches.join() === 'https://example.com/blog/next-post',
+        JSON.stringify(env2.fetches));
+    env2.press(env2.link('/blog/third-post'));
+    check('and later presses use the opt-in path', env2.fetches.length === 2 && env2.rules().length === 0);
+
+    env2 = build({ speculationRules: true, gm: WARM_ON });
+    await env2.settled();
+    env2.press(env2.link('/blog/next-post'));
+    env2.fire(env2.docListeners, 'securitypolicyviolation',
+        { disposition: 'report', blockedURI: 'inline', violatedDirective: 'script-src-elem' });
+    check('a report-only violation blocks nothing', env2.rules().length === 1 && env2.fetches.length === 0);
+
+    env2 = build();
+    await env2.settled();
+    env2.press(env2.link('/blog/next-post'));
+    check('without the flag nothing speculates and nothing is fetched unasked',
+        env2.rules().length === 0 && env2.fetches.length === 0);
+
+    env2 = build({ speculationRules: true });
+    await env2.settled();
+    let specStatusThrew = null;
+    try {
+        env2.menu.get('Quicksilver: Status')();
+    } catch (error) {
+        specStatusThrew = error;
+    }
+    const specHost = env2.document.body.children[env2.document.body.children.length - 1];
+    const specText = specHost.shadowRoot.children
+        .map(child => (child.children || []).map(c => c.textContent || '').join(' ')).join(' ');
+    check('status reports prefetch on press', specStatusThrew === null && specText.includes('Prefetch on press'));
+
+    console.log('\nsizes="auto" (Safari 27)');
+
+    const responsive = (sizes) => {
+        const img = makeImage(1200, 600, 100, 'https://example.com/hero-1600.jpg');
+        img.attributes.srcset = 'https://example.com/hero-800.jpg 800w, https://example.com/hero-1600.jpg 1600w';
+        img.attributes.sizes = sizes;
+        return img;
+    };
+
+    env2 = build({ images: [responsive('auto, (max-width: 600px) 100vw, 50vw')] });
+    await env2.settled();
+    env2.load();
+    learned = env2.read('tm-qs-lcp')['/article'];
+    check('"auto" is dropped and the author\'s fallback list is kept',
+        learned.sizes === '(max-width: 600px) 100vw, 50vw' && Boolean(learned.srcset), JSON.stringify(learned.sizes));
+
+    env2 = build({ images: [responsive('auto')] });
+    await env2.settled();
+    env2.load();
+    learned = env2.read('tm-qs-lcp')['/article'];
+    check('a bare "auto" is not replayable, so the exact URL is recorded',
+        learned.srcset === null && learned.sizes === null && learned.url === 'https://example.com/hero-1600.jpg',
+        JSON.stringify(learned));
+
+    const autoRecord = dpr => ({
+        'tm-qs-lcp::https://example.com': JSON.stringify({
+            '/article': {
+                url: 'https://cdn.example.com/hero-1600.jpg',
+                srcset: 'https://cdn.example.com/hero-800.jpg 800w, https://cdn.example.com/hero-1600.jpg 1600w',
+                sizes: 'auto', vw: 1280, dpr, at: Date.now(), seen: 3
+            }
+        })
+    });
+    env2 = build({ gm: autoRecord(2) });
+    await env2.settled();
+    const autoPreload = env2.head.children.find(c => c.rel === 'preload');
+    check('a record learned before 1.2.0 preloads its exact URL, never imagesizes="auto"',
+        Boolean(autoPreload) && !('imagesrcset' in autoPreload.attributes) && !('imagesizes' in autoPreload.attributes)
+        && autoPreload.href === 'https://cdn.example.com/hero-1600.jpg',
+        autoPreload ? JSON.stringify(autoPreload.attributes) : 'no preload');
+
+    env2 = build({ gm: autoRecord(1) });
+    await env2.settled();
+    check('and, being density-specific, only at the density it was learned at',
+        !env2.head.children.some(c => c.rel === 'preload'));
 
     const failed = results.filter(([, ok]) => !ok);
     console.log('');

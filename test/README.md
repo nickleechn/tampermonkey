@@ -40,6 +40,15 @@ present and that the 1.0 fallback runs when it is not. Run against 1.0.1,
 23 checks fail before the suite stops at the all-sites hit-rate tally, which
 1.0.1 never writes.
 
+1.2.0 (Safari 27) adds Speculation Rules prefetch, which WebKit ships behind a
+feature flag: a press prefetches through a list rule without the opt-in
+toggle and on every tier, one rule replaces the last, learned next pages are
+prefetched, action links and known SPAs are refused, a Trusted Types page
+gets its rule through a private policy, and an enforced (not report-only) CSP
+block hands the pressed link to the opt-in path. It also checks that Safari
+27's `sizes="auto"` is never replayed into a preload. 13 of those 18 checks
+fail against 1.1.0; the other five assert refusals 1.1.0 already made.
+
 No browser required.
 
 ## `supertube-safari-behaviour.js` — headless, current

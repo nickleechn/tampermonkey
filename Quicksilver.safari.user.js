@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quicksilver Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.1.0
-// @description  Safari/WebKit build: learned hero preload (LCP where WebKit reports it, geometry otherwise) + critical-origin preconnect, hover/focus preconnect, learned connection tiering, navigation-transition learning, SPA detection, media priority hints, font-display patching and opt-in content-visibility. No Speculation Rules — WebKit has none.
+// @version      1.2.0
+// @description  Safari/WebKit build: learned hero preload (LCP where WebKit reports it, geometry otherwise) + critical-origin preconnect, hover/focus preconnect, learned connection tiering, navigation-transition learning, SPA detection, Speculation Rules prefetch where Safari has it switched on, media priority hints, font-display patching and opt-in content-visibility.
 // @author       nickleechn
 // @match        *://*/*
 // @inject-into  content
@@ -19,6 +19,29 @@
 // @downloadURL  https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.safari.user.js
 // ==/UserScript==
 
+// 1.2.0 — tuned for Safari 27 on macOS.
+//
+// - Speculation Rules. WebKit has a prefetch implementation (since 26.2),
+//   still off by default in 27.0 and switched on from Develop > Feature
+//   Flags. Where HTMLScriptElement.supports() says it is on, pressed links
+//   and learned next pages are prefetched through it — on by default, with
+//   no per-origin toggle, because nothing that made fetch() warming opt-in
+//   applies: per spec the request is marked Sec-Purpose: prefetch, and the
+//   navigation uses the response whether or not it was cacheable. Same action-link
+//   filter, same SPA switch-off, prefetch only (WebKit has no prerender),
+//   Trusted Types-safe (Safari 26 enforces them, YouTube requires them),
+//   and a strict CSP falls back to the opt-in path.
+// - sizes="auto" (new in 27.0, for lazy images) means "use my layout box".
+//   A preload has none, so replaying it as imagesizes fell back to 100vw and
+//   preloaded a bigger candidate than the <img> takes — two downloads. The
+//   author's fallback list is kept; with none, the exact URL is preloaded.
+// - LCP and the Navigation API shipped in Safari 26.2, so on 27 the 1.1.0
+//   feature probes take the measured-LCP and event-driven paths; geometry
+//   and polling are now only the fallback for older Safari.
+// - Scroll anchoring (27.0) keeps the page still while content-visibility
+//   sections are measured, which removes one of the opt-in's costs. The
+//   others (sticky headers, clipped popovers) remain, so it stays opt-in.
+//
 // 1.1.0 — brought up to the Chrome build's 4.2.0, where WebKit allows it.
 //
 // From Chrome 4.1.0 and 4.2.0, unchanged in substance:
@@ -45,7 +68,7 @@
 // - Status reports how often the hero preload was the hero that painted.
 //
 // Feature-detected rather than assumed absent, because WebKit has been
-// closing these gaps (LCP and the Navigation API were Interop 2025 targets):
+// closing these gaps (LCP and the Navigation API shipped in Safari 26.2):
 // - Where WebKit reports largest-contentful-paint, the hero is the measured
 //   LCP and the gate drops to Chrome's two sightings. Geometry remains the
 //   fallback, and is still what learns routes reached by a client-side
@@ -120,7 +143,7 @@
     // =========================================================================
 
     // Matches @version; the status panel reported 1.0.0 all through 1.0.1.
-    const SCRIPT_VERSION = '1.1.0';
+    const SCRIPT_VERSION = '1.2.0';
 
     const SECOND = 1000;
     const MINUTE = 60 * SECOND;
@@ -167,6 +190,51 @@
             return false;
         }
     })();
+    // WebKit has had a Speculation Rules prefetch implementation since 26.2,
+    // off by default through 27.0 and switched on from Develop > Feature
+    // Flags. supports() answers for the flag, so this is true exactly when
+    // the user (or a later Safari) has turned it on.
+    const supportsSpeculationRules = (() => {
+        try {
+            return typeof HTMLScriptElement !== 'undefined'
+                && typeof HTMLScriptElement.supports === 'function'
+                && HTMLScriptElement.supports('speculationrules');
+        } catch (_) {
+            return false;
+        }
+    })();
+
+    // Safari 26 enforces Trusted Types, and a page that requires them (YouTube)
+    // rejects a plain string assigned to a script's text — WebKit has applied
+    // that to extension content scripts too. The pass-through policy never
+    // leaves this closure and only ever sees JSON built by this script.
+    let trustedScriptPolicy;
+
+    function makeRulesScript(rules) {
+        const script = document.createElement('script');
+        script.type = 'speculationrules';
+        const text = JSON.stringify(rules);
+
+        try {
+            script.textContent = text;
+        } catch (error) {
+            // Compared by name: the error comes from the page's realm, not
+            // this script's, so instanceof would miss it.
+            if (!error || error.name !== 'TypeError' || typeof trustedTypes === 'undefined') throw error;
+            if (trustedScriptPolicy === undefined) {
+                try {
+                    trustedScriptPolicy = trustedTypes.createPolicy('quicksilver', { createScript: s => s });
+                } catch (_) {
+                    // A trusted-types directive that doesn't list our name.
+                    trustedScriptPolicy = null;
+                }
+            }
+            if (!trustedScriptPolicy) throw error;
+            script.textContent = trustedScriptPolicy.createScript(text);
+        }
+
+        return script;
+    }
 
     const TIER_SLOW = 1;
     const TIER_MODERATE = 2;
@@ -795,6 +863,38 @@
         return { width: Number(record.vw), dpr: Number(record.dpr) };
     }
 
+    // Safari 27 supports sizes="auto" on lazy images: "use my layout box".
+    // A preload has no box, so imagesizes ignores the keyword and falls back
+    // to 100vw — a bigger candidate than the <img> will take, downloaded as
+    // well as the right one. An author's fallback after "auto," is kept;
+    // with nothing after it, false says the srcset cannot be replayed.
+    function withoutAutoSizes(sizes) {
+        if (typeof sizes !== 'string') return sizes || null;
+        const match = /^\s*auto\s*(?:,|$)/i.exec(sizes);
+        if (!match) return sizes;
+        return sizes.slice(match[0].length).trim() || false;
+    }
+
+    // What a preload can faithfully replay of an image's responsive markup.
+    // Inside <picture> the browser chose from a <source>, often AVIF or WebP;
+    // the <img>'s own srcset is only the fallback, so replaying it would
+    // preload a JPEG the page never uses. Either way, nothing replayable
+    // means the exact URL that painted is preloaded instead.
+    function replayableSourceSet(element) {
+        const none = { srcset: null, sizes: null };
+        if (!element || typeof element.getAttribute !== 'function') return none;
+        if (element.parentElement && element.parentElement.tagName === 'PICTURE') return none;
+        const srcset = element.getAttribute('srcset');
+        if (!srcset) return none;
+        const sizes = withoutAutoSizes(element.getAttribute('sizes'));
+        if (sizes === false) return none;
+        return { srcset, sizes };
+    }
+
+    function canReplaySrcset(record) {
+        return Boolean(record.srcset) && supportsImageSrcset && withoutAutoSizes(record.sizes) !== false;
+    }
+
     function matchesViewport(record) {
         const bucket = recordBucket(record);
         if (!bucket || bucket.width !== viewportWidthBucket()) return false;
@@ -802,7 +902,7 @@
         // itself, so zoom (which changes devicePixelRatio) only invalidates a
         // src-only hero — or any hero on a Safari too old for imagesrcset,
         // where the preload falls back to the URL resolved for the old density.
-        return (Boolean(record.srcset) && supportsImageSrcset) || bucket.dpr === currentDpr();
+        return canReplaySrcset(record) || bucket.dpr === currentDpr();
     }
 
     function pageKey() {
@@ -1109,9 +1209,12 @@
                 // preload the bare href, which for a responsive hero is a
                 // candidate the <img> may never request. Where it is missing,
                 // fall back to the resolved URL recorded from currentSrc.
-                if (record.srcset && supportsImageSrcset) {
+                // Records learned before sizes="auto" was understood are
+                // cleaned here too.
+                if (canReplaySrcset(record)) {
                     link.setAttribute('imagesrcset', record.srcset);
-                    if (record.sizes) link.setAttribute('imagesizes', record.sizes);
+                    const sizes = withoutAutoSizes(record.sizes);
+                    if (sizes) link.setAttribute('imagesizes', sizes);
                 }
                 // A hero that 404s or was removed should stop being preloaded
                 // rather than cost a request a day for two weeks.
@@ -1208,17 +1311,11 @@
             const url = toUrl(src);
             if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) continue;
 
-            // Inside <picture> the browser chose currentSrc from a <source>,
-            // often AVIF or WebP. The <img>'s own srcset is only the fallback,
-            // so replaying it would preload a JPEG the page never uses.
-            const inPicture = Boolean(img.parentElement && img.parentElement.tagName === 'PICTURE');
             bestArea = area;
-            best = {
+            best = Object.assign({
                 url: url.href,
-                cors: img.crossOrigin || null,
-                srcset: inPicture ? null : img.getAttribute('srcset'),
-                sizes: inPicture ? null : img.getAttribute('sizes')
-            };
+                cors: img.crossOrigin || null
+            }, replayableSourceSet(img));
         }
 
         return best;
@@ -1275,19 +1372,12 @@
                         // crossOrigin read as null then is the CORS-mode
                         // mismatch that turns a preload into a second download.
                         const element = entry.element;
-                        const inPicture = Boolean(element && element.parentElement
-                            && element.parentElement.tagName === 'PICTURE');
-                        const readAttr = name => (!inPicture && element && element.getAttribute)
-                            ? element.getAttribute(name)
-                            : null;
-                        lcpEntry = {
+                        lcpEntry = Object.assign({
                             url: entry.url,
                             startTime: entry.startTime,
                             cors: (element && element.crossOrigin) || null,
-                            srcset: readAttr('srcset'),
-                            sizes: readAttr('sizes'),
                             route: currentRoute
-                        };
+                        }, replayableSourceSet(element));
                     }
                 });
                 observer.observe({ type: 'largest-contentful-paint', buffered: true });
@@ -1713,7 +1803,8 @@
     //
     // Hence: off unless switched on per origin, same-origin only, sensitive and
     // download paths refused, and triggered by pointerdown (a click that has
-    // begun) rather than hover.
+    // begun) rather than hover. Where Speculation Rules are switched on, the
+    // section after this does the job properly and this path stands down.
 
     const WARM_BUDGET = 6;
     let warmCount = 0;
@@ -1766,47 +1857,59 @@
         } catch (_) {}
     }
 
+    // A same-origin link this script would warm by either mechanism.
+    function isWarmableLink(link) {
+        if (!link || !link.href) return false;
+
+        const url = toUrl(link.href);
+        if (!isNavigationEligible(url)) return false;
+        if (url.pathname + url.search === location.pathname + location.search) return false;
+
+        const href = link.getAttribute('href') || '';
+        if (DOWNLOAD_REGEX.test(href) || /download/i.test(href)) return false;
+        // Pointerdown is not a click: a confirm() in the click handler, or a
+        // drag off the link, means the user never agreed to this GET. The raw
+        // href is checked as well as the resolved path, because that is where
+        // a relative action link keeps its token.
+        if (isSensitiveHref(url.pathname, href)) return false;
+        // '' and '_self' stay in this tab exactly like no target at all (BBC's
+        // whole navigation is target="_self"). WebKit's speculation rules
+        // cannot follow a link into a new tab either.
+        const target = (link.getAttribute('target') || '').toLowerCase();
+        if (target && target !== '_self') return false;
+        // .download is "" for a bare <a download>, so ask for the attribute.
+        if (link.getAttribute('download') !== null || /\b(?:nofollow|external)\b/i.test(link.rel || '')) return false;
+
+        return true;
+    }
+
+    function isPlainPrimaryPress(e) {
+        // A modified click opens a tab or downloads; neither benefits, and the
+        // second is a file that should not be pulled twice.
+        return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+    }
+
     function initDocumentWarming() {
         if (!documentWarmingEnabled()) return;
         if (getConnectionTier() === TIER_SLOW) return;
-
-        function isEligible(link) {
-            if (!link || !link.href) return false;
-
-            const url = toUrl(link.href);
-            if (!isNavigationEligible(url)) return false;
-            if (url.pathname + url.search === location.pathname + location.search) return false;
-
-            const href = link.getAttribute('href') || '';
-            if (DOWNLOAD_REGEX.test(href) || /download/i.test(href)) return false;
-            // Pointerdown is not a click: a confirm() in the click handler, or
-            // a drag off the link, means the user never agreed to this GET.
-            // The raw href is checked as well as the resolved path, because
-            // that is where a relative action link keeps its token.
-            if (isSensitiveHref(url.pathname, href)) return false;
-            // '' and '_self' stay in this tab exactly like no target at all
-            // (BBC's whole navigation is target="_self").
-            const target = (link.getAttribute('target') || '').toLowerCase();
-            if (target && target !== '_self') return false;
-            // .download is "" for a bare <a download>, so ask for the attribute.
-            if (link.getAttribute('download') !== null || /\b(?:nofollow|external)\b/i.test(link.rel || '')) return false;
-
-            return true;
-        }
 
         document.addEventListener('pointerdown', e => {
             // An in-page router answers the click itself; the document we
             // would fetch is never used.
             if (knownSpa) return;
-            // A modified click opens a tab or downloads; neither benefits, and
-            // the second is a file we should not be pulling twice.
-            if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            // Speculation rules do this job properly when they are on.
+            if (speculationRulesActive()) return;
+            if (!isPlainPrimaryPress(e)) return;
             const link = getClosestLinkTarget(e.target);
-            if (isEligible(link)) warmDocument(toUrl(link.href));
+            if (isWarmableLink(link)) warmDocument(toUrl(link.href));
         }, { passive: true, capture: true });
     }
 
     function maybeWarmPredictedDocument() {
+        if (speculationRulesActive()) {
+            speculatePredicted();
+            return;
+        }
         if (!documentWarmingEnabled() || knownSpa) return;
         if (getConnectionTier() !== TIER_FAST) return;
         if (!predictedTargets.length) return;
@@ -1816,6 +1919,123 @@
 
         const url = toUrl(best.path, location.origin);
         if (isNavigationEligible(url)) warmDocument(url);
+    }
+
+    // -------------------------------------------------------------------------
+    // Speculation Rules prefetch (where WebKit has it switched on)
+    // -------------------------------------------------------------------------
+    //
+    // Everything that made document warming opt-in is a property of fetch(),
+    // not of prefetching. Per spec a speculation-rules prefetch goes out
+    // marked Sec-Purpose: prefetch, so a server can tell it from a visit, and
+    // the navigation uses the prefetched response whether or not it was
+    // cacheable — nothing is fetched twice. So where the rules work, this runs without
+    // the toggle, the way the Chrome build does: on pointerdown, about 100ms
+    // ahead of the click it starts, and for the destinations learned from
+    // here. Prefetch only; WebKit implements no prerender.
+
+    let rulesBlocked = false;
+    let pressRulesScript = null;
+    let pressHref = null;
+    let predictionRulesScript = null;
+
+    function speculationRulesActive() {
+        return supportsSpeculationRules && !rulesBlocked && !knownSpa;
+    }
+
+    // One script per purpose, replaced rather than accumulated: a rule for a
+    // link the user moved past is pure cost, and removing the script cancels
+    // its prefetch.
+    function installRules(previous, urls) {
+        if (previous) previous.remove();
+        if (!urls.length) return null;
+        const script = makeRulesScript({
+            prefetch: [{ source: 'list', urls, eagerness: 'immediate' }]
+        });
+        (document.head || document.documentElement).appendChild(script);
+        return script;
+    }
+
+    function speculatePress(href) {
+        if (pressHref === href) return;
+        pressHref = href;
+        try {
+            pressRulesScript = installRules(pressRulesScript, [href]);
+        } catch (_) {
+            // makeRulesScript throws only when Trusted Types refuses the rules
+            // and no policy could be made — as final as a CSP block.
+            blockRules();
+        }
+    }
+
+    function speculatePredicted() {
+        try {
+            // A prefetch the navigation will use is cheap on a fast link and a
+            // contested one on a slow link, where only a press warms.
+            const urls = getConnectionTier() === TIER_SLOW ? [] : predictedTargets
+                .filter(c => (Number(c.count) || 0) >= TRANSITION_MIN_CONFIDENCE)
+                .map(c => toUrl(c.path, location.origin))
+                .filter(isNavigationEligible)
+                .map(url => url.href);
+            predictionRulesScript = installRules(predictionRulesScript, urls);
+        } catch (_) {
+            blockRules();
+        }
+    }
+
+    // Under a strict CSP inline speculation rules need 'inline-speculation-rules'.
+    // Once blocked, stop emitting them and hand the press that was in flight to
+    // the opt-in path, which is the only other mechanism there is.
+    function blockRules() {
+        if (rulesBlocked) return;
+        rulesBlocked = true;
+        for (const script of [pressRulesScript, predictionRulesScript]) {
+            if (script) script.remove();
+        }
+        pressRulesScript = null;
+        predictionRulesScript = null;
+
+        const href = pressHref;
+        pressHref = null;
+        if (href && documentWarmingEnabled() && getConnectionTier() !== TIER_SLOW) {
+            const url = toUrl(href);
+            if (url) warmDocument(url);
+        }
+    }
+
+    function initSpeculationRules() {
+        if (!supportsSpeculationRules) return;
+
+        document.addEventListener('securitypolicyviolation', event => {
+            // A report-only policy blocks nothing, and a violation for some
+            // other script says nothing about inline rules.
+            if (!event || event.disposition === 'report') return;
+            if (event.blockedURI && event.blockedURI !== 'inline') return;
+            if (typeof event.violatedDirective === 'string'
+                && event.violatedDirective.indexOf('script-src') === 0) {
+                blockRules();
+            }
+        });
+
+        // Every tier, unlike the fetch() path: a pressed link's prefetch is
+        // the navigation's own response, arriving early, not a second copy.
+        document.addEventListener('pointerdown', e => {
+            if (!speculationRulesActive() || !isPlainPrimaryPress(e)) return;
+            const link = getClosestLinkTarget(e.target);
+            if (isWarmableLink(link)) speculatePress(link.href);
+        }, { passive: true, capture: true });
+
+        // The SPA detector can flip knownSpa mid-visit; a live prediction from
+        // before that is pure cost.
+        onRouteChange(() => {
+            if (!knownSpa) return;
+            for (const script of [pressRulesScript, predictionRulesScript]) {
+                if (script) script.remove();
+            }
+            pressRulesScript = null;
+            predictionRulesScript = null;
+            pressHref = null;
+        });
     }
 
     // =========================================================================
@@ -2150,6 +2370,15 @@
                 'learns where you go from here — needs ' + TRANSITION_MIN_CONFIDENCE + ' visits along the same path');
         }
 
+        if (supportsSpeculationRules) {
+            feature(speculationRulesActive() ? '●' : '○', 'Prefetch on press',
+                speculationRulesActive()
+                    ? 'Speculation Rules prefetch on pointerdown and for learned next pages'
+                    : knownSpa
+                        ? 'off — this site answers link clicks in-page'
+                        : 'off — this site’s CSP blocks inline speculation rules');
+        }
+
         feature(documentWarmingEnabled() && !knownSpa ? '●' : '○', 'Document warming',
             !documentWarmingEnabled()
                 ? 'off for this origin — Safari has no speculation rules, see the toggle'
@@ -2207,6 +2436,9 @@
         lines.push('  LCP entries                ' + (supportsLcp ? 'yes — heroes are measured' : 'no — heroes are found by layout'));
         lines.push('  Navigation API             ' + (supportsNavigationApi ? 'yes — no route polling' : 'no — polling every 400ms while visible'));
         lines.push('  <link rel=prefetch>        ' + (supportsLinkPrefetch ? 'yes' : 'no'));
+        lines.push('  Speculation Rules          ' + (supportsSpeculationRules
+            ? 'yes — prefetch on press needs no toggle'
+            : 'no — off by default; Develop > Feature Flags can switch it on'));
 
         return lines.join('\n');
     }
@@ -2252,7 +2484,8 @@
             showPanel('Aggressive rendering ' + (next === '1' ? 'enabled' : 'disabled')
                 + ' for this origin. Reload to apply.\n\nSkips layout and paint for offscreen '
                 + 'sections. Disable if dropdowns or tooltips appear clipped at a section '
-                + 'edge, or if sticky headers or in-page anchors misbehave.'
+                + 'edge, or if sticky headers or in-page anchors misbehave. On Safari 27, '
+                + 'scroll anchoring keeps the page from jumping as skipped sections are measured.'
                 + (supportsContentVisibility ? '' : '\n\nThis Safari does not support content-visibility; '
                     + 'the preference is stored but has no effect.'));
         });
@@ -2298,6 +2531,7 @@
         safely(() => applyLearnedHints());
         safely(initLearning);
         safely(initTransitionLearning);
+        safely(initSpeculationRules);
         safely(initDocumentWarming);
         safely(initMediaPriority);
         safely(initCommands);
