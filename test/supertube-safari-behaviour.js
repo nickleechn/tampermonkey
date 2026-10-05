@@ -20,6 +20,19 @@
 // drops text-node churn without losing player remounts; that preconnects target
 // the non-CORS pool; and that a blocked XHR is as parseable as a blocked fetch.
 //
+// 2.3.0 rests on behaviour read out of YouTube's own player (base.js 8ab5c328):
+// its quality menu picks with setPlaybackQualityRange(q, q, formatId), and a
+// range only counts as locked when min === max. So: the pick is pinned and
+// carries its formatId; Premium 1080p is chosen through that formatId with no
+// menu walk; an API that exists but has not loaded formats never falls back to
+// clicking the menu or spends an attempt; a player still holding the previous
+// video is not pinned; a round that ends without a pick re-arms on the next
+// player event; yt-player-quality is raised to the ceiling, in YouTube's current
+// record shape, before the player boots; the default ceiling is the top of the
+// ladder, 8K included, with a dropped-frame guard that steps down one level,
+// only measures visible playback at the guarded level, and only remembers a
+// limit after failing on two page loads; and /live/<id> counts as a watch page.
+//
 // No browser required.
 const vm = require('vm');
 const fs = require('fs');
@@ -52,6 +65,7 @@ function makeClock() {
         },
         clearTimeout(id) { queue.delete(id); },
         size() { return queue.size; },
+        now() { return now; },
         async flush(limit = 400) {
             let steps = 0;
             while (queue.size && steps++ < limit) {
@@ -90,20 +104,75 @@ function makeEl(tag) {
     };
 }
 
-// A player exposing the API path. qualityData drives chooseTargetQuality.
-function makePlayer(levels, qualityData) {
+// A player exposing the API path. qualityData drives chooseTargetQuality. Both
+// lists live on the player so a test can change them mid-run, the way formats
+// arrive after the element exists.
+function makePlayer(levels, qualityData, { videoId = null, settingsButton = false } = {}) {
     const player = makeEl('div');
     player.calls = [];
-    player.getAvailableQualityLevels = () => levels.slice();
-    player.getAvailableQualityData = () => (qualityData || []).slice();
-    player.setPlaybackQualityRange = function (min, max) {
-        player.calls.push(['setPlaybackQualityRange', min, max]);
+    player.levels = levels;
+    player.qualityData = qualityData || [];
+    player.current = 'auto';
+    player.presentingType = 1;
+    player.getAvailableQualityLevels = () => player.levels.slice();
+    player.getAvailableQualityData = () => player.qualityData.slice();
+    player.setPlaybackQualityRange = function (...args) {
+        player.calls.push(['setPlaybackQualityRange', ...args]);
+        player.current = args[1] || args[0];
     };
+    // What is actually streaming. Follows the last pin unless a test overrides it.
+    player.getPlaybackQuality = () => player.current;
+    player.getPresentingPlayerType = () => player.presentingType;
+    player.videoId = videoId;
+    player.getVideoData = () => ({ video_id: player.videoId || '' });
     player.setAutonavState = () => {};
-    // No settings button: keeps the menu-walking fallback out of these tests.
-    player.querySelector = () => null;
+    // A settings button only when asked, to prove the API path never touches it.
+    player.settingsButton = makeEl('button');
+    player.querySelector = (sel) =>
+        (settingsButton && sel === '.ytp-settings-button' ? player.settingsButton : null);
     return player;
 }
+
+// A <video> whose frame counters advance with the virtual clock, dropping
+// frames at whatever rate dropRatio(currentQuality) says.
+function makeVideo(clock, player, { fps = 60, dropRatio = () => 0 } = {}) {
+    const video = makeEl('video');
+    video.paused = false;
+    video.seeking = false;
+    video.playbackRate = 1;
+    video.listeners = {};
+    video.addEventListener = (type, fn) => {
+        (video.listeners[type] = video.listeners[type] || []).push(fn);
+    };
+    video.removeEventListener = (type, fn) => {
+        video.listeners[type] = (video.listeners[type] || []).filter((f) => f !== fn);
+    };
+    video.fire = (type) => (video.listeners[type] || []).slice().forEach((fn) => fn({ type }));
+    video.getBoundingClientRect = () => ({ width: 1280, top: 0, bottom: 720 });
+    let total = 0;
+    let dropped = 0;
+    let lastAt = 0;
+    video.getVideoPlaybackQuality = () => {
+        const now = clock.now();
+        const frames = Math.floor((now - lastAt) * fps / 1000);
+        if (frames > 0) {
+            if (!video.paused) {
+                total += frames;
+                dropped += Math.round(frames * dropRatio(player.getPlaybackQuality()));
+            }
+            lastAt = now;
+        }
+        return { totalVideoFrames: total, droppedVideoFrames: dropped };
+    };
+    return video;
+}
+
+function storedQuality(stored) {
+    const record = JSON.parse(stored['yt-player-quality']);
+    return { record, data: JSON.parse(record.data) };
+}
+
+const FRAME_CAP_KEY = 'supertube-frame-cap-v1:8.18';
 
 // A player with NO quality API, forcing selectHighestQuality down the
 // settings-menu fallback. Models the two-step menu: the root panel offers a
@@ -149,23 +218,32 @@ function build({
     safariVersion = '18',
     observationRoots = { '#player': makeEl('div') },
     playerApi = true,
-    menuLabels = null
+    menuLabels = null,
+    videoId = null,
+    settingsButton = false,
+    video = null,
+    visibilityState = 'visible',
+    patch = {}
 } = {}) {
     const clock = makeClock();
     const player = playerApi
-        ? makePlayer(levels, qualityData)
+        ? makePlayer(levels, qualityData, { videoId, settingsButton })
         : makeMenuPlayer(menuLabels || []);
+    const videoEl = video ? makeVideo(clock, player, video) : null;
     const observed = [];
     const stored = Object.assign({}, storedSeed || {});
+    const writes = [];
 
     const head = makeEl('head');
     const body = makeEl('body');
     const documentElement = makeEl('html');
 
     const selectorMap = Object.assign({}, observationRoots);
+    if (videoEl) selectorMap['#movie_player video'] = videoEl;
 
     const document = {
         readyState: 'complete',
+        visibilityState,
         head, body, documentElement,
         createElement: (tag) => makeEl(tag),
         getElementById: (id) => (id === 'movie_player' ? player : null),
@@ -223,7 +301,7 @@ function build({
         MutationObserver, XMLHttpRequest,
         localStorage: {
             getItem: (k) => (k in stored ? stored[k] : null),
-            setItem: (k, v) => { stored[k] = String(v); }
+            setItem: (k, v) => { stored[k] = String(v); writes.push(k); }
         },
         navigator: {
             userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 ' +
@@ -249,12 +327,21 @@ function build({
     sandbox.globalThis = sandbox;
     sandbox.self = sandbox;
 
+    // Config constants can be overridden per test by rewriting their line.
+    let source = SOURCE;
+    for (const [from, to] of Object.entries(patch)) {
+        if (!source.includes(from)) throw new Error('patch target missing: ' + from);
+        source = source.replace(from, to);
+    }
+
     vm.createContext(sandbox);
-    vm.runInContext(SOURCE, sandbox, { filename: 'Supertube.safari.user.js' });
+    vm.runInContext(source, sandbox, { filename: 'Supertube.safari.user.js' });
 
     return {
-        sandbox, player, observed, stored, clock, MediaSource, ManagedMediaSource, head,
-        picked: () => player.picked
+        sandbox, player, observed, stored, writes, clock, MediaSource, ManagedMediaSource, head,
+        video: videoEl,
+        picked: () => player.picked,
+        ranges: () => player.calls.filter((c) => c[0] === 'setPlaybackQualityRange')
     };
 }
 
@@ -327,46 +414,304 @@ function build({
     check('AV1 survives when only the second probe configuration is efficient',
         env.MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"') === true);
 
-    console.log('\nQuality ceiling');
+    console.log('\nQuality selection — player API');
 
     env = build({ levels: ['highres', 'hd2880', 'hd2160', 'hd1080'] });
     await env.clock.flush();
-    let range = env.player.calls.find((c) => c[0] === 'setPlaybackQualityRange');
-    check('8K/5K are refused in favour of 4K',
-        !!range && range[2] === 'hd2160',
+    let range = env.ranges()[0];
+    check('the highest level on offer is chosen, 8K included',
+        !!range && range[2] === 'highres',
         range ? `ceiling=${range[2]}` : 'setPlaybackQualityRange never called');
 
-    check('the player keeps an ABR floor rather than being pinned',
-        !!range && range[1] === 'hd1080' && range[1] !== range[2],
+    check('the pick is pinned (min === max), the only range YouTube treats as locked',
+        !!range && range[1] === range[2],
         range ? `range=[${range[1]}, ${range[2]}]` : 'n/a');
 
     env = build({ levels: ['hd1440', 'hd1080', 'hd720'] });
     await env.clock.flush();
-    range = env.player.calls.find((c) => c[0] === 'setPlaybackQualityRange');
-    check('a video that tops out below the cap still selects its best level',
-        !!range && range[2] === 'hd1440', range ? `ceiling=${range[2]}` : 'n/a');
+    range = env.ranges()[0];
+    check('a video that tops out lower still selects its best level',
+        !!range && range[1] === 'hd1440' && range[2] === 'hd1440', range ? `range=[${range[1]}, ${range[2]}]` : 'n/a');
 
-    env = build({ levels: ['hd720', 'medium'] });
+    env = build({
+        levels: ['hd2160', 'hd1080'],
+        qualityData: [
+            { quality: 'hd2160', qualityLabel: '2160p60', formatId: '315', isPlayable: true },
+            { quality: 'hd1080', qualityLabel: '1080p60', formatId: '303', isPlayable: true }
+        ]
+    });
     await env.clock.flush();
-    range = env.player.calls.find((c) => c[0] === 'setPlaybackQualityRange');
+    range = env.ranges()[0];
+    check('the pick carries its formatId, exactly like a click in the quality menu',
+        !!range && range[2] === 'hd2160' && range[3] === '315',
+        range ? `args=${JSON.stringify(range.slice(1))}` : 'n/a');
+
+    env = build({
+        levels: ['hd1080', 'hd720'],
+        settingsButton: true,
+        qualityData: [
+            { quality: 'hd1080', qualityLabel: '1080p', formatId: '137', isPlayable: true },
+            { quality: 'hd1080', qualityLabel: '1080p Premium', formatId: '356', isPlayable: true },
+            { quality: 'hd720', qualityLabel: '720p', formatId: '136', isPlayable: true }
+        ]
+    });
+    await env.clock.flush();
+    range = env.ranges()[0];
+    check('Premium 1080p is selected through the API by its formatId',
+        !!range && range[2] === 'hd1080' && range[3] === '356',
+        range ? `args=${JSON.stringify(range.slice(1))}` : 'n/a');
+    check('and the settings menu is never opened to do it',
+        !env.player.settingsButton.clicked, `clicks=${env.player.settingsButton.clicked || 0}`);
+
+    env = build({
+        levels: ['hd1080', 'hd720'],
+        qualityData: [
+            { quality: 'hd1080', qualityLabel: '1080p', formatId: '137', isPlayable: true },
+            { quality: 'hd1080', qualityLabel: '1080p Premium', formatId: '356', isPlayable: false },
+            { quality: 'hd720', qualityLabel: '720p', formatId: '136', isPlayable: true }
+        ]
+    });
+    await env.clock.flush();
+    range = env.ranges()[0];
+    check('a paywalled Premium entry is not chosen for a non-Premium account',
+        !!range && range[3] === '137', range ? `formatId=${range[3]}` : 'n/a');
+
+    env = build({
+        levels: ['highres', 'hd2160', 'hd1080'],
+        patch: { "const MAX_QUALITY = 'highres';": "const MAX_QUALITY = 'hd2160';" }
+    });
+    await env.clock.flush();
+    range = env.ranges()[0];
+    check('an explicit MAX_QUALITY cap is still honoured',
+        !!range && range[2] === 'hd2160', range ? `ceiling=${range[2]}` : 'n/a');
+
+    env = build({
+        levels: ['hd2160', 'hd1080', 'hd720'],
+        qualityData: [{ quality: 'hd2160', qualityLabel: '2160p', formatId: '313', isPlayable: true }],
+        patch: { 'const MIN_QUALITY = null;': "const MIN_QUALITY = 'hd1080';" }
+    });
+    await env.clock.flush();
+    range = env.ranges()[0];
+    check('a configured floor still yields a range, and a range carries no formatId',
+        !!range && range[1] === 'hd1080' && range[2] === 'hd2160' && range.length === 3,
+        range ? `args=${JSON.stringify(range.slice(1))}` : 'n/a');
+
+    env = build({
+        levels: ['hd720', 'medium'],
+        patch: { 'const MIN_QUALITY = null;': "const MIN_QUALITY = 'hd1080';" }
+    });
+    await env.clock.flush();
+    range = env.ranges()[0];
     check('the floor never outranks the ceiling on a low-quality video',
         !!range && range[1] === 'hd720' && range[2] === 'hd720',
         range ? `range=[${range[1]}, ${range[2]}]` : 'n/a');
 
-    console.log('\nQuality ceiling — settings-menu fallback');
+    env = build({ href: 'https://www.youtube.com/live/abcdefghijk', videoId: 'abcdefghijk' });
+    await env.clock.flush();
+    check('a /live/<id> URL is treated as a watch page',
+        env.ranges().length === 1, `calls=${env.ranges().length}`);
 
-    // The menu path runs whenever the player API is missing or fails. It reads
-    // resolutions out of label text rather than level ids, so it needs the cap
-    // applied separately — it is not covered by the chooseTargetQuality filter.
+    console.log('\nQuality selection — timing');
+
+    // Formats arrive after the element and its settings button exist. Opening
+    // the menu in that window used to flash the panel and burn the attempts.
+    env = build({ levels: [], settingsButton: true, video: {} });
+    await env.clock.flush();
+    check('an API with no formats yet neither opens the menu nor pins anything',
+        !env.player.settingsButton.clicked && env.ranges().length === 0,
+        `clicks=${env.player.settingsButton.clicked || 0} pins=${env.ranges().length}`);
+
+    env.player.levels = ['hd2160', 'hd1080'];
+    env.video.fire('canplay');
+    await env.clock.flush();
+    range = env.ranges()[0];
+    check('a round that ended without a pick re-arms on the next player event',
+        !!range && range[2] === 'hd2160', range ? `ceiling=${range[2]}` : 'never re-armed');
+
+    // On an SPA navigation the URL changes before the player swaps videos.
+    env = build({ videoId: 'previous000', video: {} });
+    await env.clock.flush();
+    check('a player still holding the previous video is not pinned',
+        env.ranges().length === 0, `pins=${env.ranges().length}`);
+
+    env.player.videoId = 'abc123';
+    env.video.fire('loadedmetadata');
+    await env.clock.flush();
+    check('and is pinned once the new video has loaded',
+        env.ranges().length === 1, `pins=${env.ranges().length}`);
+
+    console.log('\nStored quality preference');
+
+    const day = 24 * 60 * 60 * 1000;
+    const legacyNow = Date.now();
+    env = build({
+        storedSeed: {
+            'yt-player-quality': JSON.stringify({
+                data: JSON.stringify({ quality: 720, previousQuality: 1080 }),
+                expiration: legacyNow + 300 * day,
+                creation: legacyNow
+            })
+        }
+    });
+    // No flush: this has to land before the player boots, synchronously.
+    let pref = storedQuality(env.stored);
+    check('a lower stored preference is raised to the ceiling before the player boots',
+        pref.data.quality === 4320, `quality=${pref.data.quality}`);
+    check('in YouTube\'s current record shape (data is a JSON string of heights)',
+        typeof pref.record.data === 'string' && pref.data.previousQuality === 720
+        && pref.record.expiration > pref.record.creation,
+        pref.record.data);
+
+    env = build({
+        storedSeed: {
+            'yt-player-quality': JSON.stringify({
+                data: 'hd720', expiration: legacyNow + day, creation: legacyNow
+            })
+        }
+    });
+    pref = storedQuality(env.stored);
+    check('the legacy "data":"hd720" form is read and replaced',
+        pref.data.quality === 4320 && pref.data.previousQuality === 720, pref.record.data);
+
+    env = build({
+        storedSeed: {
+            'yt-player-quality': JSON.stringify({
+                data: JSON.stringify({ quality: 4320, previousQuality: 4320 }),
+                expiration: legacyNow + 300 * day,
+                creation: legacyNow
+            })
+        }
+    });
+    await env.clock.flush();
+    check('a current, fresh record is left alone',
+        !env.writes.includes('yt-player-quality'), `writes=${env.writes.join(',')}`);
+
+    env = build({
+        storedSeed: {
+            'yt-player-quality': JSON.stringify({
+                data: JSON.stringify({ quality: 4320, previousQuality: 4320 }),
+                expiration: legacyNow + 300 * day,
+                creation: legacyNow - 2 * day
+            })
+        }
+    });
+    pref = storedQuality(env.stored);
+    check('an ageing record is refreshed before YouTube\'s 30-day cut-off ignores it',
+        pref.record.creation >= legacyNow, `creation=${pref.record.creation}`);
+
+    console.log('\nFrame guard');
+
+    env = build({ levels: ['highres', 'hd2160', 'hd1080'], video: {} });
+    await env.clock.flush();
+    check('healthy 8K playback is left at 8K',
+        env.ranges().length === 1 && env.ranges()[0][2] === 'highres' && !env.stored[FRAME_CAP_KEY],
+        `pins=${env.ranges().map((c) => c[2]).join('>')}`);
+
+    env = build({
+        levels: ['highres', 'hd2160', 'hd1080'],
+        video: { dropRatio: (q) => (q === 'highres' ? 0.3 : 0) }
+    });
+    await env.clock.flush();
+    let pins = env.ranges().map((c) => c[2]).join('>');
+    check('heavy drops at 8K step down one level, to 4K',
+        pins === 'highres>hd2160', `pins=${pins}`);
+    const cap = env.stored[FRAME_CAP_KEY] ? JSON.parse(env.stored[FRAME_CAP_KEY]) : null;
+    check('and the failure is recorded as a first strike for this Mac',
+        !!cap && cap.height === 4320 && cap.strikes === 1, JSON.stringify(cap));
+
+    env = build({
+        levels: ['highres', 'hd2160', 'hd1440', 'hd1080'],
+        video: { dropRatio: () => 0.3 }
+    });
+    await env.clock.flush();
+    pins = env.ranges().map((c) => c[2]).join('>');
+    check('it keeps stepping while drops persist, but never below 1080p',
+        pins === 'highres>hd2160>hd1440>hd1080', `pins=${pins}`);
+
+    const future = Date.now() + 10 * day;
+    env = build({
+        levels: ['highres', 'hd2160', 'hd1080'],
+        storedSeed: { [FRAME_CAP_KEY]: JSON.stringify({ height: 4320, strikes: 1, until: future }) }
+    });
+    await env.clock.flush();
+    check('one failed page load does not cap the next one',
+        env.ranges()[0] && env.ranges()[0][2] === 'highres', `ceiling=${env.ranges()[0] && env.ranges()[0][2]}`);
+
+    env = build({
+        levels: ['highres', 'hd2160', 'hd1080'],
+        storedSeed: { [FRAME_CAP_KEY]: JSON.stringify({ height: 4320, strikes: 2, until: future }) }
+    });
+    await env.clock.flush();
+    check('two failed page loads cap this Mac below the failing level',
+        env.ranges()[0] && env.ranges()[0][2] === 'hd2160', `ceiling=${env.ranges()[0] && env.ranges()[0][2]}`);
+    // Exclusive cap: 8K failed, so the next rung down (5K) is what players boot under.
+    check('and the stored preference boots players under that cap',
+        storedQuality(env.stored).data.quality === 2880, env.stored['yt-player-quality']);
+
+    env = build({
+        levels: ['highres', 'hd2160', 'hd1080'],
+        storedSeed: { [FRAME_CAP_KEY]: JSON.stringify({ height: 4320, strikes: 2, until: Date.now() - 1 }) }
+    });
+    await env.clock.flush();
+    check('an expired cap is ignored, so the Mac gets re-tested',
+        env.ranges()[0] && env.ranges()[0][2] === 'highres', `ceiling=${env.ranges()[0] && env.ranges()[0][2]}`);
+
+    env = build({ levels: ['highres', 'hd2160'], video: { dropRatio: () => 0.5 }, visibilityState: 'hidden' });
+    await env.clock.flush();
+    check('a background tab is never measured',
+        env.ranges().length === 1, `pins=${env.ranges().map((c) => c[2]).join('>')}`);
+
+    env = build({ levels: ['highres', 'hd2160'], video: { dropRatio: () => 0.5 } });
+    env.video.paused = true;
+    await env.clock.flush();
+    check('a paused video is never measured',
+        env.ranges().length === 1, `pins=${env.ranges().map((c) => c[2]).join('>')}`);
+
+    // Before the stream reaches the pinned level, drops belong to the old one.
+    env = build({ levels: ['highres', 'hd2160'], video: { dropRatio: () => 0.5 } });
+    env.player.getPlaybackQuality = () => 'hd1080';
+    await env.clock.flush();
+    check('frames are only counted once the stream is actually at the guarded level',
+        env.ranges().length === 1, `pins=${env.ranges().map((c) => c[2]).join('>')}`);
+
+    env = build({ levels: ['highres', 'hd2160'], video: { dropRatio: () => 0.5 } });
+    env.player.presentingType = 2;
+    await env.clock.flush();
+    check('an ad is never measured',
+        env.ranges().length === 1, `pins=${env.ranges().map((c) => c[2]).join('>')}`);
+
+    env = build({ levels: ['hd1080', 'hd720'], video: { dropRatio: () => 0.5 } });
+    await env.clock.flush();
+    check('1080p and below are never guarded',
+        env.ranges().length === 1 && !env.stored[FRAME_CAP_KEY], `pins=${env.ranges().map((c) => c[2]).join('>')}`);
+
+    console.log('\nSettings-menu fallback');
+
+    // The menu path runs only when the player API is missing. It reads
+    // resolutions out of label text rather than level ids, so it needs the
+    // ceiling applied separately — it is not covered by chooseTargetQuality.
     env = build({ menuLabels: ['4320p', '2160p60', '1080p', '720p'], playerApi: false });
     await env.clock.flush();
-    check('the menu fallback refuses 8K and takes 4K',
+    check('the menu fallback takes the highest level, 8K included',
+        env.picked() === '4320p', `picked=${env.picked()}`);
+
+    env = build({
+        menuLabels: ['4320p', '2160p60', '1080p', '720p'],
+        playerApi: false,
+        storedSeed: { [FRAME_CAP_KEY]: JSON.stringify({ height: 4320, strikes: 2, until: future }) }
+    });
+    await env.clock.flush();
+    check('a learned cap binds the menu fallback too',
         env.picked() === '2160p60', `picked=${env.picked()}`);
 
-    env = build({ menuLabels: ['1440p', '1080p', '720p'], playerApi: false });
+    env = build({
+        menuLabels: ['4320p', '2160p60', '1080p'],
+        playerApi: false,
+        patch: { "const MAX_QUALITY = 'highres';": "const MAX_QUALITY = 'hd2160';" }
+    });
     await env.clock.flush();
-    check('the menu fallback still takes the best level under the cap',
-        env.picked() === '1440p', `picked=${env.picked()}`);
+    check('and so does an explicit MAX_QUALITY',
+        env.picked() === '2160p60', `picked=${env.picked()}`);
 
     env = build({ menuLabels: ['2160p', '1080p Premium', '1080p'], playerApi: false });
     await env.clock.flush();
