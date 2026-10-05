@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quicksilver Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      1.0.1
-// @description  Safari/WebKit build: learned LCP preload + critical-origin preconnect, hover/focus preconnect, learned connection tiering, navigation-transition learning, media priority hints, font-display patching and opt-in content-visibility. No Speculation Rules — WebKit has none.
+// @version      1.1.0
+// @description  Safari/WebKit build: learned hero preload (LCP where WebKit reports it, geometry otherwise) + critical-origin preconnect, hover/focus preconnect, learned connection tiering, navigation-transition learning, SPA detection, media priority hints, font-display patching and opt-in content-visibility. No Speculation Rules — WebKit has none.
 // @author       nickleechn
 // @match        *://*/*
 // @inject-into  content
@@ -19,6 +19,49 @@
 // @downloadURL  https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.safari.user.js
 // ==/UserScript==
 
+// 1.1.0 — brought up to the Chrome build's 4.2.0, where WebKit allows it.
+//
+// From Chrome 4.1.0 and 4.2.0, unchanged in substance:
+// - The action-link filter. It matters more here than in Chrome: document
+//   warming in Safari is a real credentialed fetch(), indistinguishable from
+//   a click, so /vote?id=…&auth=…, /Account/LogOff, /remove-from-cart/5 and
+//   /cancelOrder must never be warmed. Links carrying a CSRF-style token are
+//   refused outright, the verb list is Chrome's, matching is case-insensitive
+//   and catches compound and camelCase forms, and pages that act by being
+//   viewed (/message/unread/, /notifications, /inbox) are refused.
+// - Transition learning could never add a fifth destination and never let
+//   the first four expire. Targets now carry their own last-seen time.
+// - A hero inside <picture> replayed the <img> fallback srcset, preloading a
+//   JPEG the page never used. Such heroes now preload the exact URL painted.
+// - Records survive zoom and nudged window edges: 320px width buckets, and a
+//   srcset hero (which the browser resolves per density) ignores the DPR.
+// - Icon fonts keep their blocking font-display; swap flashed ligature text.
+// - Learned critical origins act on the second visit, up to 6 on a fast link.
+// - target="" and target="_self" stay in the tab and are no longer refused;
+//   a bare <a download> no longer slips past as "not a download".
+// - SPA detection: one click whose link URL a same-document navigation then
+//   lands on marks the origin as client-routed, and document warming stops
+//   there (the router never uses a fetched document). Learning continues.
+// - Status reports how often the hero preload was the hero that painted.
+//
+// Feature-detected rather than assumed absent, because WebKit has been
+// closing these gaps (LCP and the Navigation API were Interop 2025 targets):
+// - Where WebKit reports largest-contentful-paint, the hero is the measured
+//   LCP and the gate drops to Chrome's two sightings. Geometry remains the
+//   fallback, and is still what learns routes reached by a client-side
+//   navigation, which LCP never reports on.
+// - Where the Navigation API exists, route changes come from its events and
+//   the 400ms location poll is not started at all.
+// - Where <link rel=prefetch> is supported, document warming uses it instead
+//   of fetch(): the browser issues it at its own priority and, per spec,
+//   marks it as a prefetch (Sec-Purpose). A script fetch() can be neither.
+//
+// Considered and left out: Chrome 4.2.0 warms on pointerdown on every link
+// tier, because there the prefetched response *is* the navigation. Here it
+// is only reused when the page is cacheable, so on a slow link it is two
+// copies of the page competing for the bandwidth. Slow links still skip it.
+// Trusted Types needed no change: nothing here writes to a script sink.
+//
 // A port of Quicksilver 4.0.0 to WebKit. Not a compatibility shim around the
 // Chrome script — four of its load-bearing APIs do not exist in Safari, so the
 // parts that depended on them are either rebuilt on something WebKit does have
@@ -76,6 +119,9 @@
     // Shared helpers
     // =========================================================================
 
+    // Matches @version; the status panel reported 1.0.0 all through 1.0.1.
+    const SCRIPT_VERSION = '1.1.0';
+
     const SECOND = 1000;
     const MINUTE = 60 * SECOND;
     const HOUR = 60 * MINUTE;
@@ -100,6 +146,27 @@
     const supportsLazyFrames = 'loading' in HTMLIFrameElement.prototype;
     const supportsContentVisibility = typeof CSS !== 'undefined' && Boolean(CSS.supports)
         && CSS.supports('content-visibility', 'auto');
+    // The three gaps the 1.0 port was built around, probed rather than
+    // assumed. Each has a fallback that is the 1.0 behaviour.
+    const supportsLcp = (() => {
+        try {
+            const types = PerformanceObserver.supportedEntryTypes;
+            return Array.isArray(types) && types.includes('largest-contentful-paint');
+        } catch (_) {
+            return false;
+        }
+    })();
+    const supportsNavigationApi = Boolean(window.navigation)
+        && typeof window.navigation.addEventListener === 'function';
+    const supportsLinkPrefetch = (() => {
+        try {
+            const link = document.createElement('link');
+            return Boolean(link.relList && typeof link.relList.supports === 'function'
+                && link.relList.supports('prefetch'));
+        } catch (_) {
+            return false;
+        }
+    })();
 
     const TIER_SLOW = 1;
     const TIER_MODERATE = 2;
@@ -164,11 +231,64 @@
     ];
     const DOWNLOAD_REGEX = new RegExp('\\.(?:' + DOWNLOAD_EXTENSIONS.map(ext => ext.slice(1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')(?:[?#]|$)', 'i');
 
-    const SENSITIVE_PATH_SEGMENTS = 'logout|signout|log-out|sign-out|checkout|cart|account|admin|orders?|payments?|delete|auth|login|signin|sign-in|session|destroy|revoke|unsubscribe|remove|transfer';
+    // Document warming here is a real, credentialed GET that the server cannot
+    // tell apart from a click, so any link whose GET *does* something must
+    // never be warmed. The list is the Chrome build's 4.2.0 one: account words,
+    // the action verbs sites without CSRF-protected forms put in link paths
+    // (Hacker News: vote, hide, flag, fave), the shapes Jev (TypeSafe) rated as
+    // acting when asked about 42 real links, logoff variants, and pages that
+    // act by being viewed (old.reddit's /message/unread/ marks mail read).
+    const SENSITIVE_PATH_WORDS = [
+        'logout', 'signout', 'log-out', 'sign-out', 'checkout', 'cart', 'account', 'admin',
+        'order', 'orders', 'payment', 'payments', 'delete', 'auth', 'login', 'signin', 'sign-in',
+        'session', 'destroy', 'revoke', 'unsubscribe', 'remove', 'transfer',
+        'vote', 'upvote', 'downvote', 'unvote', 'hide', 'unhide', 'flag', 'unflag',
+        'fave', 'unfave', 'favorite', 'favourite', 'like', 'unlike', 'follow', 'unfollow',
+        'subscribe', 'report', 'markread', 'mark-read', 'mark_read', 'mark-all', 'archive', 'trash', 'spam',
+        'cancel', 'confirm', 'approve', 'reject', 'accept', 'decline', 'leave', 'reset',
+        'enable', 'disable', 'toggle',
+        'add', 'answer', 'rsvp', 'dismiss', 'setlang', 'set-language', 'set-locale', 'set-currency',
+        'logoff', 'log-off', 'signoff', 'sign-off',
+        'unread', 'inbox', 'message', 'messages', 'notification', 'notifications'
+    ];
+    // A segment is an action if it is the verb, optionally with one short
+    // suffix (/vote, /delete-account, /logout.php, /mark-all-read), or a
+    // verb-led compound followed by another segment, which is its argument
+    // (/remove-from-cart/5). Not a final slug that merely starts with a verb
+    // (/like-a-pro-guide) and not a plural index (/reports). Case-insensitive:
+    // ASP.NET's /Account/LogOff is the same link as /account/logoff.
     const SENSITIVE_HREF_REGEX = new RegExp(
-        '\\/(?:' + SENSITIVE_PATH_SEGMENTS + ')(?:[\\/?#-]|$)',
+        '\\/(?:' + SENSITIVE_PATH_WORDS.join('|') + ')'
+        + '(?:(?:[-_.][a-z0-9]+)?(?:[\\/?#;]|$)|(?:[-_][a-z0-9]+)+\\/[^/?#])',
         'i'
     );
+    // camelCase and PascalCase compounds: /cancelOrder, /DeleteItem. Case
+    // matters here, so the first letter of each word is spelled both ways.
+    const SENSITIVE_CAMEL_REGEX = new RegExp(
+        '\\/(?:' + SENSITIVE_PATH_WORDS
+            .filter(word => /^[a-z]+$/.test(word))
+            .map(word => '[' + word[0] + word[0].toUpperCase() + ']' + word.slice(1))
+            .join('|') + ')(?=[A-Z])'
+    );
+    // Matched anywhere in the raw href, query string included. A URL carrying
+    // a per-user CSRF token (HN auth=, phpBB sid=/hash=, WordPress _wpnonce,
+    // Moodle sesskey) is an action link by construction. The verbs also count
+    // as query values (?action=trash, ?do=vote), but a bare action= does not:
+    // Wikipedia's ?action=history is an ordinary page.
+    const SENSITIVE_SUBSTRINGS = [
+        'logout', 'log-out', 'log_out', 'signout', 'sign-out', 'sign_out', 'delete', 'unsubscribe',
+        'auth=', 'token=', 'nonce', 'csrf', 'xsrf', 'sesskey', 'sesc=', 'sid=', 'hash=',
+        'mark-all-read', 'markallread', 'logoff', 'log-off', 'log_off', 'signoff', 'sign-off'
+    ].concat(SENSITIVE_PATH_WORDS.map(word => '=' + word));
+    const SENSITIVE_SUBSTRING_REGEX = new RegExp(
+        SENSITIVE_SUBSTRINGS.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'),
+        'i'
+    );
+
+    function isSensitiveHref(pathname, rawHref) {
+        return SENSITIVE_HREF_REGEX.test(pathname) || SENSITIVE_CAMEL_REGEX.test(pathname)
+            || SENSITIVE_SUBSTRING_REGEX.test(rawHref || pathname);
+    }
 
     const FONT_EXTENSION = /\.(?:woff2?|ttf|otf|eot)(?:[?#]|$)/i;
 
@@ -192,14 +312,19 @@
     const LEARN_ORIGINS_KEY = 'tm-qs-origins';
     const LEARN_VITALS_KEY = 'tm-qs-vitals';
     const LEARN_TRANSITIONS_KEY = 'tm-qs-transitions';
+    const LEARN_SPA_KEY = 'tm-qs-spa';
+    const STATS_KEY = 'tm-qs-stats';
     const CV_FLAG_KEY = 'tm-qs-content-visibility';
     const WARM_FLAG_KEY = 'tm-qs-warm';
     const LEARN_INDEX_KEY = 'tm-qs-origin-index';
     const NET_KEY = 'tm-qs-net';
+    // Unsuffixed, like NET_KEY: one tally across every site.
+    const STATS_ALL_KEY = 'tm-qs-stats-all';
 
-    const ORIGIN_KEYS = [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_VITALS_KEY, LEARN_TRANSITIONS_KEY];
+    const ORIGIN_KEYS = [LEARN_LCP_KEY, LEARN_ORIGINS_KEY, LEARN_VITALS_KEY, LEARN_TRANSITIONS_KEY,
+        LEARN_SPA_KEY, STATS_KEY];
     const FLAG_KEYS = [CV_FLAG_KEY, WARM_FLAG_KEY];
-    const GLOBAL_KEYS = [LEARN_INDEX_KEY, NET_KEY];
+    const GLOBAL_KEYS = [LEARN_INDEX_KEY, NET_KEY, STATS_ALL_KEY];
 
     const LEARN_MAX_ORIGINS = 150;
 
@@ -439,16 +564,32 @@
     // Same-document route changes
     // =========================================================================
     //
-    // No Navigation API in WebKit, and under @inject-into content a
-    // history.pushState patch would only observe calls made from this script's
-    // own world — the page's router lives in another one and would go
-    // completely undetected. Polling location.href is world-agnostic, costs a
-    // string compare, and stops entirely while the tab is hidden.
+    // Under @inject-into content a history.pushState patch would only observe
+    // calls made from this script's own world — the page's router lives in
+    // another one and would go completely undetected. Two world-agnostic
+    // sources instead: the Navigation API's events where WebKit has it (DOM
+    // events reach every world), and otherwise a poll of location.href that
+    // costs a string compare and stops entirely while the tab is hidden.
 
     const ROUTE_POLL_MS = 400;
     const routeChangeHandlers = [];
     let routeWatcherInstalled = false;
     let watchedHref = location.href;
+
+    // A router answering a link click is the SPA signature, and the pushed URL
+    // has to be the clicked link's: infinite scroll that rewrites the URL as
+    // you read is not a router. Five seconds covers routers that only push
+    // once their data has arrived on a slow response.
+    const LINK_CLICK_WINDOW_MS = 5000;
+    let lastLinkClickAt = 0;
+    let lastLinkClickHref = null;
+
+    function withoutHash(href) {
+        const url = toUrl(href);
+        if (!url) return null;
+        url.hash = '';
+        return url.href;
+    }
 
     function onRouteChange(handler) {
         routeChangeHandlers.push(handler);
@@ -456,9 +597,11 @@
     }
 
     function fireRouteChange() {
+        const recent = Date.now() - lastLinkClickAt < LINK_CLICK_WINDOW_MS;
+        const info = { clickedHref: recent ? lastLinkClickHref : null };
         for (const handler of routeChangeHandlers) {
             try {
-                handler();
+                handler(info);
             } catch (_) {}
         }
     }
@@ -474,6 +617,24 @@
             watchedHref = location.href;
             fireRouteChange();
         };
+
+        // Capture on document runs before the router's own click handler.
+        document.addEventListener('click', event => {
+            const link = getClosestLinkTarget(event.target);
+            if (!link) return;
+            lastLinkClickAt = Date.now();
+            lastLinkClickHref = withoutHash(link.href);
+        }, { passive: true, capture: true });
+
+        // currententrychange fires once the new URL is committed, for push,
+        // replace and traversal alike, so it replaces the poll outright.
+        if (supportsNavigationApi) {
+            try {
+                window.navigation.addEventListener('currententrychange', check);
+                window.addEventListener('hashchange', check);
+                return;
+            } catch (_) {}
+        }
 
         const start = () => {
             if (timer) return;
@@ -506,6 +667,81 @@
         if (document.visibilityState !== 'hidden') start();
     }
 
+    // -------------------------------------------------------------------------
+    // SPA detection
+    // -------------------------------------------------------------------------
+    //
+    // On a site whose router answers link clicks in-page (YouTube, GitHub), a
+    // fetched document is never used: the click becomes a pushState and a JSON
+    // request. One observed click-driven soft navigation switches document
+    // warming off for the origin. Hero pre-warming stays on — a router still
+    // fetches the next route's images — and so does all learning.
+
+    const SPA_FLAG_REFRESH = 24 * HOUR;
+    let knownSpa = false;
+
+    function isKnownSpa() {
+        const flag = readStore(LEARN_SPA_KEY);
+        return Boolean(flag) && Date.now() - (Number(flag.at) || 0) < LEARN_MAX_AGE;
+    }
+
+    function initSpaDetection() {
+        knownSpa = isKnownSpa();
+        let lastRoute = pageKey();
+
+        onRouteChange(info => {
+            // A hash-only change is an in-page anchor, not a route.
+            const next = pageKey();
+            if (next === lastRoute) return;
+            lastRoute = next;
+            if (!info || !info.clickedHref || info.clickedHref !== withoutHash(location.href)) return;
+
+            // Kept alive by use and aged out like everything else, so a site
+            // that drops its client-side router gets warming back.
+            const flag = readStore(LEARN_SPA_KEY);
+            if (!flag || Date.now() - (Number(flag.at) || 0) > SPA_FLAG_REFRESH) {
+                writeStore(LEARN_SPA_KEY, { at: Date.now() });
+            }
+            knownSpa = true;
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Measured outcomes
+    // -------------------------------------------------------------------------
+    //
+    // The hero heuristic is the least certain thing in this port, so it is the
+    // thing worth scoring: was the image preloaded for a route the image that
+    // turned out to be its hero?
+
+    function bumpStats(section, outcome) {
+        const bump = previous => {
+            const stats = (previous && typeof previous === 'object' && !Array.isArray(previous)) ? previous : {};
+            const bucket = (stats[section] && typeof stats[section] === 'object') ? stats[section] : {};
+            bucket[outcome] = (Number(bucket[outcome]) || 0) + 1;
+            stats[section] = bucket;
+            if (!stats.since) stats.since = Date.now();
+            return stats;
+        };
+
+        writeStore(STATS_KEY, bump(readStore(STATS_KEY)));
+
+        // The localStorage fallback is per-origin by nature; there is no
+        // "all sites" to add to.
+        if (!usingGm) return;
+        try {
+            rawWrite(STATS_ALL_KEY, JSON.stringify(bump(readAllStats())));
+        } catch (_) {}
+    }
+
+    function readAllStats() {
+        try {
+            return JSON.parse(rawRead(STATS_ALL_KEY) || 'null');
+        } catch (_) {
+            return null;
+        }
+    }
+
     // =========================================================================
     // Hint emission
     // =========================================================================
@@ -532,10 +768,41 @@
         observer.observe(target, { childList: true, subtree: !root });
     }
 
-    function viewportBucket() {
-        const width = Math.round((window.innerWidth || 0) / 160) * 160;
-        const dpr = Math.round(window.devicePixelRatio || 1);
-        return width + 'x' + dpr;
+    // A different viewport can mean a different layout and so a different hero,
+    // so a record is only reused at a similar width. 320px buckets survive a
+    // nudged window edge; the 160px ones 1.0 used did not.
+    const VIEWPORT_BUCKET_PX = 320;
+
+    function viewportWidthBucket() {
+        return Math.round((window.innerWidth || 0) / VIEWPORT_BUCKET_PX) * VIEWPORT_BUCKET_PX;
+    }
+
+    function currentDpr() {
+        return Math.round(window.devicePixelRatio || 1);
+    }
+
+    function recordBucket(record) {
+        // 1.0 stored "1280x2" at 160px granularity. Re-bucket it rather than
+        // make every learned hero start over.
+        if (typeof record.vw === 'string') {
+            const match = /^(\d+)x(\d+)$/.exec(record.vw);
+            if (!match) return null;
+            return {
+                width: Math.round(Number(match[1]) / VIEWPORT_BUCKET_PX) * VIEWPORT_BUCKET_PX,
+                dpr: Number(match[2])
+            };
+        }
+        return { width: Number(record.vw), dpr: Number(record.dpr) };
+    }
+
+    function matchesViewport(record) {
+        const bucket = recordBucket(record);
+        if (!bucket || bucket.width !== viewportWidthBucket()) return false;
+        // With srcset replayed as imagesrcset the browser picks the density
+        // itself, so zoom (which changes devicePixelRatio) only invalidates a
+        // src-only hero — or any hero on a Safari too old for imagesrcset,
+        // where the preload falls back to the URL resolved for the old density.
+        return (Boolean(record.srcset) && supportsImageSrcset) || bucket.dpr === currentDpr();
     }
 
     function pageKey() {
@@ -625,6 +892,8 @@
     // Part B: font-display injection
     // =========================================================================
 
+    const ICON_FONT_FAMILY = /icon|awesome|glyph|symbol|fontello|icomoon|material|dashicons|octicon|feather|ionic|remixicon/i;
+
     function initFontDisplaySwap() {
         if (typeof CSSFontFaceRule === 'undefined') return;
 
@@ -649,6 +918,11 @@
 
                 for (const rule of rules) {
                     if (!(rule instanceof CSSFontFaceRule)) continue;
+                    // An icon font has no readable fallback: 'swap' flashes
+                    // ligature text or empty boxes, and 'optional' on a slow
+                    // link can leave the hamburger menu blank all visit (Font
+                    // Awesome 4.7 and Glyphicons declare no display at all).
+                    if (ICON_FONT_FAMILY.test(rule.style.getPropertyValue('font-family'))) continue;
 
                     if (!rule.style.fontDisplay) {
                         rule.style.fontDisplay = displayValue;
@@ -739,8 +1013,10 @@
     //
     // Chrome's version of this reads the LCP entry, which is authoritative:
     // the browser tells you exactly which element it considered largest at
-    // paint time. WebKit exposes nothing equivalent, so the hero is found by
-    // measuring — the largest image intersecting the first viewport, taken
+    // paint time. Where WebKit reports LCP too, so does this — for the initial
+    // load of a document. Everywhere else, and for every route reached by a
+    // client-side navigation (which LCP never reports on), the hero is found
+    // by measuring: the largest image intersecting the first viewport, taken
     // after load once layout is stable.
     //
     // That is a guess where Chrome had a fact, and it is wrong in a predictable
@@ -761,7 +1037,12 @@
     // Chrome build's gate and is not made to wait an extra visit for a doubt
     // that does not apply to it.
     const LEARN_MIN_SIGHTINGS = 3;
-    const LEARN_ORIGIN_MIN_SIGHTINGS = 2;
+    // A record taken from a real LCP entry is a measurement, so it gets the
+    // Chrome build's gate.
+    const LEARN_LCP_MIN_SIGHTINGS = 2;
+    // One sighting: the preconnect acts on the second visit. A preconnect
+    // that turns out unneeded costs one idle socket, not a request.
+    const LEARN_ORIGIN_MIN_SIGHTINGS = 1;
     const LEARN_EARLY_RESOURCE_MS = 4000;
     const LEARN_SETTLE_MS = 3000;
     // A hero is a substantial part of the first screen. Below this the
@@ -773,6 +1054,23 @@
 
     let learnedLcpUrl = null;
     let emittedPreloadFor = null;
+    // Which route a hero preload went out for, and every URL that would count
+    // as it being right: with imagesrcset the browser may pick any candidate,
+    // all of which are the same image.
+    let heroPreload = null;
+
+    function minSightings(record) {
+        return record && record.src === 'lcp' ? LEARN_LCP_MIN_SIGHTINGS : LEARN_MIN_SIGHTINGS;
+    }
+
+    function preloadUrls(record) {
+        const urls = [record.url];
+        for (const candidate of String(record.srcset || '').split(',')) {
+            const url = toUrl(candidate.trim().split(/\s+/)[0]);
+            if (url) urls.push(url.href);
+        }
+        return urls;
+    }
 
     function applyLearnedHints(route) {
         const key = route || pageKey();
@@ -784,13 +1082,14 @@
         if (
             record
             && typeof record.url === 'string'
-            && (Number(record.seen) || 0) >= LEARN_MIN_SIGHTINGS
-            && record.vw === viewportBucket()
+            && (Number(record.seen) || 0) >= minSightings(record)
+            && matchesViewport(record)
             && Date.now() - (Number(record.at) || 0) < LEARN_MAX_AGE
             && emittedPreloadFor !== record.url
         ) {
             learnedLcpUrl = record.url;
             emittedPreloadFor = record.url;
+            heroPreload = { route: key, urls: preloadUrls(record) };
 
             try {
                 const link = document.createElement('link');
@@ -831,7 +1130,7 @@
 
         const originStore = readStore(LEARN_ORIGINS_KEY);
         const origins = (originStore && Array.isArray(originStore.origins)) ? originStore.origins : [];
-        const budget = tier === TIER_SLOW ? 2 : (tier === TIER_MODERATE ? 3 : 4);
+        const budget = tier === TIER_SLOW ? 2 : (tier === TIER_MODERATE ? 3 : 6);
 
         let used = 0;
         for (const entry of origins) {
@@ -909,12 +1208,16 @@
             const url = toUrl(src);
             if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) continue;
 
+            // Inside <picture> the browser chose currentSrc from a <source>,
+            // often AVIF or WebP. The <img>'s own srcset is only the fallback,
+            // so replaying it would preload a JPEG the page never uses.
+            const inPicture = Boolean(img.parentElement && img.parentElement.tagName === 'PICTURE');
             bestArea = area;
             best = {
                 url: url.href,
                 cors: img.crossOrigin || null,
-                srcset: img.getAttribute('srcset'),
-                sizes: img.getAttribute('sizes')
+                srcset: inPicture ? null : img.getAttribute('srcset'),
+                sizes: inPicture ? null : img.getAttribute('sizes')
             };
         }
 
@@ -948,10 +1251,58 @@
         let currentRoute = pageKey();
         let persistedRoute = null;
         let settleTimer = null;
+        // LCP only ever describes the document's initial load. After the first
+        // client-side navigation it falls silent and geometry is all there is.
+        let softNavigated = false;
+        let lcpEntry = null;
 
-        function persistHero(route, observed) {
+        if (supportsLcp) {
+            try {
+                const observer = new PerformanceObserver(list => {
+                    for (const entry of list.getEntries()) {
+                        // Reported repeatedly as larger candidates paint; the
+                        // last one wins. A text LCP has nothing to preload, but
+                        // it does replace an earlier image: a logo that painted
+                        // first and then lost to a headline is not the hero.
+                        if (!entry) continue;
+                        if (!entry.url) {
+                            lcpEntry = null;
+                            continue;
+                        }
+
+                        // Snapshot now: entry.element is null once the element
+                        // leaves the document, routine for carousels, and a
+                        // crossOrigin read as null then is the CORS-mode
+                        // mismatch that turns a preload into a second download.
+                        const element = entry.element;
+                        const inPicture = Boolean(element && element.parentElement
+                            && element.parentElement.tagName === 'PICTURE');
+                        const readAttr = name => (!inPicture && element && element.getAttribute)
+                            ? element.getAttribute(name)
+                            : null;
+                        lcpEntry = {
+                            url: entry.url,
+                            startTime: entry.startTime,
+                            cors: (element && element.crossOrigin) || null,
+                            srcset: readAttr('srcset'),
+                            sizes: readAttr('sizes'),
+                            route: currentRoute
+                        };
+                    }
+                });
+                observer.observe({ type: 'largest-contentful-paint', buffered: true });
+            } catch (_) {}
+        }
+
+        function persistHero(route, observed, hardLoad) {
             if (!route || persistedRoute === route) return;
             persistedRoute = route;
+
+            if (heroPreload && heroPreload.route === route) {
+                const painted = observed && observed.url ? toUrl(observed.url) : null;
+                bumpStats('hero', painted && heroPreload.urls.includes(painted.href) ? 'hit' : 'miss');
+                heroPreload = null;
+            }
 
             if (!observed || !observed.url) {
                 // No qualifying image on this route: redesigned to a text
@@ -968,17 +1319,23 @@
                 return;
             }
 
+            const url = toUrl(observed.url);
+            if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) return;
+
             const store = readStore(LEARN_LCP_KEY) || {};
             const previous = store[route];
-            const bucket = viewportBucket();
-            const sameTarget = Boolean(previous && previous.url === observed.url && previous.vw === bucket);
+            const sameTarget = Boolean(previous && previous.url === url.href && matchesViewport(previous));
 
             store[route] = {
-                url: observed.url,
+                url: url.href,
                 cors: observed.cors,
                 srcset: observed.srcset,
                 sizes: observed.sizes,
-                vw: bucket,
+                // Which gate the record answers to: 'lcp' was measured by the
+                // browser, 'geo' was guessed from layout.
+                src: observed.src,
+                vw: viewportWidthBucket(),
+                dpr: currentDpr(),
                 at: Date.now(),
                 // A changed target resets confidence rather than accumulating
                 // it. With a geometric heuristic this is doing more work than
@@ -990,22 +1347,32 @@
 
             writeStore(LEARN_LCP_KEY, capStore(store, LEARN_LCP_MAX_ENTRIES));
 
-            // No LCP in WebKit, so the vitals sample is FCP. It is a different
-            // number and is reported as such — it says when the page started
-            // being useful, not when it finished.
-            const fcp = firstContentfulPaint();
-            if (Number.isFinite(fcp) && fcp > 0) {
-                const vitals = readStore(LEARN_VITALS_KEY) || {};
-                const samples = Array.isArray(vitals.fcp) ? vitals.fcp.filter(Number.isFinite) : [];
-                samples.push(Math.round(fcp));
-                writeStore(LEARN_VITALS_KEY, { fcp: samples.slice(-LEARN_VITALS_SAMPLES) });
+            // Both paint timings belong to the document's initial load. A
+            // client-side route has neither, and filing the document's FCP
+            // again under every route it visits would drag the median toward
+            // whichever page happened to be loaded first.
+            if (!hardLoad) return;
+            const vitals = readStore(LEARN_VITALS_KEY) || {};
+            const next = {};
+            const lcp = observed.src === 'lcp' ? observed.startTime : null;
+            for (const [name, value] of [['fcp', firstContentfulPaint()], ['lcp', lcp]]) {
+                const samples = Array.isArray(vitals[name]) ? vitals[name].filter(Number.isFinite) : [];
+                if (Number.isFinite(value) && value > 0) samples.push(Math.round(value));
+                if (samples.length) next[name] = samples.slice(-LEARN_VITALS_SAMPLES);
             }
+            writeStore(LEARN_VITALS_KEY, next);
         }
 
         // Safe only while the document still shows currentRoute.
         function observe() {
             if (!sawLoad || hiddenBeforeLoad) return;
-            pending = { route: currentRoute, hero: heroCandidate() };
+            if (supportsLcp && !softNavigated) {
+                const entry = lcpEntry && lcpEntry.route === currentRoute ? lcpEntry : null;
+                pending = { route: currentRoute, hard: true, hero: entry ? Object.assign({ src: 'lcp' }, entry) : null };
+                return;
+            }
+            const hero = heroCandidate();
+            pending = { route: currentRoute, hard: !softNavigated, hero: hero ? Object.assign({ src: 'geo' }, hero) : null };
         }
 
         function settle(measure) {
@@ -1016,7 +1383,7 @@
             // null there would decrement a record on the strength of never
             // having looked.
             if (!pending || pending.route !== currentRoute) return;
-            persistHero(pending.route, pending.hero);
+            persistHero(pending.route, pending.hero, pending.hard);
         }
 
         function scheduleSettle() {
@@ -1036,9 +1403,11 @@
             // it, and if it never ran there is nothing to record.
             settle(false);
 
+            softNavigated = true;
             currentRoute = next;
             persistedRoute = null;
             pending = null;
+            lcpEntry = null;
             emittedPreloadFor = null;
             learnedLcpUrl = null;
 
@@ -1174,15 +1543,21 @@
         const now = Date.now();
 
         const entry = (store[from] && typeof store[from] === 'object') ? store[from] : { t: {}, at: 0 };
-        const targets = (entry.t && typeof entry.t === 'object') ? entry.t : {};
+        const targets = readTargets(entry, now);
 
-        targets[to] = (Number(targets[to]) || 0) + 1;
+        targets[to] = { n: (targets[to] ? targets[to].n : 0) + 1, at: now };
 
         // A page that leads everywhere predicts nothing, and storing its whole
-        // fan-out just spends quota to dilute the ranking.
+        // fan-out just spends quota to dilute the ranking. The destination just
+        // taken always stays: through 1.0 a new one tied at 1 with the
+        // incumbents, sorted last and was cut, so once a page had four targets
+        // it could never learn another — and the source's refreshed timestamp
+        // kept the stale four alive indefinitely.
         const ranked = Object.entries(targets)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, TRANSITION_MAX_TARGETS);
+            .filter(([path]) => path !== to)
+            .sort((a, b) => (b[1].n - a[1].n) || (b[1].at - a[1].at))
+            .slice(0, TRANSITION_MAX_TARGETS - 1);
+        ranked.push([to, targets[to]]);
 
         store[from] = { t: Object.fromEntries(ranked), at: now };
 
@@ -1194,16 +1569,29 @@
         writeStore(LEARN_TRANSITIONS_KEY, Object.fromEntries(live));
     }
 
+    // Targets are { n, at } since 1.1.0. A 1.0 bare count inherits the
+    // source's timestamp, and from then on each target ages out on its own.
+    function readTargets(entry, now) {
+        const raw = (entry && entry.t && typeof entry.t === 'object') ? entry.t : {};
+        const targets = {};
+        for (const [path, value] of Object.entries(raw)) {
+            const n = typeof value === 'number' ? value : Number(value && value.n) || 0;
+            const at = typeof value === 'number' ? Number(entry.at) || 0 : Number(value && value.at) || 0;
+            if (n > 0 && now - at < LEARN_MAX_AGE) targets[path] = { n, at };
+        }
+        return targets;
+    }
+
     function predictNext(fromPath) {
         const store = readStore(LEARN_TRANSITIONS_KEY);
         const entry = store && store[String(fromPath || '').slice(0, 200)];
         if (!entry || !entry.t) return [];
 
-        return Object.entries(entry.t)
-            .filter(([, count]) => (Number(count) || 0) >= TRANSITION_MIN_CONFIDENCE)
-            .sort((a, b) => b[1] - a[1])
+        return Object.entries(readTargets(entry, Date.now()))
+            .filter(([, target]) => target.n >= TRANSITION_MIN_CONFIDENCE)
+            .sort((a, b) => (b[1].n - a[1].n) || (b[1].at - a[1].at))
             .slice(0, 2)
-            .map(([path, count]) => ({ path, count }));
+            .map(([path, target]) => ({ path, count: target.n }));
     }
 
     function isNavigationEligible(url) {
@@ -1217,7 +1605,7 @@
         // side effect. A false positive here only costs a missed prediction.
         const candidate = url.pathname + url.search;
         if (DOWNLOAD_REGEX.test(candidate)) return false;
-        if (SENSITIVE_HREF_REGEX.test(candidate)) return false;
+        if (isSensitiveHref(url.pathname, candidate)) return false;
         return true;
     }
 
@@ -1252,8 +1640,8 @@
         const lcpStore = readStore(LEARN_LCP_KEY);
         const record = lcpStore && lcpStore[best.path];
         if (!record || typeof record.url !== 'string') return;
-        if ((Number(record.seen) || 0) < LEARN_MIN_SIGHTINGS) return;
-        if (record.vw !== viewportBucket()) return;
+        if ((Number(record.seen) || 0) < minSightings(record)) return;
+        if (!matchesViewport(record)) return;
         if (Date.now() - (Number(record.at) || 0) >= LEARN_MAX_AGE) return;
         if (preWarmedHero === record.url) return;
 
@@ -1348,6 +1736,18 @@
         warmed.add(url.href);
         warmCount += 1;
 
+        // The browser's own mechanism where WebKit has it, rather than a
+        // request that looks exactly like a visit.
+        if (supportsLinkPrefetch) {
+            try {
+                const hint = document.createElement('link');
+                hint.rel = 'prefetch';
+                hint.href = url.href;
+                appendToHead(hint);
+                return;
+            } catch (_) {}
+        }
+
         try {
             fetch(url.href, {
                 method: 'GET',
@@ -1379,12 +1779,25 @@
 
             const href = link.getAttribute('href') || '';
             if (DOWNLOAD_REGEX.test(href) || /download/i.test(href)) return false;
-            if (link.target || link.download || /\b(?:nofollow|external)\b/i.test(link.rel || '')) return false;
+            // Pointerdown is not a click: a confirm() in the click handler, or
+            // a drag off the link, means the user never agreed to this GET.
+            // The raw href is checked as well as the resolved path, because
+            // that is where a relative action link keeps its token.
+            if (isSensitiveHref(url.pathname, href)) return false;
+            // '' and '_self' stay in this tab exactly like no target at all
+            // (BBC's whole navigation is target="_self").
+            const target = (link.getAttribute('target') || '').toLowerCase();
+            if (target && target !== '_self') return false;
+            // .download is "" for a bare <a download>, so ask for the attribute.
+            if (link.getAttribute('download') !== null || /\b(?:nofollow|external)\b/i.test(link.rel || '')) return false;
 
             return true;
         }
 
         document.addEventListener('pointerdown', e => {
+            // An in-page router answers the click itself; the document we
+            // would fetch is never used.
+            if (knownSpa) return;
             // A modified click opens a tab or downloads; neither benefits, and
             // the second is a file we should not be pulling twice.
             if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -1394,7 +1807,7 @@
     }
 
     function maybeWarmPredictedDocument() {
-        if (!documentWarmingEnabled()) return;
+        if (!documentWarmingEnabled() || knownSpa) return;
         if (getConnectionTier() !== TIER_FAST) return;
         if (!predictedTargets.length) return;
 
@@ -1707,17 +2120,18 @@
         const lines = [];
         const feature = (mark, name, detail) => lines.push('  ' + mark + ' ' + name + '\n      ' + detail);
 
-        lines.push('Quicksilver Safari 1.0.0 — ' + location.origin + route);
+        lines.push('Quicksilver Safari ' + SCRIPT_VERSION + ' — ' + location.origin + route);
         lines.push('');
         lines.push('ACTIVE ON THIS PAGE');
 
         feature('●', 'Hover preconnect', 'DNS + TLS opened on hover, focus or touch');
 
         if (learnedLcpUrl) {
-            feature('●', 'Learned hero preload', 'preloading this route’s hero image');
+            feature('●', 'Learned hero preload', 'preloading this route’s hero image'
+                + (record && record.src === 'lcp' ? ' (measured LCP)' : ' (largest first-screen image)'));
         } else if (record) {
             const seen = Number(record.seen) || 0;
-            const need = Math.max(0, LEARN_MIN_SIGHTINGS - seen);
+            const need = Math.max(0, minSightings(record) - seen);
             feature('◐', 'Learned hero preload', need > 0
                 ? 'seen ' + seen + '× — ' + need + ' more visit' + (need === 1 ? '' : 's') + ' before it acts'
                 : 'record exists but did not match this viewport');
@@ -1736,20 +2150,33 @@
                 'learns where you go from here — needs ' + TRANSITION_MIN_CONFIDENCE + ' visits along the same path');
         }
 
-        feature(documentWarmingEnabled() ? '●' : '○', 'Document warming',
-            documentWarmingEnabled()
-                ? 'fetching same-origin pages on pointerdown'
-                : 'off for this origin — Safari has no prefetch, see the toggle');
+        feature(documentWarmingEnabled() && !knownSpa ? '●' : '○', 'Document warming',
+            !documentWarmingEnabled()
+                ? 'off for this origin — Safari has no speculation rules, see the toggle'
+                : knownSpa
+                    ? 'off — this site answers link clicks in-page, so a fetched page is never used'
+                    : (supportsLinkPrefetch ? 'prefetching' : 'fetching') + ' same-origin pages on pointerdown');
 
         feature(contentVisibilityEnabled() ? (supportsContentVisibility ? '●' : '○') : '○', 'Aggressive rendering',
             !contentVisibilityEnabled() ? 'off for this origin'
                 : (supportsContentVisibility ? 'skipping layout for offscreen sections'
                     : 'enabled, but this Safari has no content-visibility'));
 
-        const samples = (vitals && Array.isArray(vitals.fcp) ? vitals.fcp : []).filter(Number.isFinite);
-        const fcpText = samples.length
-            ? median(samples) + ' ms (median of ' + samples.length + ')'
-            : 'no samples yet';
+        const describeSamples = values => {
+            const samples = (Array.isArray(values) ? values : []).filter(Number.isFinite);
+            return samples.length ? median(samples) + ' ms (median of ' + samples.length + ')' : null;
+        };
+        const fcpText = describeSamples(vitals && vitals.fcp) || 'no samples yet';
+        const lcpText = describeSamples(vitals && vitals.lcp);
+
+        // Hit rate of the hero preload: was the preloaded image the hero that
+        // painted? Low numbers mean the heuristic is guessing wrong here.
+        const describeHero = stats => {
+            const hero = (stats && stats.hero) || {};
+            const hit = Number(hero.hit) || 0;
+            const total = hit + (Number(hero.miss) || 0);
+            return total ? hit + ' of ' + total + ' (' + Math.round((hit / total) * 100) + '%)' : 'no preloads scored yet';
+        };
 
         const netSamples = readNetSamples();
         const netText = netSamples.length
@@ -1763,6 +2190,12 @@
             ? originStore.origins.length : 0));
         lines.push('  Navigation sources         ' + (transitions ? Object.keys(transitions).length : 0));
         lines.push('  Median FCP                 ' + fcpText);
+        if (lcpText) lines.push('  Median LCP                 ' + lcpText);
+        lines.push('  Client-side router         ' + (knownSpa ? 'yes — document warming is off here' : 'not seen'));
+        lines.push('');
+        lines.push('MEASURED');
+        lines.push('  Hero preload was the hero  ' + describeHero(readStore(STATS_KEY)) + ' on this site');
+        if (usingGm) lines.push('                             ' + describeHero(readAllStats()) + ' on all sites');
         lines.push('');
         lines.push('ENVIRONMENT');
         lines.push('  Connection                 ' + tierName(tier) + ' — ' + netText);
@@ -1771,6 +2204,9 @@
         lines.push('  fetchpriority              ' + (supportsFetchPriority ? 'yes' : 'no'));
         lines.push('  imagesrcset preload        ' + (supportsImageSrcset ? 'yes' : 'no'));
         lines.push('  content-visibility         ' + (supportsContentVisibility ? 'yes' : 'no'));
+        lines.push('  LCP entries                ' + (supportsLcp ? 'yes — heroes are measured' : 'no — heroes are found by layout'));
+        lines.push('  Navigation API             ' + (supportsNavigationApi ? 'yes — no route polling' : 'no — polling every 400ms while visible'));
+        lines.push('  <link rel=prefetch>        ' + (supportsLinkPrefetch ? 'yes' : 'no'));
 
         return lines.join('\n');
     }
@@ -1782,8 +2218,10 @@
             for (const key of ORIGIN_KEYS) deleteStore(key);
             learnedLcpUrl = null;
             emittedPreloadFor = null;
+            heroPreload = null;
             predictedTargets = [];
             preWarmedHero = null;
+            knownSpa = false;
             showPanel('Quicksilver forgot everything learned for ' + location.origin
                 + '.\n\nThe per-origin preferences were kept.');
         });
@@ -1856,6 +2294,7 @@
         // Anything computed from an empty store before this point is void.
         cachedTier = null;
 
+        safely(initSpaDetection);
         safely(() => applyLearnedHints());
         safely(initLearning);
         safely(initTransitionLearning);

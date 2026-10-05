@@ -28,6 +28,18 @@ the geometric hero heuristic and its raised three-sighting gate, the connection
 tier learned from Navigation Timing, and the same scope limits on transition
 learning the Chrome build has.
 
+1.1.0 adds what was ported from the Chrome build's 4.1.0 and 4.2.0, asserted
+where a wrong answer costs the most: the action-link filter on the
+document-warming path (a credentialed GET in Safari), `target="_self"` and bare
+`<a download>`, SPA detection switching warming off, transition targets that
+age out and make room for a fifth, `<picture>` heroes, zoom-tolerant viewport
+matching, icon fonts left alone, the origin gate and budget, and hero hit-rate
+scoring. It also stubs the three APIs 1.1.0 feature-detects — LCP, the
+Navigation API and `<link rel=prefetch>` — and checks each is used when
+present and that the 1.0 fallback runs when it is not. Run against 1.0.1,
+23 checks fail before the suite stops at the all-sites hit-rate tally, which
+1.0.1 never writes.
+
 No browser required.
 
 ## `supertube-safari-behaviour.js` — headless, current
