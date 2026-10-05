@@ -40,14 +40,26 @@ Evaluates `Supertube.safari.user.js` against a stubbed **WebKit** DOM and
 asserts what 2.1.0 rests on: that AV1 filtering survives Safari 17+, where
 `ManagedMediaSource` declares its *own* static `isTypeSupported` and so is not
 covered by patching `MediaSource`; that VP9 is never filtered, because 4K
-depends on it and H.264 tops out at 1080p; that selection is capped below the
-8K/5K tiers that have no hardware decode path on Apple Silicon; that the player
-keeps an ABR floor instead of being pinned; that the settings-menu fallback
+depends on it and H.264 tops out at 1080p; that the settings-menu fallback
 honours the same ceiling as the player-API path; and that the `MutationObserver`
-never falls back to observing the whole feed.
+never falls back to observing the whole feed. (2.1.0 also capped selection at
+4K and kept a 1080p ABR floor; 2.3.0 replaces both, see below.)
 
 Seven of its seventeen assertions fail against 2.0.0 — the suite was written to
 pin down real regressions, not to describe code that already worked.
+
+2.3.0 adds assertions grounded in YouTube's own player code (base.js
+`8ab5c328`): the quality menu picks with `setPlaybackQualityRange(q, q,
+formatId)` and a range only counts as locked when min equals max, so the suite
+checks that the pick is pinned and carries its `formatId`, that Premium 1080p
+is chosen that way with no settings-menu walk, that a player whose formats have
+not loaded yet is waited on rather than menu-clicked, that a player still
+holding the previous video is not pinned, that a round ending without a pick
+re-arms on the next player event, that `yt-player-quality` is raised to the
+ceiling in YouTube's current record shape before the player boots, that
+`/live/<id>` is a watch page, and that the dropped-frame guard steps down one
+level at a time, never below 1080p, only measures visible playback at the
+guarded level, and only remembers a limit after failing on two page loads.
 
 No browser required.
 

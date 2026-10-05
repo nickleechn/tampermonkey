@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      2.2.0
-// @description  Safari-only YouTube tuning: hardware-aware codec filtering, telemetry blocking, UI cleanup, and automatic highest-quality selection capped at 4K (1080p Premium when offered).
+// @version      2.3.0
+// @description  Safari-only YouTube tuning: hardware-aware codec filtering, telemetry blocking, UI cleanup, and automatic highest-quality selection (8K included, 1080p Premium when offered) with a dropped-frame guard that steps down when the Mac can't keep up.
 // @author       nickleechn
 // @match        https://www.youtube.com/*
 // @exclude      https://www.youtube.com/live_chat*
@@ -53,12 +53,13 @@
     // Turn off "autoplay next video" via the player API.
     const DISABLE_AUTOPLAY_NEXT = false;
 
-    // Highest quality this script will ever ask for. 8K and 5K have no hardware
-    // decode path on Apple Silicon in Safari, so selecting them drops playback into
-    // software VP9 and produces exactly the dropped frames this script exists to
-    // prevent — on a panel that cannot resolve them anyway. Set to 'highres' to
-    // remove the cap.
-    const MAX_QUALITY = 'hd2160';
+    // Highest quality this script will ever ask for. 'highres' means whatever the
+    // video offers, 8K included. Whether a given Mac can decode 8K/5K in hardware
+    // is not something one vendor hint answers reliably, so instead of refusing
+    // those tiers up front the frame guard below measures it: if playback at a
+    // level above 1080p drops too many frames, it steps down one level and
+    // remembers the limit for this Mac. Set to e.g. 'hd2160' for a hard cap.
+    const MAX_QUALITY = 'highres';
 
     // Safari 17+ exposes ManagedMediaSource, and YouTube picks it up via
     // `self.ManagedMediaSource || self.MediaSource`. MMS hands buffering policy to
@@ -78,10 +79,23 @@
     const DEBUG_STATS = false;
     const DEBUG_STATS_INTERVAL_MS = 5000;
 
-    // Floor handed to setPlaybackQualityRange as its minimum. Pinning min === max
-    // leaves the player no room to adapt, so a bandwidth dip becomes a rebuffer
-    // instead of a brief quality drop. Set to null to pin hard at MAX_QUALITY.
-    const MIN_QUALITY = 'hd1080';
+    // Optional floor handed to setPlaybackQualityRange as its minimum. null pins
+    // min === max, which is exactly what YouTube's own quality menu does when you
+    // pick a resolution — and the player only treats a range as locked when the
+    // two ends are equal. Any floor below the ceiling turns the pick back into
+    // "Auto, between these two", and ABR on a fresh load routinely sits at the
+    // floor. Set e.g. 'hd1080' if you would rather dip than rebuffer.
+    const MIN_QUALITY = null;
+
+    // Dropped-frame guard. After a level above 1080p is selected, it samples
+    // getVideoPlaybackQuality() while the video is visibly playing at that level.
+    // If more than FRAME_GUARD_DROP_RATIO of FRAME_GUARD_MIN_FRAMES frames are
+    // dropped, it steps down one level and remembers the limit for 30 days, keyed
+    // to this Mac and Safari version. It never steps below 1080p and never raises
+    // quality, so it cannot fight a manual pick.
+    const FRAME_GUARD = true;
+    const FRAME_GUARD_DROP_RATIO = 0.1;
+    const FRAME_GUARD_MIN_FRAMES = 300;
 
     /* ==================================================================
      * PART A — Early hooks. Installed once, never torn down.
@@ -117,15 +131,16 @@
     // carries a signature of the things that can change the answer — the machine's
     // core count and the Safari major version. Swap Macs or take an OS update and
     // the old entry is simply not found, costing one conservative load instead of
-    // one wrong one.
-    const AV1_CACHE_KEY = (function () {
-        let signature = '0.0';
+    // one wrong one. The frame guard's learned ceiling is keyed the same way.
+    const HW_SIGNATURE = (function () {
         try {
             const version = (String(navigator.userAgent).match(/version\/(\d+)/i) || [])[1] || '0';
-            signature = String(navigator.hardwareConcurrency || 0) + '.' + version;
-        } catch (_) {}
-        return 'supertube-av1-hw-v2:' + signature;
+            return String(navigator.hardwareConcurrency || 0) + '.' + version;
+        } catch (_) {
+            return '0.0';
+        }
     })();
+    const AV1_CACHE_KEY = 'supertube-av1-hw-v2:' + HW_SIGNATURE;
 
     // Start conservative: assume no hardware AV1 until proven otherwise, so a
     // player that initialises before the async probe resolves never gets handed
@@ -315,6 +330,88 @@
         };
     }
 
+    /* --- A3. Quality ceiling and YouTube's stored preference ----------- */
+
+    const QUALITY_ORDER = [
+        'highres', 'hd2880', 'hd2160', 'hd1440',
+        'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'
+    ];
+    // Same table as YouTube's own quality-name -> height map. The menu fallback
+    // reads heights out of label text ("2160p60"), the API path reads level ids,
+    // and both are compared against one ceiling expressed as a height.
+    const QUALITY_HEIGHTS = {
+        highres: 4320, hd2880: 2880, hd2160: 2160, hd1440: 1440, hd1080: 1080,
+        hd720: 720, large: 480, medium: 360, small: 240, tiny: 144
+    };
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const FRAME_CAP_KEY = 'supertube-frame-cap-v1:' + HW_SIGNATURE;
+    const FRAME_CAP_TTL_MS = 30 * DAY_MS;
+    const PLAYER_QUALITY_KEY = 'yt-player-quality';
+    // YouTube's own lifetime for this record (31104000 s).
+    const PLAYER_QUALITY_TTL_MS = 360 * DAY_MS;
+
+    function heightOf(quality) {
+        return QUALITY_HEIGHTS[quality] || 0;
+    }
+
+    // The lowest height the frame guard has seen this Mac fail to keep up with.
+    // Exclusive: that level and everything above it are refused. A saved record
+    // only counts once it has failed on two separate page loads; see
+    // recordFrameFailure for why one is not enough.
+    let frameCapHeight = Infinity;
+    try {
+        const saved = JSON.parse(localStorage.getItem(FRAME_CAP_KEY) || 'null');
+        if (saved && saved.height > 0 && saved.strikes >= 2 && saved.until > Date.now()) {
+            frameCapHeight = saved.height;
+        }
+    } catch (_) {}
+
+    function getCeilingHeight() {
+        return Math.min(heightOf(MAX_QUALITY) || Infinity, frameCapHeight - 1);
+    }
+
+    // The ceiling as an exact rung of YouTube's ladder. The stored preference is
+    // looked up by exact height, so 4319 would silently mean "no ceiling at all".
+    function getCeilingQuality() {
+        const ceiling = getCeilingHeight();
+        return QUALITY_ORDER.find(function (quality) {
+            return heightOf(quality) <= ceiling;
+        }) || 'tiny';
+    }
+
+    // YouTube reads this record whenever it creates a player and turns it into the
+    // initial constraint "Auto, up to <height>", ignoring it once `creation` is
+    // more than 30 days old. Its own writes look like
+    //   {"data":"{\"quality\":2160,\"previousQuality\":1080}","expiration":…,"creation":…}
+    // — `data` is a JSON *string*. The legacy "data":"hd2160" form is still read,
+    // but writing the current shape means one less thing to break when it is not.
+    function persistPlayerQuality(height) {
+        try {
+            const now = Date.now();
+            let previous = 0;
+            const raw = localStorage.getItem(PLAYER_QUALITY_KEY);
+            if (raw) {
+                const record = JSON.parse(raw);
+                let data = record && record.data;
+                try { data = JSON.parse(data); } catch (_) {}
+                previous = (data && typeof data === 'object') ? Number(data.quality) || 0 : heightOf(data);
+                // Refreshed daily even when unchanged so `creation` never ages out.
+                if (previous === height && now - Number(record.creation) < DAY_MS) return;
+            }
+            localStorage.setItem(PLAYER_QUALITY_KEY, JSON.stringify({
+                data: JSON.stringify({ quality: height, previousQuality: previous || height }),
+                expiration: now + PLAYER_QUALITY_TTL_MS,
+                creation: now
+            }));
+        } catch (_) {}
+    }
+
+    // Synchronous and at document-start, so the first player on the page boots
+    // under this ceiling instead of whatever was last stored. A one-off 720p pick
+    // in another tab would otherwise cap the opening seconds of every new video
+    // until the API pin in part B lands.
+    persistPlayerQuality(heightOf(getCeilingQuality()));
+
     /* ==================================================================
      * PART B — Cleanup CSS, preconnects, and quality selection
      * ================================================================== */
@@ -323,19 +420,12 @@
     const MENU_WAIT_MS = 150;
     const OBSERVER_DEBOUNCE_MS = 250;
     const MAX_ATTEMPTS_PER_VIDEO = 4;
-    const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
-    const QUALITY_ORDER = [
-        'highres', 'hd2880', 'hd2160', 'hd1440',
-        'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'
-    ];
     const PREMIUM_RE = /\b(?:premium|enhanced bitrate)\b/i;
-    // The menu fallback reads resolutions out of label text ("2160p60"), not level
-    // ids, so MAX_QUALITY has to be expressible as a height for it to share the cap.
-    const QUALITY_HEIGHTS = {
-        highres: 4320, hd2880: 2880, hd2160: 2160, hd1440: 1440, hd1080: 1080,
-        hd720: 720, large: 480, medium: 360, small: 240, tiny: 144
-    };
-    const MAX_QUALITY_HEIGHT = QUALITY_HEIGHTS[MAX_QUALITY] || Infinity;
+    const FRAME_GUARD_MIN_HEIGHT = 1440;
+    const FRAME_GUARD_SAMPLE_MS = 2000;
+    // ~3 minutes of sampling. Long enough to outlast a pause or a background tab,
+    // short enough that a video left open does not keep a timer alive forever.
+    const FRAME_GUARD_MAX_SAMPLES = 90;
     // Apex googlevideo.com does not warm the real CDN hosts, and the per-session
     // rr*---sn-*.googlevideo.com name is unknowable ahead of time, so media
     // preconnects are not attempted at all.
@@ -407,7 +497,6 @@
     let styleElement = null;
     let currentVideoKey = '';
     let completedVideoKey = '';
-    let premiumSelectedKey = '';
     let autonavDisabledKey = '';
     let activeScheduleKey = '';
     let attempts = 0;
@@ -416,6 +505,7 @@
     let watchedVideo = null;
     let removeVideoListeners = null;
     let qualitySelectionRunning = false;
+    let frameGuard = null;
 
     function addListener(target, type, listener, options) {
         target.addEventListener(type, listener, options);
@@ -463,21 +553,33 @@
         return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
     }
 
-    function getVideoKey() {
+    // Live streams are linked as /live/<id> and YouTube renders the ordinary
+    // watch page there without rewriting the URL, so a `v`-only test skipped
+    // them entirely.
+    function getWatchVideoId() {
         try {
             const url = new URL(location.href);
-            return url.searchParams.get('v') || url.pathname;
+            const id = url.searchParams.get('v');
+            if (id) return id;
+            const live = url.pathname.match(/^\/live\/([\w-]{11})(?:[/?#]|$)/);
+            return live ? live[1] : '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function getVideoKey() {
+        const id = getWatchVideoId();
+        if (id) return id;
+        try {
+            return new URL(location.href).pathname;
         } catch (_) {
             return location.href;
         }
     }
 
     function isWatchPage() {
-        try {
-            return Boolean(new URL(location.href).searchParams.get('v'));
-        } catch (_) {
-            return false;
-        }
+        return Boolean(getWatchVideoId());
     }
 
     function getPlayer() {
@@ -510,6 +612,16 @@
         if (button && button.getAttribute('aria-expanded') === 'true') button.click();
     }
 
+    // The quality API is attached to the player element a beat after the element
+    // itself exists. Its absence is the one case the settings-menu fallback is
+    // for; its presence with nothing to report only means "not loaded yet".
+    function hasQualityApi(player) {
+        return Boolean(player) &&
+            typeof player.getAvailableQualityLevels === 'function' &&
+            (typeof player.setPlaybackQualityRange === 'function' ||
+                typeof player.setPlaybackQuality === 'function');
+    }
+
     function getAvailableQualityLevels(player) {
         if (!player || typeof player.getAvailableQualityLevels !== 'function') return [];
         try {
@@ -533,76 +645,71 @@
         }
     }
 
-    function rankQuality(quality) {
-        const index = QUALITY_ORDER.indexOf(quality);
-        return index === -1 ? QUALITY_ORDER.length : index;
+    // The video the player has actually loaded. On an SPA navigation this lags
+    // the URL, and a pin made in that window lands on the outgoing video's data
+    // while the new one boots unpinned.
+    function getPlayerVideoId(player) {
+        try {
+            const data = typeof player.getVideoData === 'function' ? player.getVideoData() : null;
+            return (data && data.video_id) || '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function isPremiumEntry(entry) {
+        return Boolean(entry.paygatedQualityDetails) ||
+            PREMIUM_RE.test([entry.qualityLabel, entry.label, entry.name].filter(Boolean).join(' '));
     }
 
     function chooseTargetQuality(levels, qualityData) {
         // Prefer the levels the player reports as playable; fall back to the raw
         // level list when getAvailableQualityData is unavailable.
-        const playableLevels = qualityData.length
-            ? qualityData.map(function (entry) { return entry.quality; }).filter(Boolean)
-            : [];
+        const playableLevels = qualityData.map(function (entry) { return entry.quality; }).filter(Boolean);
         const candidates = playableLevels.length ? playableLevels : levels;
 
-        // A lower rank index means a higher resolution, so the cap is a lower
-        // bound on the index. Filter before sorting so uniqueLevels[0] is the best
-        // *allowed* level rather than the best available one.
-        const maxRank = rankQuality(MAX_QUALITY);
-        const uniqueLevels = Array.from(new Set(candidates))
-            .filter(function (quality) { return rankQuality(quality) >= maxRank; })
-            .sort(function (left, right) {
-                return rankQuality(left) - rankQuality(right);
-            });
-        if (!uniqueLevels.length) return null;
+        // Filter while picking so the result is the best *allowed* level rather
+        // than the best available one. 'auto' and unknown ids have no height and
+        // drop out here too.
+        const ceiling = getCeilingHeight();
+        let bestQuality = null;
+        for (const quality of candidates) {
+            const height = heightOf(quality);
+            if (height && height <= ceiling && height > heightOf(bestQuality)) bestQuality = quality;
+        }
+        if (!bestQuality) return null;
 
-        const bestQuality = uniqueLevels[0];
+        // "1080p Premium" and plain "1080p" share the quality id hd1080; only the
+        // formatId tells them apart, so it is carried along with the pick.
         const matchingData = qualityData.filter(function (entry) {
             return entry.quality === bestQuality;
         });
-        const premiumData = matchingData.find(function (entry) {
-            return PREMIUM_RE.test([entry.qualityLabel, entry.label, entry.name].filter(Boolean).join(' '));
-        });
+        const entry = matchingData.find(isPremiumEntry) || matchingData[0] || null;
 
         return {
             quality: bestQuality,
-            wantsPremium1080: bestQuality === 'hd1080' && Boolean(premiumData),
-            displayLabel: (premiumData || matchingData[0] || {}).qualityLabel || ''
+            formatId: (entry && entry.formatId) || ''
         };
     }
 
-    function persistPlayerQuality(quality) {
-        // Deliberately re-reads localStorage rather than memoising the last value
-        // written. A memo is only correct while this tab is the only writer, and
-        // another tab settling on a lower quality would then be left in place
-        // because this one "already wrote" the value it wanted. The read costs
-        // microseconds and happens at most MAX_ATTEMPTS_PER_VIDEO times per video,
-        // which is not worth a cross-tab correctness hole.
-        try {
-            const current = localStorage.getItem('yt-player-quality');
-            if (current) {
-                const parsed = JSON.parse(current);
-                if (parsed && parsed.data === quality) return;
-            }
-            const now = Date.now();
-            localStorage.setItem('yt-player-quality', JSON.stringify({
-                data: quality,
-                expiration: now + MONTH_MS,
-                creation: now
-            }));
-        } catch (_) {}
-    }
-
-    function applyQualityViaApi(player, quality) {
+    function applyQualityViaApi(player, choice) {
+        const quality = choice.quality;
+        // Never let the floor outrank the ceiling.
+        const floor = (MIN_QUALITY && heightOf(MIN_QUALITY) && heightOf(MIN_QUALITY) <= heightOf(quality))
+            ? MIN_QUALITY
+            : quality;
         try {
             if (typeof player.setPlaybackQualityRange === 'function') {
-                // Ceiling stays at the chosen quality; the floor gives ABR somewhere
-                // to go on a bandwidth dip. Never let the floor outrank the ceiling.
-                const floor = (MIN_QUALITY && rankQuality(MIN_QUALITY) >= rankQuality(quality))
-                    ? MIN_QUALITY
-                    : quality;
-                player.setPlaybackQualityRange(floor, quality);
+                // The same call YouTube's own quality menu makes for a pick:
+                // setPlaybackQuality(q, formatId) -> setPlaybackQualityRange(q, q, formatId).
+                // The formatId is what selects "1080p Premium" over plain 1080p
+                // without driving the settings menu. A floored range is not one
+                // format, so it goes without.
+                if (floor === quality && choice.formatId) {
+                    player.setPlaybackQualityRange(quality, quality, choice.formatId);
+                } else {
+                    player.setPlaybackQualityRange(floor, quality);
+                }
                 return true;
             }
         } catch (_) {}
@@ -642,11 +749,12 @@
     }
 
     function chooseHighestMenuQuality(items) {
-        // Cap here too. This path runs whenever the player API is missing or
-        // setPlaybackQualityRange fails, and without the filter it happily selects
-        // 8K straight past MAX_QUALITY.
+        // Cap here too. This path reads heights out of label text, so it shares
+        // the ceiling (MAX_QUALITY and anything the frame guard learned) as a
+        // height rather than through chooseTargetQuality.
+        const ceiling = getCeilingHeight();
         const choices = items.map(parseQuality).filter(Boolean)
-            .filter(function (choice) { return choice.resolution <= MAX_QUALITY_HEIGHT; });
+            .filter(function (choice) { return choice.resolution <= ceiling; });
         choices.sort(function (left, right) {
             if (right.resolution !== left.resolution) return right.resolution - left.resolution;
             if (right.premium !== left.premium) return Number(right.premium) - Number(left.premium);
@@ -681,28 +789,6 @@
         return !stopped;
     }
 
-    async function selectPremiumInMenu(player, targetLabel) {
-        if (!await openQualityMenu(player)) {
-            closeSettings(player);
-            return false;
-        }
-
-        const targetText = normalizeText(targetLabel);
-        const premiumOption = getVisibleMenuItems(player).find(function (item) {
-            const text = normalizeText(item.textContent);
-            if (!text.includes('1080p') || !PREMIUM_RE.test(text)) return false;
-            return !targetText || text.includes(targetText) || targetText.includes(text);
-        });
-
-        if (!premiumOption) {
-            closeSettings(player);
-            return false;
-        }
-
-        premiumOption.click();
-        return true;
-    }
-
     async function selectHighestQualityViaMenu(player) {
         if (!await openQualityMenu(player)) {
             closeSettings(player);
@@ -720,7 +806,12 @@
         return true;
     }
 
-    async function selectHighestQuality() {
+    function markCompleted(videoKey) {
+        completedVideoKey = videoKey;
+        clearApplyTimers();
+    }
+
+    function selectHighestQuality() {
         if (stopped || qualitySelectionRunning || attempts >= MAX_ATTEMPTS_PER_VIDEO) return;
         if (!isWatchPage()) return;
 
@@ -730,64 +821,174 @@
         const player = getPlayer();
         if (!player) return;
 
-        const levels = getAvailableQualityLevels(player);
-        const choice = chooseTargetQuality(levels, getAvailableQualityData(player));
-        // Don't burn an attempt while the player is still initialising.
-        if (!choice && !getSettingsButton(player)) return;
+        if (!hasQualityApi(player)) {
+            selectViaMenuFallback(player, expectedVideoKey);
+            return;
+        }
+
+        // Formats not loaded yet, or the player still holds the previous video:
+        // wait for the next scheduled try or player event. Neither case spends an
+        // attempt, and neither touches the settings menu — falling back to it here
+        // flashed the panel open on ordinary loads and burned the attempts the
+        // real pick needed a moment later.
+        const playerVideoId = getPlayerVideoId(player);
+        if (playerVideoId && playerVideoId !== expectedVideoKey) return;
+        const choice = chooseTargetQuality(getAvailableQualityLevels(player), getAvailableQualityData(player));
+        if (!choice) return;
+
+        attempts += 1;
+        disableAutonavOnce(player, expectedVideoKey);
+        if (!applyQualityViaApi(player, choice)) return;
+
+        // After the pin, not before: the player rewrites this record itself when
+        // a pick lands below the top level on offer, and the ceiling, not this
+        // video's pick, is what the next video should boot under.
+        persistPlayerQuality(heightOf(getCeilingQuality()));
+        markCompleted(expectedVideoKey);
+        startFrameGuard(expectedVideoKey, choice.quality);
+    }
+
+    async function selectViaMenuFallback(player, expectedVideoKey) {
+        // Menu not built yet. Don't burn an attempt while the player initialises.
+        if (!getSettingsButton(player)) return;
 
         qualitySelectionRunning = true;
         attempts += 1;
-
         try {
-            if (expectedVideoKey !== getVideoKey() || stopped) return;
-
             disableAutonavOnce(player, expectedVideoKey);
-
-            if (!choice) {
-                if (!await selectHighestQualityViaMenu(player) || expectedVideoKey !== getVideoKey()) return;
-                completedVideoKey = expectedVideoKey;
-                clearApplyTimers();
-                return;
+            if (await selectHighestQualityViaMenu(player) && expectedVideoKey === getVideoKey()) {
+                markCompleted(expectedVideoKey);
             }
-
-            persistPlayerQuality(choice.quality);
-
-            if (!applyQualityViaApi(player, choice.quality)) {
-                // Player API unavailable — drive the settings menu instead.
-                if (!await selectHighestQualityViaMenu(player) || expectedVideoKey !== getVideoKey()) return;
-                completedVideoKey = expectedVideoKey;
-                clearApplyTimers();
-                return;
-            }
-
-            if (choice.wantsPremium1080 && premiumSelectedKey !== expectedVideoKey) {
-                if (!getSettingsButton(player)) {
-                    // Menu isn't built yet. Leave the video incomplete so a later
-                    // scheduled attempt retries rather than marking it done here.
-                    // Refund the attempt: base quality is already applied, and a
-                    // premium-only miss must not burn MAX_ATTEMPTS_PER_VIDEO. The
-                    // APPLY_DELAYS_MS schedule still bounds the total retries.
-                    attempts -= 1;
-                    return;
-                }
-                await wait(700);
-                if (stopped || expectedVideoKey !== getVideoKey()) return;
-                // Only record success — a failed menu walk must stay retryable.
-                if (await selectPremiumInMenu(player, choice.displayLabel)) {
-                    premiumSelectedKey = expectedVideoKey;
-                } else {
-                    attempts -= 1;
-                    return;
-                }
-            }
-
-            completedVideoKey = expectedVideoKey;
-            clearApplyTimers();
         } catch (_) {
             closeSettings(player);
         } finally {
             qualitySelectionRunning = false;
         }
+    }
+
+    /* --- Frame guard ---------------------------------------------------- */
+
+    function readFrameCounts(video) {
+        try {
+            const quality = video.getVideoPlaybackQuality();
+            return { total: quality.totalVideoFrames, dropped: quality.droppedVideoFrames };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function isInViewport(element) {
+        if (typeof element.getBoundingClientRect !== 'function') return true;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.bottom > 0 && rect.top < (window.innerHeight || Infinity);
+    }
+
+    // Only frames rendered while the stream is visibly playing at the guarded
+    // level count. Paused, seeking, sped-up, background-tab, scrolled-away, ad
+    // and mid-switch intervals all inflate droppedVideoFrames for reasons that
+    // have nothing to do with decode speed, so they re-baseline instead of
+    // being measured.
+    function isMeasurable(player, video, quality) {
+        if (!player || !video || typeof video.getVideoPlaybackQuality !== 'function') return false;
+        if (video.paused || video.seeking || video.playbackRate > 1) return false;
+        if (document.visibilityState === 'hidden') return false;
+        try {
+            if (!isInViewport(video)) return false;
+            if (typeof player.getPresentingPlayerType === 'function' && player.getPresentingPlayerType() !== 1) return false;
+            if (typeof player.getPlaybackQuality === 'function' && player.getPlaybackQuality() !== quality) return false;
+        } catch (_) {
+            return false;
+        }
+        return true;
+    }
+
+    function stopFrameGuard() {
+        if (!frameGuard) return;
+        cancelTimer(frameGuard.timer);
+        frameGuard = null;
+    }
+
+    function startFrameGuard(videoKey, quality) {
+        stopFrameGuard();
+        if (!FRAME_GUARD || heightOf(quality) < FRAME_GUARD_MIN_HEIGHT) return;
+        frameGuard = {
+            videoKey: videoKey,
+            quality: quality,
+            frames: 0,
+            dropped: 0,
+            samples: 0,
+            baseline: null,
+            video: null,
+            timer: 0
+        };
+        frameGuard.timer = schedule(sampleFrameGuard, FRAME_GUARD_SAMPLE_MS);
+    }
+
+    function sampleFrameGuard() {
+        const guard = frameGuard;
+        if (!guard) return;
+        guard.timer = 0;
+        guard.samples += 1;
+        if (guard.videoKey !== getVideoKey() || guard.samples > FRAME_GUARD_MAX_SAMPLES) {
+            frameGuard = null;
+            return;
+        }
+
+        const player = getPlayer();
+        const video = getVideoElement();
+        const counts = isMeasurable(player, video, guard.quality) ? readFrameCounts(video) : null;
+        if (counts && guard.baseline && guard.video === video) {
+            const frames = counts.total - guard.baseline.total;
+            const dropped = counts.dropped - guard.baseline.dropped;
+            // The counters restart when the element loads a new stream; a
+            // negative delta is that, not a measurement.
+            if (frames > 0 && dropped >= 0 && dropped <= frames) {
+                guard.frames += frames;
+                guard.dropped += dropped;
+            }
+        }
+        guard.baseline = counts;
+        guard.video = video;
+
+        if (guard.frames >= FRAME_GUARD_MIN_FRAMES) {
+            frameGuard = null;
+            if (guard.dropped / guard.frames > FRAME_GUARD_DROP_RATIO) stepDownFrom(player, guard);
+            return;
+        }
+        guard.timer = schedule(sampleFrameGuard, FRAME_GUARD_SAMPLE_MS);
+    }
+
+    // One bad measurement steps this page down at once, but only a second one,
+    // on a later page load, is remembered for the Mac — a single stutter while
+    // something else hogged the CPU should not cost a month of 1440p.
+    function recordFrameFailure(height) {
+        frameCapHeight = Math.min(frameCapHeight, height);
+        try {
+            const saved = JSON.parse(localStorage.getItem(FRAME_CAP_KEY) || 'null');
+            const strikes = (saved && saved.height === height && saved.until > Date.now())
+                ? (Number(saved.strikes) || 0) + 1
+                : 1;
+            localStorage.setItem(FRAME_CAP_KEY, JSON.stringify({
+                height: height,
+                strikes: strikes,
+                until: Date.now() + FRAME_CAP_TTL_MS
+            }));
+        } catch (_) {}
+    }
+
+    function stepDownFrom(player, guard) {
+        recordFrameFailure(heightOf(guard.quality));
+        if (!hasQualityApi(player)) return;
+
+        const choice = chooseTargetQuality(getAvailableQualityLevels(player), getAvailableQualityData(player));
+        if (!choice || heightOf(choice.quality) >= heightOf(guard.quality)) return;
+        try {
+            console.info('[SuperTube] ' + Math.round(100 * guard.dropped / guard.frames) +
+                '% of frames dropped at ' + guard.quality + '; stepping down to ' + choice.quality + '.');
+        } catch (_) {}
+        if (!applyQualityViaApi(player, choice)) return;
+        persistPlayerQuality(heightOf(getCeilingQuality()));
+        startFrameGuard(guard.videoKey, choice.quality);
     }
 
     function clearApplyTimers() {
@@ -799,7 +1000,7 @@
     function scheduleQualitySelection(reason, force) {
         if (!isWatchPage()) return;
         const videoKey = getVideoKey();
-        if (completedVideoKey === videoKey) return;
+        if (completedVideoKey === videoKey || attempts >= MAX_ATTEMPTS_PER_VIDEO) return;
         if (!force && activeScheduleKey === videoKey) return;
 
         clearApplyTimers();
@@ -807,6 +1008,11 @@
         for (const delay of APPLY_DELAYS_MS) {
             scheduleApply(function () {
                 selectHighestQuality();
+                // A round spent without a pick must stop claiming the video is
+                // scheduled, or the next player event (an ad ending, a slow stream
+                // finally reaching canplay) is ignored and a load slower than the
+                // last delay never gets its quality set at all.
+                if (!applyTimers.size && activeScheduleKey === videoKey) activeScheduleKey = '';
             }, delay);
         }
     }
@@ -817,10 +1023,10 @@
         if (changed) {
             currentVideoKey = nextVideoKey;
             completedVideoKey = '';
-            premiumSelectedKey = '';
             autonavDisabledKey = '';
             attempts = 0;
             qualitySelectionRunning = false;
+            stopFrameGuard();
             attachVideoListeners();
             installObserver();
         }
@@ -959,7 +1165,8 @@
                     total: quality.totalVideoFrames,
                     codecs: stats && stats.codecs,
                     resolution: stats && stats.resolution,
-                    blockingAv1: blockAv1
+                    blockingAv1: blockAv1,
+                    ceiling: getCeilingQuality()
                 });
             }
         } catch (_) {}
@@ -971,6 +1178,7 @@
         stopped = true;
 
         clearApplyTimers();
+        stopFrameGuard();
         cancelTimer(observerTimer);
         observerTimer = 0;
         for (const timer of Array.from(timers)) cancelTimer(timer);
@@ -1004,7 +1212,6 @@
         stopped = false;
         attempts = 0;
         completedVideoKey = '';
-        premiumSelectedKey = '';
         autonavDisabledKey = '';
 
         installStyles();
