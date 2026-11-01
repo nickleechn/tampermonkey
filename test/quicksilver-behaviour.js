@@ -45,7 +45,7 @@ const SLOW = { effectiveType: '4g', rtt: 80, downlink: 10, saveData: true };
 const SCRIPT_VERSION = (fs.readFileSync(path.join(__dirname, '..', 'Quicksilver.js'), 'utf8')
     .match(/@version\s+(\S+)/) || [])[1];
 
-function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = true, anchors = 17, navEntries = [], prerendering = false, speculation = true, localStorageSeed = {}, connection = FAST, topFrame = true, viewport = { width: 1280, dpr: 2 }, trustedTypesEnforced = false, chromeVersion = 154 } = {}) {
+function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = true, anchors = 17, navEntries = [], prerendering = false, speculation = true, localStorageSeed = {}, connection = FAST, topFrame = true, viewport = { width: 1280, dpr: 2 }, trustedTypesEnforced = false, chromeVersion = 154, softNav = false, bareDocument = false } = {}) {
     const winListeners = new Map();
     const docListeners = new Map();
     const navListeners = new Map();
@@ -53,7 +53,9 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
     const store = new Map(Object.entries(gm));
     const menu = new Map();
     const alerts = [];
-    let lcpCallback = null;
+    // PerformanceObserver callbacks by entry type.
+    const perfObservers = new Map();
+    const mutationCallbacks = [];
 
     const add = (map, t, f) => { if (!map.has(t)) map.set(t, []); map.get(t).push(f); };
     const fire = (map, t, ev) => { for (const f of (map.get(t) || []).slice()) f(ev || {}); };
@@ -61,7 +63,9 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
     const document = {
         readyState: 'loading', visibilityState: 'visible', referrer,
         prerendering,
-        head, body: makeEl('body'), documentElement: makeEl('html'),
+        // bareDocument: injected before the parser has made <html>, as CDP
+        // and some userscript managers do at document-start.
+        head: bareDocument ? null : head, body: makeEl('body'), documentElement: bareDocument ? null : makeEl('html'),
         images: [], styleSheets: [],
         // Trusted Types enforcement, as on YouTube: a script element's text
         // refuses plain strings and accepts only a policy's output.
@@ -105,8 +109,19 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
             serviceWorker: { controller: null, addEventListener() {} }
         },
         performance: { getEntriesByType: t => (t === 'navigation' ? navEntries : []) },
-        MutationObserver: class { observe() {} disconnect() {} },
-        PerformanceObserver: class { constructor(cb) { lcpCallback = cb; } observe() {} disconnect() {} },
+        MutationObserver: class {
+            constructor(cb) { this.cb = cb; this.live = false; }
+            observe() { if (!this.live) { this.live = true; mutationCallbacks.push(this); } }
+            disconnect() { this.live = false; }
+        },
+        // Per entry type, like the real thing. Soft Navigations (Chrome
+        // 151+) are only advertised when the test asks for them.
+        PerformanceObserver: Object.assign(class {
+            constructor(cb) { this.cb = cb; }
+            observe(opts) { add(perfObservers, opts && opts.type, this.cb); }
+            disconnect() {}
+        }, { supportedEntryTypes: ['largest-contentful-paint', 'navigation', 'resource']
+            .concat(softNav ? ['soft-navigation', 'interaction-contentful-paint'] : []) }),
         HTMLScriptElement: { supports: () => speculation },
         CSSFontFaceRule: class {}, CSS: { supports: () => true },
         URL, Element: class {},
@@ -141,8 +156,21 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
 
     return {
         head, store, menu, alerts, sandbox,
-        emitLcp: entry => lcpCallback && lcpCallback({ getEntries: () => [entry] }),
+        emitLcp: entry => fire(perfObservers, 'largest-contentful-paint', { getEntries: () => [entry] }),
+        emitEntry: (type, entry) => fire(perfObservers, type, { getEntries: () => [entry] }),
+        // Clicks a link without navigating, as a router does before its data arrives.
+        clickLink(href) {
+            const link = { href: new URL(href, sandbox.location.href).href, getAttribute: () => href };
+            const target = Object.assign(Object.create(sandbox.Element.prototype), { closest: () => link });
+            fire(docListeners, 'click', { target });
+        },
         load() { document.readyState = 'complete'; fire(winListeners, 'load'); },
+        // The parser creates <html> and <head>; observers hear about it.
+        growHead() {
+            document.documentElement = makeEl('html');
+            document.head = head;
+            for (const o of mutationCallbacks.slice()) if (o.live) o.cb([], o);
+        },
         // DOMContentLoaded bubbles from document to window; listeners exist on both.
         domReady() {
             document.readyState = 'interactive';
@@ -797,6 +825,183 @@ const transOf = h => JSON.parse(h.store.get('tm-qs-transitions::https://site.tes
         (repText.split('\n').find(l => l.includes('% hit')) || '').trim());
     check('status reports hero accuracy', repText.includes('this site: 4 of 5'));
     check('status flags speculation that never lands', repText.includes('"Preload pages"'));
+
+
+    // ---- 4.3.0: Soft Navigations (Chrome 151+) -----------------------------
+    // Entry shapes are the ones Chrome 153 produced for a real click →
+    // pushState → paint: the soft-navigation entry is named by the new URL,
+    // and the interaction-contentful-paint entry wraps an LCP entry and
+    // shares the soft navigation's interactionId.
+    const ROUTE_HERO = 'https://cdn.site.test/route-hero.jpg';
+    const softNavTo = (h, p, interactionId) => h.emitEntry('soft-navigation',
+        { name: 'https://site.test' + p, interactionId, navigationId: interactionId + 1000 });
+    const icp = (h, interactionId, url, element) => h.emitEntry('interaction-contentful-paint', {
+        interactionId, navigationId: interactionId + 1000,
+        largestContentfulPaint: { url, startTime: 40, element: element || makeEl(url ? 'img' : 'h1') }
+    });
+    const spaFlagOf = h => h.store.get('tm-qs-spa::https://site.test');
+
+    const softA = build({ softNav: true });
+    softA.domReady();
+    await wait(20);
+    softA.emitLcp({ url: 'https://cdn.site.test/hero.jpg', startTime: 900, element: makeEl('img') });
+    softA.load();
+    await wait(20);
+    softA.navigateTo('/spa-route', { click: true });
+    await wait(10);
+    softNavTo(softA, '/spa-route', 7);
+    icp(softA, 7, ROUTE_HERO);
+
+    // The paint can be delivered before its soft-navigation entry.
+    const softEarly = build({ softNav: true });
+    softEarly.load();
+    await wait(20);
+    softEarly.navigateTo('/spa-route', { click: true });
+    await wait(10);
+    icp(softEarly, 9, ROUTE_HERO);
+    softNavTo(softEarly, '/spa-route', 9);
+
+    // ...and the soft-navigation entry can beat the route watcher's deferred turn.
+    const softRace = build({ softNav: true });
+    softRace.load();
+    await wait(20);
+    softRace.navigateTo('/spa-route', { click: true });
+    softNavTo(softRace, '/spa-route', 11);
+    await wait(10);
+    icp(softRace, 11, ROUTE_HERO);
+
+    // A later click on the same route (a modal opening) paints under the
+    // same navigationId in Chrome 153, but is a different interaction.
+    const softModal = build({ softNav: true });
+    softModal.load();
+    await wait(20);
+    softModal.navigateTo('/spa-route', { click: true });
+    await wait(10);
+    softNavTo(softModal, '/spa-route', 13);
+    icp(softModal, 13, '');
+    softModal.emitEntry('interaction-contentful-paint', { interactionId: 14, navigationId: 1013,
+        largestContentfulPaint: { url: 'https://cdn.site.test/modal.jpg', startTime: 900, element: makeEl('img') } });
+
+    // A headline that outgrows the first image paint replaces it, as with LCP.
+    const softText = build({ softNav: true });
+    softText.load();
+    await wait(20);
+    softText.navigateTo('/spa-route', { click: true });
+    await wait(10);
+    softNavTo(softText, '/spa-route', 15);
+    icp(softText, 15, ROUTE_HERO);
+    icp(softText, 15, '');
+
+    // Silence is not evidence the hero is gone: the browser reports no soft
+    // navigation for some route changes at all.
+    const softSilent = build({ softNav: true, gm: { 'tm-qs-lcp::https://site.test': JSON.stringify({
+        '/spa-route': { url: ROUTE_HERO, vw: 1280, dpr: 2, at: Date.now(), seen: 3 } }) } });
+    softSilent.load();
+    await wait(20);
+    softSilent.navigateTo('/spa-route', { click: true });
+
+    // Without the API, 4.2.0's behaviour: nothing learned client-side.
+    const softOff = build({ softNav: false });
+    softOff.load();
+    await wait(20);
+    softOff.navigateTo('/spa-route', { click: true });
+    await wait(10);
+    softNavTo(softOff, '/spa-route', 17);
+    icp(softOff, 17, ROUTE_HERO);
+
+    // Chrome flags a load slowed by a busy machine; keep it out of the median.
+    const busy = build({ navEntries: [{ type: 'navigate', confidence: { value: 'low', randomizedTriggerRate: 0.5 } }] });
+    busy.domReady();
+    await wait(20);
+    busy.emitLcp({ url: 'https://cdn.site.test/hero.jpg', startTime: 4000, element: makeEl('img') });
+    busy.load();
+    const calm = build({ navEntries: [{ type: 'navigate', confidence: { value: 'high', randomizedTriggerRate: 0.5 } }] });
+    calm.domReady();
+    await wait(20);
+    calm.emitLcp({ url: 'https://cdn.site.test/hero.jpg', startTime: 1000, element: makeEl('img') });
+    calm.load();
+
+    await wait(3400);
+    const softRec = lcpOf(softA)['/spa-route'];
+    check('soft navigation: route hero learned from interaction-contentful-paint',
+        Boolean(softRec) && softRec.url === ROUTE_HERO && softRec.seen === 1, JSON.stringify(softRec || null));
+    check('soft navigation: hard-load hero still recorded under its own route',
+        Boolean(lcpOf(softA)['/article']) && lcpOf(softA)['/article'].url === 'https://cdn.site.test/hero.jpg');
+    check('soft navigation: route paint kept out of the page-load LCP median',
+        (vitalsOf(softA).lcp || []).length === 1 && vitalsOf(softA).lcp[0] === 900, JSON.stringify(vitalsOf(softA)));
+    check('soft navigation: paint delivered before its entry is still claimed',
+        (lcpOf(softEarly)['/spa-route'] || {}).url === ROUTE_HERO);
+    check('soft navigation: entry delivered before the route watcher is still claimed',
+        (lcpOf(softRace)['/spa-route'] || {}).url === ROUTE_HERO);
+    check('soft navigation: a later interaction on the route (modal) is not the hero',
+        !lcpOf(softModal)['/spa-route'], JSON.stringify(lcpOf(softModal)['/spa-route'] || null));
+    check('soft navigation: a larger text paint displaces the image candidate',
+        !lcpOf(softText)['/spa-route']);
+    check('soft navigation: silence does not erode an existing record',
+        (lcpOf(softSilent)['/spa-route'] || {}).seen === 3);
+    check('soft navigation: ignored where the browser does not advertise it',
+        !lcpOf(softOff)['/spa-route']);
+    check('low-confidence navigation kept out of the LCP median',
+        Boolean(lcpOf(busy)['/article']) && !(vitalsOf(busy).lcp || []).length, JSON.stringify(vitalsOf(busy)));
+    check('high-confidence navigation still sampled', (vitalsOf(calm).lcp || [])[0] === 1000);
+
+    // Second and third visits: two sightings, then the route hero is preloaded
+    // the moment the router navigates there.
+    const softB = build({ softNav: true, gm: Object.fromEntries(softA.store) });
+    softB.load();
+    await wait(20);
+    softB.navigateTo('/spa-route', { click: true });
+    await wait(10);
+    softNavTo(softB, '/spa-route', 21);
+    icp(softB, 21, ROUTE_HERO);
+    await wait(3400);
+    check('soft navigation: second sighting raises confidence', (lcpOf(softB)['/spa-route'] || {}).seen === 2);
+    const softC = build({ softNav: true, gm: Object.fromEntries(softB.store) });
+    softC.load();
+    await wait(20);
+    softC.navigateTo('/spa-route', { click: true });
+    await wait(20);
+    check('soft navigation: learned route hero preloaded on the client-side navigation',
+        softC.head.children.some(c => c.rel === 'preload' && c.href === ROUTE_HERO));
+
+    // SPA detection from soft-navigation entries: a router that pushes only
+    // after a slow fetch, past the 5 s click window.
+    const slowRouter = build({ softNav: true });
+    slowRouter.domReady();
+    await wait(20);
+    const hadRules = Boolean(slowRouter.blanketRules());
+    slowRouter.clickLink('/detail');
+    const anchorPage = build({ softNav: true });
+    anchorPage.domReady();
+    await wait(20);
+    anchorPage.clickLink('/article#comments');
+    const strayPush = build({ softNav: true });
+    strayPush.domReady();
+    await wait(20);
+    strayPush.clickLink('/detail');
+    await wait(5200);
+    slowRouter.navigateTo('/detail');
+    await wait(10);
+    check('slow router: click-window heuristic alone misses it', !spaFlagOf(slowRouter));
+    softNavTo(slowRouter, '/detail', 31);
+    check('slow router: soft-navigation entry for the clicked link marks the SPA', Boolean(spaFlagOf(slowRouter)));
+    check('slow router: blanket rules withdrawn for this visit', hadRules && !slowRouter.blanketRules());
+    anchorPage.navigateTo('/article');
+    softNavTo(anchorPage, '/article#comments', 33);
+    check('in-page anchor soft navigation does not mark the SPA', !spaFlagOf(anchorPage));
+    strayPush.navigateTo('/page/2');
+    softNavTo(strayPush, '/page/2', 35);
+    check('soft navigation to a URL nobody clicked does not mark the SPA', !spaFlagOf(strayPush));
+
+
+    // ---- 4.3.0: hints survive injection before <html> exists ---------------
+    const bare = build({ bareDocument: true, gm: { 'tm-qs-lcp::https://site.test': JSON.stringify({
+        '/article': { url: 'https://cdn.site.test/hero.jpg', vw: 1280, dpr: 2, at: Date.now(), seen: 2 } }) } });
+    await wait(10);
+    const earlyEmpty = !bare.head.children.some(c => c.rel === 'preload');
+    bare.growHead();
+    check('hero preload waits for <head> when injected before <html> exists',
+        earlyEmpty && bare.head.children.some(c => c.rel === 'preload' && c.href === 'https://cdn.site.test/hero.jpg'));
 
     const bad = results.filter(r => !r[1]).length;
     console.log(bad ? `\n${bad} CHECK(S) FAILED` : `\nALL ${results.length} CHECKS PASSED`);
