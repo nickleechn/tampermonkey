@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      2.3.0
-// @description  Safari-only YouTube tuning: hardware-aware codec filtering, telemetry blocking, UI cleanup, and automatic highest-quality selection (8K included, 1080p Premium when offered) with a dropped-frame guard that steps down when the Mac can't keep up.
+// @version      2.4.0
+// @description  Safari-only YouTube tuning: AV1 forced on every video that offers it to save bandwidth, telemetry blocking, UI cleanup, and automatic highest-quality selection up to 4K with a dropped-frame guard that steps down when the Mac can't keep up.
 // @author       nickleechn
 // @match        https://www.youtube.com/*
 // @exclude      https://www.youtube.com/live_chat*
@@ -38,11 +38,13 @@
      * Configuration
      * ================================================================== */
 
-    // 'auto'      : probe for hardware AV1 decode, block AV1 only if absent (recommended)
+    // 'force-av1' : use AV1 on every video that offers it, for the lowest bandwidth.
+    //               Other videos play as normal. Wants a hardware decoder (M3 or later)
+    // 'auto'      : probe for hardware AV1 decode, block AV1 only if absent
     // 'no-av1'    : always block AV1
     // 'h264-only' : block AV1 and VP9 — caps you at 1080p, for old Intel Macs
     // 'all'       : no codec filtering
-    const CODEC_PROFILE = 'auto';
+    const CODEC_PROFILE = 'force-av1';
 
     // Blocking /api/stats/watchtime and /api/stats/atr stops YouTube recording
     // your playback position, which breaks "resume where you left off" and stops
@@ -53,13 +55,15 @@
     // Turn off "autoplay next video" via the player API.
     const DISABLE_AUTOPLAY_NEXT = false;
 
-    // Highest quality this script will ever ask for. 'highres' means whatever the
-    // video offers, 8K included. Whether a given Mac can decode 8K/5K in hardware
-    // is not something one vendor hint answers reliably, so instead of refusing
-    // those tiers up front the frame guard below measures it: if playback at a
-    // level above 1080p drops too many frames, it steps down one level and
-    // remembers the limit for this Mac. Set to e.g. 'hd2160' for a hard cap.
-    const MAX_QUALITY = 'highres';
+    // Highest quality this script will ever ask for. A pick is pinned, so this is
+    // also the most bandwidth a video can ask for; 4K keeps 5K and 8K from
+    // rebuffering on a constrained link. 'highres' means whatever the video
+    // offers, 8K included. Whether a given Mac can decode 8K/5K in hardware is not
+    // something one vendor hint answers reliably, so instead of refusing those
+    // tiers up front the frame guard below measures it: if playback at a level
+    // above 1080p drops too many frames, it steps down one level and remembers
+    // the limit for this Mac.
+    const MAX_QUALITY = 'hd2160';
 
     // Safari 17+ exposes ManagedMediaSource, and YouTube picks it up via
     // `self.ManagedMediaSource || self.MediaSource`. MMS hands buffering policy to
@@ -74,8 +78,9 @@
     const PREFER_CLASSIC_MSE = false;
 
     // Logs dropped-frame counts and the codec actually in use every few seconds.
-    // The codec policy above rests entirely on one vendor hint (powerEfficient);
-    // this is how you check that hint against reality on your own Mac.
+    // 'force-av1' rests on a player flag YouTube can remove, and 'auto' on one
+    // vendor hint (powerEfficient); this is how you check either against reality
+    // on your own Mac.
     const DEBUG_STATS = false;
     const DEBUG_STATS_INTERVAL_MS = 5000;
 
@@ -144,8 +149,11 @@
 
     // Start conservative: assume no hardware AV1 until proven otherwise, so a
     // player that initialises before the async probe resolves never gets handed
-    // a software-decoded AV1 stream.
-    let blockAv1 = CODEC_PROFILE !== 'all';
+    // a software-decoded AV1 stream. 'force-av1' skips all of that: the probe's
+    // answer doesn't change what it asks for, and native isTypeSupported still
+    // refuses AV1 on a machine that can't play it.
+    const FORCE_AV1 = CODEC_PROFILE === 'force-av1';
+    let blockAv1 = CODEC_PROFILE !== 'all' && !FORCE_AV1;
     const blockVp9 = CODEC_PROFILE === 'h264-only';
 
     const isBlockedCodec = (mime) => {
@@ -191,7 +199,7 @@
         }
     }
 
-    if (CODEC_PROFILE !== 'all') {
+    if (CODEC_PROFILE !== 'all' && !FORCE_AV1) {
         // ManagedMediaSource (Safari 17+) declares its OWN static isTypeSupported in
         // WebKit's IDL rather than inheriting MediaSource's. An own property shadows
         // the inherited one, so patching MediaSource alone leaves it untouched — and
@@ -222,6 +230,66 @@
                 return nativeAudioCanPlay.call(this, mime);
             };
         }
+    }
+
+    if (FORCE_AV1) {
+        // Read out of YouTube's own player (base.js 11a45ffb). Allowing AV1 is not
+        // enough: the player works out its own threshold for when to use it. This
+        // flag makes it use only the AV1 formats, and only when the video has
+        // some, so a video without them still gets normal selection. An AV1
+        // playback error also still turns AV1 off for the session. Blocking VP9
+        // instead would push those videos to H.264, which costs more bandwidth.
+        // The old localStorage['yt-player-av1-pref'] switch is gone from this build.
+        //
+        // The player reads flags from yt.config_, which the page fills through
+        // ytcfg.set(), so the flag has to be in place before that call lands.
+        const FORCE_AV1_FLAG = 'html5_force_av1_for_testing';
+        const PLAYER_CONFIGS_KEY = 'WEB_PLAYER_CONTEXT_CONFIGS';
+
+        const addForceAv1Flag = function (configs) {
+            if (!configs || typeof configs !== 'object') return;
+            Object.keys(configs).forEach(function (id) {
+                const config = configs[id];
+                if (!config || typeof config !== 'object') return;
+                const flags = String(config.serializedExperimentFlags || '').split('&')
+                    .filter(function (pair) { return pair && pair.split('=')[0] !== FORCE_AV1_FLAG; });
+                flags.push(FORCE_AV1_FLAG + '=true');
+                config.serializedExperimentFlags = flags.join('&');
+            });
+        };
+
+        const wrapYtcfgSet = function (cfg) {
+            if (!cfg || typeof cfg.set !== 'function') return;
+            const nativeSet = cfg.set;
+            cfg.set = function (first, second) {
+                try {
+                    if (first === PLAYER_CONFIGS_KEY) addForceAv1Flag(second);
+                    else if (first && typeof first === 'object') addForceAv1Flag(first[PLAYER_CONFIGS_KEY]);
+                } catch (_) {}
+                return nativeSet.apply(this, arguments);
+            };
+        };
+
+        // document-start usually beats the page's inline `var ytcfg = {...}`, and
+        // an accessor catches that assignment. If the page got there first, patch
+        // what it already stored as well.
+        try {
+            if (window.ytcfg) {
+                wrapYtcfgSet(window.ytcfg);
+                if (typeof window.ytcfg.get === 'function') addForceAv1Flag(window.ytcfg.get(PLAYER_CONFIGS_KEY));
+            } else {
+                let currentYtcfg;
+                Object.defineProperty(window, 'ytcfg', {
+                    configurable: true,
+                    get: function () { return currentYtcfg; },
+                    set: function (value) {
+                        if (value === currentYtcfg) return;
+                        currentYtcfg = value;
+                        try { wrapYtcfgSet(value); } catch (_) {}
+                    }
+                });
+            }
+        } catch (_) {}
     }
 
     /* --- A2. Block telemetry / ad endpoints ---------------------------- */
@@ -680,11 +748,16 @@
         if (!bestQuality) return null;
 
         // "1080p Premium" and plain "1080p" share the quality id hd1080; only the
-        // formatId tells them apart, so it is carried along with the pick.
+        // formatId tells them apart, so it is carried along with the pick. Premium
+        // is a higher-bitrate encode and pinning its formatId could leave AV1, so
+        // 'force-av1' takes the plain entry instead.
         const matchingData = qualityData.filter(function (entry) {
             return entry.quality === bestQuality;
         });
-        const entry = matchingData.find(isPremiumEntry) || matchingData[0] || null;
+        const preferred = FORCE_AV1
+            ? matchingData.find(function (entry) { return !isPremiumEntry(entry); })
+            : matchingData.find(isPremiumEntry);
+        const entry = preferred || matchingData[0] || null;
 
         return {
             quality: bestQuality,
@@ -757,7 +830,10 @@
             .filter(function (choice) { return choice.resolution <= ceiling; });
         choices.sort(function (left, right) {
             if (right.resolution !== left.resolution) return right.resolution - left.resolution;
-            if (right.premium !== left.premium) return Number(right.premium) - Number(left.premium);
+            if (right.premium !== left.premium) {
+                const premiumFirst = Number(right.premium) - Number(left.premium);
+                return FORCE_AV1 ? -premiumFirst : premiumFirst;
+            }
             return 0;
         });
         return choices[0] || null;

@@ -33,6 +33,14 @@
 // only measures visible playback at the guarded level, and only remembers a
 // limit after failing on two page loads; and /live/<id> counts as a watch page.
 //
+// 2.4.0 ships CODEC_PROFILE 'force-av1' and a 4K MAX_QUALITY. Every check above
+// its own section runs with the old 'auto' and 'highres' values patched back in,
+// because those paths still exist. The new section runs the shipped defaults:
+// AV1 is allowed synchronously with no probe, a native refusal still stands, VP9
+// survives, html5_force_av1_for_testing (base.js 11a45ffb) reaches every player
+// config whichever side of the page's `var ytcfg` the script lands on, and 4K
+// and plain-over-Premium hold on both selection paths.
+//
 // No browser required.
 const vm = require('vm');
 const fs = require('fs');
@@ -40,6 +48,20 @@ const path = require('path');
 
 // Mirrors the signature the script builds from navigator: cores '.' Safari major.
 const AV1_KEY = 'supertube-av1-hw-v2:8.18';
+
+// Applied by build() unless a test asks for the shipped defaults.
+const OLD_DEFAULTS = {
+    "const CODEC_PROFILE = 'force-av1';": "const CODEC_PROFILE = 'auto';",
+    "const MAX_QUALITY = 'hd2160';": "const MAX_QUALITY = 'highres';"
+};
+
+// The page's own inline bootstrap, as served on a watch page.
+const YTCFG_PAGE = 'var ytcfg={d:function(){return window.yt&&yt.config_||ytcfg.data_||(ytcfg.data_={})},' +
+    'get:function(k,o){return k in ytcfg.d()?ytcfg.d()[k]:o},' +
+    'set:function(){var a=arguments;if(a.length>1)ytcfg.d()[a[0]]=a[1];' +
+    'else{var k;for(k in a[0])ytcfg.d()[k]=a[0][k]}}};';
+const FORCE_FLAG = 'html5_force_av1_for_testing';
+const AV1_MIME = 'video/mp4; codecs="av01.0.08M.08"';
 
 const SOURCE = fs.readFileSync(
     path.join(__dirname, '..', 'Supertube.safari.user.js'), 'utf8');
@@ -223,9 +245,13 @@ function build({
     settingsButton = false,
     video = null,
     visibilityState = 'visible',
-    patch = {}
+    patch = {},
+    shipped = false,
+    nativeAv1 = true,
+    pageScript = null
 } = {}) {
     const clock = makeClock();
+    let probes = 0;
     const player = playerApi
         ? makePlayer(levels, qualityData, { videoId, settingsButton })
         : makeMenuPlayer(menuLabels || []);
@@ -255,7 +281,8 @@ function build({
         addEventListener() {}, removeEventListener() {}
     };
 
-    const nativeIsTypeSupported = (mime) => !/theora/i.test(String(mime));
+    const nativeIsTypeSupported = (mime) => !/theora/i.test(String(mime))
+        && (nativeAv1 || !/av01/i.test(String(mime)));
 
     // Mirrors WebKit: ManagedMediaSource : MediaSource, but declaring its OWN
     // static isTypeSupported, which shadows the inherited (patched) one.
@@ -312,12 +339,15 @@ function build({
                 // powerEfficientAv1 may be a function so a test can answer
                 // differently per configuration, which is the whole point of
                 // probing more than one.
-                decodingInfo: (config) => Promise.resolve({
-                    supported: true,
-                    powerEfficient: typeof powerEfficientAv1 === 'function'
-                        ? powerEfficientAv1(config.video)
-                        : powerEfficientAv1
-                })
+                decodingInfo: (config) => {
+                    probes += 1;
+                    return Promise.resolve({
+                        supported: true,
+                        powerEfficient: typeof powerEfficientAv1 === 'function'
+                            ? powerEfficientAv1(config.video)
+                            : powerEfficientAv1
+                    });
+                }
             }
         },
         fetch: () => Promise.resolve(new Response('native', { status: 200 })),
@@ -329,17 +359,19 @@ function build({
 
     // Config constants can be overridden per test by rewriting their line.
     let source = SOURCE;
-    for (const [from, to] of Object.entries(patch)) {
+    for (const [from, to] of Object.entries(shipped ? patch : { ...OLD_DEFAULTS, ...patch })) {
         if (!source.includes(from)) throw new Error('patch target missing: ' + from);
         source = source.replace(from, to);
     }
 
     vm.createContext(sandbox);
+    if (pageScript) vm.runInContext(pageScript, sandbox);
     vm.runInContext(source, sandbox, { filename: 'Supertube.safari.user.js' });
 
     return {
         sandbox, player, observed, stored, writes, clock, MediaSource, ManagedMediaSource, head,
         video: videoEl,
+        probes: () => probes,
         picked: () => player.picked,
         ranges: () => player.calls.filter((c) => c[0] === 'setPlaybackQualityRange')
     };
@@ -803,6 +835,139 @@ function build({
 
     check('an unblocked fetch still reaches the native implementation',
         (await allowed.text()) === 'native');
+
+    console.log('\nForced AV1 — the shipped defaults');
+
+    // No flush: the player asks before anything async could settle.
+    env = build({ shipped: true });
+    check('AV1 is allowed synchronously through both constructors',
+        env.MediaSource.isTypeSupported(AV1_MIME) === true
+        && env.ManagedMediaSource.isTypeSupported(AV1_MIME) === true);
+    await env.clock.flush();
+    check('the power-efficiency probe never runs, and caches nothing',
+        env.probes() === 0 && !(AV1_KEY in env.stored), `probes=${env.probes()}`);
+    check('VP9 is not blocked, so a video with no AV1 avoids H.264',
+        env.MediaSource.isTypeSupported('video/webm; codecs="vp9"') === true
+        && env.ManagedMediaSource.isTypeSupported('video/webm; codecs="vp09.00.10.08"') === true);
+
+    env = build({ shipped: true, nativeAv1: false });
+    check('a native refusal of AV1 is never spoofed away',
+        env.MediaSource.isTypeSupported(AV1_MIME) === false
+        && env.ManagedMediaSource.isTypeSupported(AV1_MIME) === false);
+
+    const flagsOf = (e, id) => vm.runInContext(
+        `ytcfg.get('WEB_PLAYER_CONTEXT_CONFIGS')[${JSON.stringify(id)}].serializedExperimentFlags`, e.sandbox);
+    const setConfigs = (e, configs, twoArg) => vm.runInContext(twoArg
+        ? `ytcfg.set('WEB_PLAYER_CONTEXT_CONFIGS', ${JSON.stringify(configs)})`
+        : `ytcfg.set({ OTHER: 1, WEB_PLAYER_CONTEXT_CONFIGS: ${JSON.stringify(configs)} })`, e.sandbox);
+    const flagCount = (flags) => flags.split('&').filter((p) => p.startsWith(FORCE_FLAG + '=')).length;
+
+    // Script first, page second: the usual document-start order.
+    env = build({ shipped: true });
+    vm.runInContext(YTCFG_PAGE, env.sandbox);
+    setConfigs(env, {
+        WATCH: { serializedExperimentFlags: 'kept_flag=true&other=1.0' },
+        SHORTS: {}
+    });
+    let flags = flagsOf(env, 'WATCH');
+    check('the flag reaches a player config set after the page declares ytcfg',
+        flags.includes(FORCE_FLAG + '=true'), flags);
+    check('existing flags in that config survive',
+        flags.split('&').includes('kept_flag=true') && flags.split('&').includes('other=1.0'), flags);
+    check('every player config gets it, even one with no flags yet',
+        flagsOf(env, 'SHORTS') === FORCE_FLAG + '=true', flagsOf(env, 'SHORTS'));
+    check('the rest of the same ytcfg.set call still lands',
+        vm.runInContext("ytcfg.get('OTHER')", env.sandbox) === 1);
+
+    setConfigs(env, { WATCH: { serializedExperimentFlags: 'a=1' } }, true);
+    flags = flagsOf(env, 'WATCH');
+    check('the two-argument form of ytcfg.set is covered too',
+        flagCount(flags) === 1 && flags.includes('a=1'), flags);
+
+    setConfigs(env, { WATCH: { serializedExperimentFlags: `${FORCE_FLAG}=false&a=1` } });
+    flags = flagsOf(env, 'WATCH');
+    check('an existing value is replaced, not duplicated',
+        flagCount(flags) === 1 && flags.includes(FORCE_FLAG + '=true'), flags);
+
+    vm.runInContext("ytcfg.set('initialInnerWidth', 1440)", env.sandbox);
+    check('unrelated ytcfg.set calls pass straight through',
+        vm.runInContext("ytcfg.get('initialInnerWidth')", env.sandbox) === 1440);
+
+    // Page first, script second: the late-injection order.
+    env = build({
+        shipped: true,
+        pageScript: YTCFG_PAGE + "ytcfg.set({ WEB_PLAYER_CONTEXT_CONFIGS: { WATCH: { serializedExperimentFlags: 'a=1' } } });"
+    });
+    flags = flagsOf(env, 'WATCH');
+    check('a config the page stored before the script ran is patched too',
+        flagCount(flags) === 1 && flags.includes('a=1'), flags);
+    setConfigs(env, { LATER: { serializedExperimentFlags: 'b=1' } });
+    check('and later ytcfg.set calls on that same object are covered',
+        flagCount(flagsOf(env, 'LATER')) === 1, flagsOf(env, 'LATER'));
+
+    // Reverting is one word: the other profiles must not touch the player's flags.
+    env = build();
+    vm.runInContext(YTCFG_PAGE, env.sandbox);
+    setConfigs(env, { WATCH: { serializedExperimentFlags: 'a=1' } });
+    check('under \'auto\' the flag is never added',
+        flagsOf(env, 'WATCH') === 'a=1', flagsOf(env, 'WATCH'));
+
+    env = build({ shipped: true, levels: ['highres', 'hd2880', 'hd2160', 'hd1080'] });
+    await env.clock.flush();
+    range = env.ranges()[0];
+    check('an 8K video selects 4K through the player API',
+        !!range && range[1] === 'hd2160' && range[2] === 'hd2160',
+        range ? `range=[${range[1]}, ${range[2]}]` : 'n/a');
+
+    env = build({ shipped: true, menuLabels: ['4320p', '2160p60', '1080p'], playerApi: false });
+    await env.clock.flush();
+    check('and through the menu fallback', env.picked() === '2160p60', `picked=${env.picked()}`);
+
+    // Existing installs carry an 8K record from 2.3.0, which would otherwise boot
+    // the first player above the new cap.
+    env = build({
+        shipped: true,
+        storedSeed: {
+            'yt-player-quality': JSON.stringify({
+                data: JSON.stringify({ quality: 4320, previousQuality: 4320 }),
+                expiration: Date.now() + 300 * day,
+                creation: Date.now()
+            })
+        }
+    });
+    const lowered = JSON.parse(JSON.parse(env.stored['yt-player-quality']).data);
+    check('a stored 8K preference is lowered to the 4K ceiling before the player boots',
+        lowered.quality === 2160, `quality=${lowered.quality}`);
+
+    env = build({
+        shipped: true,
+        levels: ['hd1080', 'hd720'],
+        qualityData: [
+            { quality: 'hd1080', qualityLabel: '1080p Premium', formatId: '356', isPlayable: true },
+            { quality: 'hd1080', qualityLabel: '1080p', formatId: '399', isPlayable: true },
+            { quality: 'hd720', qualityLabel: '720p', formatId: '398', isPlayable: true }
+        ]
+    });
+    await env.clock.flush();
+    range = env.ranges()[0];
+    check('plain 1080p beats Premium through the player API',
+        !!range && range[2] === 'hd1080' && range[3] === '399',
+        range ? `args=${JSON.stringify(range.slice(1))}` : 'n/a');
+
+    env = build({
+        shipped: true,
+        levels: ['hd1080'],
+        qualityData: [{ quality: 'hd1080', qualityLabel: '1080p Premium', formatId: '356', isPlayable: true }]
+    });
+    await env.clock.flush();
+    range = env.ranges()[0];
+    check('a Premium entry is still used when it is the only one at that level',
+        !!range && range[3] === '356', range ? `args=${JSON.stringify(range.slice(1))}` : 'n/a');
+
+    env = build({ shipped: true, menuLabels: ['1080p Premium', '1080p', '720p'], playerApi: false });
+    await env.clock.flush();
+    check('plain 1080p beats Premium through the menu fallback too',
+        env.picked() === '1080p', `picked=${env.picked()}`);
 
     const failed = results.filter(([, ok]) => !ok);
     console.log('');

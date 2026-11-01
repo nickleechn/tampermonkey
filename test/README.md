@@ -82,6 +82,16 @@ ceiling in YouTube's current record shape before the player boots, that
 level at a time, never below 1080p, only measures visible playback at the
 guarded level, and only remembers a limit after failing on two page loads.
 
+2.4.0 ships `CODEC_PROFILE = 'force-av1'` and `MAX_QUALITY = 'hd2160'`. The checks
+above run with the old `'auto'` and `'highres'` values patched back in, because
+those paths still exist. A new section runs the shipped defaults, grounded in
+base.js `11a45ffb`: AV1 is allowed synchronously with no probe, a native refusal
+is never spoofed away, VP9 survives, `html5_force_av1_for_testing` reaches every
+player config whichever side of the page's `var ytcfg` the script lands on, and
+the 4K ceiling and plain-over-Premium pick hold on both selection paths. No
+headless check can show that the player honours the flag; that takes real Safari
+and Stats for nerds.
+
 No browser required.
 
 ## `quicksilver-chrome/` — browser harness, **partly obsolete**
