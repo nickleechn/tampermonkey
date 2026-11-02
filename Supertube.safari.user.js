@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SuperTube Safari
 // @namespace    https://github.com/nickleechn/tampermonkey
-// @version      2.4.0
+// @version      2.4.1
 // @description  Safari-only YouTube tuning: AV1 forced on every video that offers it to save bandwidth, telemetry blocking, UI cleanup, and automatic highest-quality selection up to 4K with a dropped-frame guard that steps down when the Mac can't keep up.
 // @author       nickleechn
 // @match        https://www.youtube.com/*
@@ -78,7 +78,7 @@
     const PREFER_CLASSIC_MSE = false;
 
     // Logs dropped-frame counts and the codec actually in use every few seconds.
-    // 'force-av1' rests on a player flag YouTube can remove, and 'auto' on one
+    // 'force-av1' rests on player flags YouTube can remove, and 'auto' on one
     // vendor hint (powerEfficient); this is how you check either against reality
     // on your own Mac.
     const DEBUG_STATS = false;
@@ -234,26 +234,34 @@
 
     if (FORCE_AV1) {
         // Read out of YouTube's own player (base.js 11a45ffb). Allowing AV1 is not
-        // enough: the player works out its own threshold for when to use it. This
-        // flag makes it use only the AV1 formats, and only when the video has
-        // some, so a video without them still gets normal selection. An AV1
-        // playback error also still turns AV1 off for the session. Blocking VP9
+        // enough: the player works out its own threshold for when to use it. Two
+        // flags, because there are two paths:
+        //  - html5_force_av1_for_testing uses only the AV1 formats, and only when the
+        //    video has some, so a video without them still gets normal selection.
+        //    A pre-roll can make the player skip that branch and walk a codec list
+        //    with VP9 first instead, and a 4K video then plays in VP9. That was
+        //    measured in Chromium 156 against CrystalClear, not seen in Safari.
+        //  - html5_default_av1_threshold above 2160 puts AV1 first on that list.
+        // An AV1 playback error also still turns AV1 off for the session. Blocking VP9
         // instead would push those videos to H.264, which costs more bandwidth.
         // The old localStorage['yt-player-av1-pref'] switch is gone from this build.
         //
         // The player reads flags from yt.config_, which the page fills through
-        // ytcfg.set(), so the flag has to be in place before that call lands.
-        const FORCE_AV1_FLAG = 'html5_force_av1_for_testing';
+        // ytcfg.set(), so these have to be in place before that call lands.
+        const AV1_FLAGS = {
+            html5_force_av1_for_testing: 'true',
+            html5_default_av1_threshold: '8192'
+        };
         const PLAYER_CONFIGS_KEY = 'WEB_PLAYER_CONTEXT_CONFIGS';
 
-        const addForceAv1Flag = function (configs) {
+        const addAv1Flags = function (configs) {
             if (!configs || typeof configs !== 'object') return;
             Object.keys(configs).forEach(function (id) {
                 const config = configs[id];
                 if (!config || typeof config !== 'object') return;
                 const flags = String(config.serializedExperimentFlags || '').split('&')
-                    .filter(function (pair) { return pair && pair.split('=')[0] !== FORCE_AV1_FLAG; });
-                flags.push(FORCE_AV1_FLAG + '=true');
+                    .filter(function (pair) { return pair && !(pair.split('=')[0] in AV1_FLAGS); });
+                Object.keys(AV1_FLAGS).forEach(function (name) { flags.push(name + '=' + AV1_FLAGS[name]); });
                 config.serializedExperimentFlags = flags.join('&');
             });
         };
@@ -263,8 +271,8 @@
             const nativeSet = cfg.set;
             cfg.set = function (first, second) {
                 try {
-                    if (first === PLAYER_CONFIGS_KEY) addForceAv1Flag(second);
-                    else if (first && typeof first === 'object') addForceAv1Flag(first[PLAYER_CONFIGS_KEY]);
+                    if (first === PLAYER_CONFIGS_KEY) addAv1Flags(second);
+                    else if (first && typeof first === 'object') addAv1Flags(first[PLAYER_CONFIGS_KEY]);
                 } catch (_) {}
                 return nativeSet.apply(this, arguments);
             };
@@ -276,7 +284,7 @@
         try {
             if (window.ytcfg) {
                 wrapYtcfgSet(window.ytcfg);
-                if (typeof window.ytcfg.get === 'function') addForceAv1Flag(window.ytcfg.get(PLAYER_CONFIGS_KEY));
+                if (typeof window.ytcfg.get === 'function') addAv1Flags(window.ytcfg.get(PLAYER_CONFIGS_KEY));
             } else {
                 let currentYtcfg;
                 Object.defineProperty(window, 'ytcfg', {
@@ -725,6 +733,18 @@
         }
     }
 
+    // During an ad getAvailableQualityData() lists the ad's formats while
+    // getVideoData() already names the video, so a pick made then pins a 4K video
+    // at whatever the ad tops out at. The ad ending fires the <video> events that
+    // bring selection back.
+    function isPresentingMainVideo(player) {
+        try {
+            return typeof player.getPresentingPlayerType !== 'function' || player.getPresentingPlayerType() === 1;
+        } catch (_) {
+            return false;
+        }
+    }
+
     function isPremiumEntry(entry) {
         return Boolean(entry.paygatedQualityDetails) ||
             PREMIUM_RE.test([entry.qualityLabel, entry.label, entry.name].filter(Boolean).join(' '));
@@ -897,6 +917,10 @@
         const player = getPlayer();
         if (!player) return;
 
+        // An ad is on screen: wait for the next scheduled try or player event. This
+        // sits above the fallback because a menu pick pins the video just the same.
+        if (!isPresentingMainVideo(player)) return;
+
         if (!hasQualityApi(player)) {
             selectViaMenuFallback(player, expectedVideoKey);
             return;
@@ -970,7 +994,7 @@
         if (document.visibilityState === 'hidden') return false;
         try {
             if (!isInViewport(video)) return false;
-            if (typeof player.getPresentingPlayerType === 'function' && player.getPresentingPlayerType() !== 1) return false;
+            if (!isPresentingMainVideo(player)) return false;
             if (typeof player.getPlaybackQuality === 'function' && player.getPlaybackQuality() !== quality) return false;
         } catch (_) {
             return false;
