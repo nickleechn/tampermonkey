@@ -41,6 +41,12 @@
 // config whichever side of the page's `var ytcfg` the script lands on, and 4K
 // and plain-over-Premium hold on both selection paths.
 //
+// 2.4.1 fixes two pre-roll bugs measured in Chromium 156 against CrystalClear and
+// found here by reading the code, so the stubs copy what that measurement saw:
+// nothing is pinned while an ad is on screen, on either selection path, and waiting
+// through one spends no attempts; and html5_default_av1_threshold reaches every
+// player config alongside the force flag, replacing any value the page serves.
+//
 // No browser required.
 const vm = require('vm');
 const fs = require('fs');
@@ -61,6 +67,8 @@ const YTCFG_PAGE = 'var ytcfg={d:function(){return window.yt&&yt.config_||ytcfg.
     'set:function(){var a=arguments;if(a.length>1)ytcfg.d()[a[0]]=a[1];' +
     'else{var k;for(k in a[0])ytcfg.d()[k]=a[0][k]}}};';
 const FORCE_FLAG = 'html5_force_av1_for_testing';
+const THRESHOLD_FLAG = 'html5_default_av1_threshold';
+const AV1_FLAGS = `${FORCE_FLAG}=true&${THRESHOLD_FLAG}=8192`;
 const AV1_MIME = 'video/mp4; codecs="av01.0.08M.08"';
 
 const SOURCE = fs.readFileSync(
@@ -137,7 +145,9 @@ function makePlayer(levels, qualityData, { videoId = null, settingsButton = fals
     player.current = 'auto';
     player.presentingType = 1;
     player.getAvailableQualityLevels = () => player.levels.slice();
-    player.getAvailableQualityData = () => player.qualityData.slice();
+    // During an ad the player answers this one for the ad, and only this one.
+    player.adData = [];
+    player.getAvailableQualityData = () => (player.presentingType === 2 ? player.adData : player.qualityData).slice();
     player.setPlaybackQualityRange = function (...args) {
         player.calls.push(['setPlaybackQualityRange', ...args]);
         player.current = args[1] || args[0];
@@ -706,8 +716,14 @@ function build({
     check('frames are only counted once the stream is actually at the guarded level',
         env.ranges().length === 1, `pins=${env.ranges().map((c) => c[2]).join('>')}`);
 
+    // A mid-roll straight after the pin, since nothing gets pinned during an ad.
     env = build({ levels: ['highres', 'hd2160'], video: { dropRatio: () => 0.5 } });
-    env.player.presentingType = 2;
+    const midRoll = env.player;
+    const pinRange = midRoll.setPlaybackQualityRange;
+    midRoll.setPlaybackQualityRange = function (...args) {
+        pinRange.apply(this, args);
+        midRoll.presentingType = 2;
+    };
     await env.clock.flush();
     check('an ad is never measured',
         env.ranges().length === 1, `pins=${env.ranges().map((c) => c[2]).join('>')}`);
@@ -860,7 +876,7 @@ function build({
     const setConfigs = (e, configs, twoArg) => vm.runInContext(twoArg
         ? `ytcfg.set('WEB_PLAYER_CONTEXT_CONFIGS', ${JSON.stringify(configs)})`
         : `ytcfg.set({ OTHER: 1, WEB_PLAYER_CONTEXT_CONFIGS: ${JSON.stringify(configs)} })`, e.sandbox);
-    const flagCount = (flags) => flags.split('&').filter((p) => p.startsWith(FORCE_FLAG + '=')).length;
+    const flagCount = (flags, name = FORCE_FLAG) => flags.split('&').filter((p) => p.startsWith(name + '=')).length;
 
     // Script first, page second: the usual document-start order.
     env = build({ shipped: true });
@@ -875,7 +891,7 @@ function build({
     check('existing flags in that config survive',
         flags.split('&').includes('kept_flag=true') && flags.split('&').includes('other=1.0'), flags);
     check('every player config gets it, even one with no flags yet',
-        flagsOf(env, 'SHORTS') === FORCE_FLAG + '=true', flagsOf(env, 'SHORTS'));
+        flagsOf(env, 'SHORTS').split('&').includes(FORCE_FLAG + '=true'), flagsOf(env, 'SHORTS'));
     check('the rest of the same ytcfg.set call still lands',
         vm.runInContext("ytcfg.get('OTHER')", env.sandbox) === 1);
 
@@ -909,7 +925,7 @@ function build({
     env = build();
     vm.runInContext(YTCFG_PAGE, env.sandbox);
     setConfigs(env, { WATCH: { serializedExperimentFlags: 'a=1' } });
-    check('under \'auto\' the flag is never added',
+    check('under \'auto\' neither flag is added',
         flagsOf(env, 'WATCH') === 'a=1', flagsOf(env, 'WATCH'));
 
     env = build({ shipped: true, levels: ['highres', 'hd2880', 'hd2160', 'hd1080'] });
@@ -968,6 +984,112 @@ function build({
     await env.clock.flush();
     check('plain 1080p beats Premium through the menu fallback too',
         env.picked() === '1080p', `picked=${env.picked()}`);
+
+    console.log('\nPre-roll ads — the shipped defaults');
+
+    // As measured on base.js 11a45ffb in Chromium 156, against CrystalClear: a
+    // pre-roll on a click-through, with the video's id and full level list already
+    // showing, and the ad's data list. Nothing here has been seen in Safari.
+    const FOUR_K_DATA = ['hd2160', 'hd1440', 'hd1080', 'hd720'].map((quality) => ({ quality, qualityLabel: quality, isPlayable: true }));
+    const AD_DATA = ['hd1080', 'hd720', 'large'].map((quality) => ({ quality, qualityLabel: quality, isPlayable: true }));
+    const duringPreroll = () => {
+        const e = build({
+            shipped: true,
+            levels: ['hd2160', 'hd1440', 'hd1080', 'hd720', 'auto'],
+            qualityData: FOUR_K_DATA,
+            videoId: 'abc123',
+            video: {}
+        });
+        e.player.adData = AD_DATA;
+        e.player.presentingType = 2;
+        return e;
+    };
+
+    env = duringPreroll();
+    await env.clock.flush();
+    check('nothing is pinned while an ad is on screen',
+        env.ranges().length === 0, JSON.stringify(env.ranges()));
+    env.video.fire('playing');
+    await env.clock.flush();
+    env.video.fire('canplay');
+    await env.clock.flush();
+    check('nor on the player events that fire during it',
+        env.ranges().length === 0, JSON.stringify(env.ranges()));
+    env.player.presentingType = 1;
+    env.video.fire('loadedmetadata');
+    await env.clock.flush();
+    check('the video gets its own top level when the ad ends, not the ad\'s',
+        env.ranges().length === 1 && env.ranges()[0][2] === 'hd2160', JSON.stringify(env.ranges()));
+
+    // Four attempts per video, and each of these rounds has four tries in it.
+    env = duringPreroll();
+    for (let i = 0; i < 8; i++) {
+        env.video.fire('canplay');
+        await env.clock.flush();
+    }
+    env.player.presentingType = 1;
+    env.video.fire('canplay');
+    await env.clock.flush();
+    check('a long ad break does not use up the video\'s attempts',
+        env.ranges().length === 1 && env.ranges()[0][2] === 'hd2160', JSON.stringify(env.ranges()));
+
+    env = build({ shipped: true, levels: ['hd2160', 'hd1080'], video: {} });
+    env.player.presentingType = 3;
+    await env.clock.flush();
+    check('any presenting type other than 1 waits, not only the ad\'s',
+        env.ranges().length === 0, JSON.stringify(env.ranges()));
+
+    env = build({ shipped: true, levels: ['hd2160', 'hd1080'], video: {} });
+    env.player.getPresentingPlayerType = () => { throw new Error('not ready'); };
+    await env.clock.flush();
+    check('a player that throws when asked is waited on, not pinned',
+        env.ranges().length === 0, JSON.stringify(env.ranges()));
+
+    env = build({ shipped: true, levels: ['hd2160', 'hd1080'] });
+    delete env.player.getPresentingPlayerType;
+    await env.clock.flush();
+    check('a player with no getPresentingPlayerType is still pinned',
+        env.ranges().length === 1, `pins=${env.ranges().length}`);
+
+    // A menu pick pins the video just the same and spends an attempt, so the
+    // fallback has to wait as well.
+    env = build({ shipped: true, menuLabels: ['2160p60', '1080p'], playerApi: false, video: {} });
+    env.player.presentingType = 2;
+    env.player.getPresentingPlayerType = () => env.player.presentingType;
+    await env.clock.flush();
+    check('the settings-menu fallback waits an ad out as well',
+        env.picked() === null, `picked=${env.picked()}`);
+    env.player.presentingType = 1;
+    env.video.fire('canplay');
+    await env.clock.flush();
+    check('and picks for the video when the ad ends',
+        env.picked() === '2160p60', `picked=${env.picked()}`);
+
+    // No headless check can show the player walking that codec list. These only
+    // show the flag arriving, whichever side of the page's `var ytcfg` we land on.
+    env = build({ shipped: true });
+    vm.runInContext(YTCFG_PAGE, env.sandbox);
+    setConfigs(env, { WATCH: { serializedExperimentFlags: 'kept_flag=true' }, SHORTS: {} });
+    check('the threshold flag goes in alongside the force flag',
+        flagsOf(env, 'WATCH') === 'kept_flag=true&' + AV1_FLAGS, flagsOf(env, 'WATCH'));
+    check('in every player config, even one with no flags yet',
+        flagsOf(env, 'SHORTS') === AV1_FLAGS, flagsOf(env, 'SHORTS'));
+
+    setConfigs(env, { WATCH: { serializedExperimentFlags: 'a=1' } }, true);
+    check('through the two-argument form of ytcfg.set too',
+        flagsOf(env, 'WATCH') === 'a=1&' + AV1_FLAGS, flagsOf(env, 'WATCH'));
+
+    setConfigs(env, { WATCH: { serializedExperimentFlags: `${THRESHOLD_FLAG}=1080&a=1&${FORCE_FLAG}=false` } });
+    flags = flagsOf(env, 'WATCH');
+    check('a threshold the page serves is replaced, not duplicated',
+        flagCount(flags, THRESHOLD_FLAG) === 1 && flags === 'a=1&' + AV1_FLAGS, flags);
+
+    env = build({
+        shipped: true,
+        pageScript: YTCFG_PAGE + `ytcfg.set({ WEB_PLAYER_CONTEXT_CONFIGS: { WATCH: { serializedExperimentFlags: '${THRESHOLD_FLAG}=0&a=1' } } });`
+    });
+    check('and so is one the page stored before the script ran',
+        flagsOf(env, 'WATCH') === 'a=1&' + AV1_FLAGS, flagsOf(env, 'WATCH'));
 
     const failed = results.filter(([, ok]) => !ok);
     console.log('');

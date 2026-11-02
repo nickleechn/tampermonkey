@@ -120,6 +120,21 @@ the 4K ceiling and plain-over-Premium pick hold on both selection paths. No
 headless check can show that the player honours the flag; that takes real Safari
 and Stats for nerds.
 
+2.4.1 adds a pre-roll section, also on the shipped defaults. Nothing is pinned
+while `getPresentingPlayerType()` isn't 1, on either selection path; waiting
+through an ad spends no attempts; the video gets its own top level when the ad
+ends; and `html5_default_av1_threshold=8192` reaches every player config alongside
+the force flag, replacing any value the page serves. 12 of those 14 checks fail
+against 2.4.0. The other two pass there too: a player with no
+`getPresentingPlayerType` is still pinned, and the menu picks for the video once
+the ad ends, which 2.4.0 had already done during it. `an ad is never measured`
+now starts its ad straight after the pin, since nothing gets pinned during one.
+
+The stubs copy what was measured in Chromium 156 against CrystalClear: the ad's
+formats in `getAvailableQualityData()` during a pre-roll, and a pre-roll sending 4K
+to VP9. Both were found in SuperTube by reading the code, not by running it in
+Safari, so check Stats for nerds there after a pre-roll.
+
 No browser required.
 
 ## `crystalclear-behaviour.js` — headless, current
