@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Quicksilver
 // @namespace    http://tampermonkey.net/
-// @version      4.2.0
-// @description  Chrome-only: connection-tiered Speculation Rules prefetch/prerender, learned LCP preload + origin preconnect, navigation-transition prediction, media priority hints, and opt-in content-visibility. Avoids sensitive links and degrades gracefully on slow connections.
+// @version      4.3.0
+// @description  Chrome-only: connection-tiered Speculation Rules prefetch/prerender, learned LCP preload (client-side routes too, via Soft Navigations) + origin preconnect, navigation-transition prediction, lazy hints for media that starts empty, and opt-in content-visibility. Avoids sensitive links and degrades gracefully on slow connections.
 // @author       You
 // @match        *://*/*
 // @updateURL    https://raw.githubusercontent.com/nickleechn/tampermonkey/main/Quicksilver.js
@@ -11,11 +11,102 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM_addElement
 // @grant        unsafeWindow
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
 
+// 4.3.0 — tuned against current Chrome (stable 156; tested in 153 and 156).
+// Chrome moved to a two-week release cycle at 153, so this version gates on
+// feature detection rather than version numbers wherever it can.
+//
+// - Learned hero preload now covers client-side routes. The LCP API goes
+//   quiet after the first interaction, so through 4.2.0 a route first
+//   reached by an SPA router never got a hero record, and the preload that
+//   runs on every route change had nothing to emit. Chrome 151 shipped Soft
+//   Navigations, which report the largest paint of the interaction that
+//   navigated. Only that interaction counts: in Chrome 153 a later click
+//   that opens a modal reports its paint under the *same* navigationId, so
+//   paints are matched on interactionId, and a paint delivered before its
+//   soft-navigation entry is held until the entry claims it. Silence still
+//   erodes nothing, because the browser reports no soft navigation at all
+//   for some route changes (one that paints only an image, in testing).
+// - A soft-navigation entry for the clicked link marks an origin as an SPA
+//   with no time window, catching routers that push only after a fetch
+//   slower than the 5 s click window. It adds to the click heuristic and
+//   never replaces it; an in-page #anchor is excluded explicitly, since a
+//   fragment change can be a soft navigation too.
+// - The LCP median leaves out client-side routes (timed from the click,
+//   not the load) and loads Chrome flags as slowed by a busy machine
+//   (PerformanceNavigationTiming.confidence 'low', Chrome 145+).
+// - Found by the new real-Chrome harness: injected before the parser has
+//   created <html> (CDP does this; so can a userscript manager at
+//   document-start), the learned hero preload and critical-origin
+//   preconnects were dropped, and the media observer never started — both
+//   watched documentElement and gave up when it was null. They watch the
+//   document node now.
+//
+// Measured in Chromium 156 rather than assumed, and each overturned something:
+//
+// - Part 7 did almost nothing. Below-the-fold images and iframes that had a
+//   source were requested exactly as often with loading=lazy as without, and
+//   fetchpriority=low moved no request's priority; meanwhile the pass forced
+//   layout at DOMContentLoaded. It now handles only the shape it changed, an
+//   element inserted empty, through an IntersectionObserver. The <video>
+//   preload="metadata" hint is gone: that is Chrome's default.
+// - Through 4.2.0 a site sending Referrer-Policy origin or strict-origin
+//   filed every arrival as a transition from its homepage, because the
+//   referrer is then a bare origin. no-referrer sites learned nothing, and
+//   their hits and misses weren't counted. navigation.activation.from gives
+//   the real path under strict-origin and hides it under origin and
+//   no-referrer, so the click marker now records where it was pressed.
+// - 4.2.0's "pointerdown speculates on data-saver too" was wrong: Chrome's
+//   docs say speculation is blocked under Save-Data, so the rule did nothing.
+//   Nothing warms there now, and those clicks no longer count as misses. The
+//   <link rel=prefetch> fallback is no substitute: a page sent no-store,
+//   no-cache or max-age=0 is fetched a second time by the click, which is
+//   also why that strict-CSP fallback is now off on slow links.
+//
+// Also fixed:
+//
+// - Since Chrome 141 a router's precommitHandler can hold a navigation's
+//   commit, and the URL read after the navigate event was still the old one,
+//   so the route change vanished, soft-route hero included. Route changes
+//   come from currententrychange now, which fires after the commit.
+// - Back from the bfcache, pressing the link that left the page warmed
+//   nothing, because this document still recorded it as warm, and the
+//   prediction was never renewed. Both are reset on pageshow.
+// - The hover rules read the connection tier once, so a tab that moved from
+//   wifi to a slow link kept prerendering on hover. They follow it now.
+// - sizes="auto" was replayed into a preload as imagesizes, where it falls
+//   back to 100vw. Ported from the Safari build's guard.
+// - expects_no_vary_search is gone. Its comment said it let a prefetch of
+//   /post serve a click on /post?utm_source=x, but the server has to send
+//   No-Vary-Search for that; alone the hint can only make a click wait on a
+//   prefetch it then discards.
+// - Rules now try GM_addElement first, which Tampermonkey documents for pages
+//   whose CSP restricts script tags. Not verifiable without real Tampermonkey;
+//   if it is blocked, the violation handling behaves as before.
+//
+// Checked in Chrome 153 and left alone: every rule set this script emits
+// parses (the CDP Preload domain reports no error for any of them), and the
+// unload deprecation completed in 155 doesn't touch it (pagehide only). Checked
+// in Chromium 156 and left alone: rule.style.fontDisplay does reach the rule
+// and its FontFace, and this script doesn't stop a page entering the bfcache.
+//
+// Considered and left out: prerender_until_script (still an origin trial,
+// now to 159; Chrome silently ignores the key without a token, so it would
+// parse and do nothing), form_submission prerender (151: the query isn't
+// known before the submit), the speculation-measurement and
+// prefetch-activation-beacon origin trials, cross-origin-iframe prerender
+// (158: the site opts in by header), the moderate-viewport origin trial, a
+// speculation tag (sent to servers in Sec-Speculation-Tags, so it would
+// identify users of this script to every site), cross-document view
+// transitions (an animation on every navigation, and no faster), sizes="auto"
+// on images (one with no definite width can pick too small a file), and
+// Compute Pressure gating (no measured benefit).
+//
 // 4.2.0 — speculate wherever the click is already committed, and follow
 // links into new tabs.
 //
@@ -156,6 +247,9 @@
     })();
     // target="_blank" prerender (document rules, and target_hint on lists).
     const NEW_TAB_PRERENDER_CHROME = 138;
+    // 'eager' on document rules became 10ms of hover (desktop) / a short
+    // viewport dwell (mobile) rather than "every link, now".
+    const EAGER_HOVER_CHROME = 143;
 
     // =========================================================================
     // Shared helpers
@@ -179,6 +273,35 @@
 
     const conn = navigator.connection;
     const supportsSpeculationRules = Boolean(HTMLScriptElement.supports && HTMLScriptElement.supports('speculationrules'));
+
+    // Soft Navigations (Chrome 151+): the browser itself reports a
+    // click-driven same-document navigation that painted, and the largest
+    // paint each such interaction produced. Feature-detected, never assumed.
+    const supportedEntryTypes = (() => {
+        try {
+            const types = PerformanceObserver.supportedEntryTypes;
+            return Array.isArray(types) ? types : [];
+        } catch (_) {
+            return [];
+        }
+    })();
+    const supportsSoftNavigations = supportedEntryTypes.includes('soft-navigation');
+    const supportsInteractionPaint = supportsSoftNavigations
+        && supportedEntryTypes.includes('interaction-contentful-paint');
+
+    function observeEntries(type, handler) {
+        try {
+            const observer = new PerformanceObserver(list => {
+                for (const entry of list.getEntries()) {
+                    if (!entry) continue;
+                    try {
+                        handler(entry);
+                    } catch (_) {}
+                }
+            });
+            observer.observe({ type, buffered: true });
+        } catch (_) {}
+    }
 
     // Set once Part 6 has read storage, and flipped live by the SPA detector
     // there. Declared up here because Parts 2 and 4 read it and can run
@@ -218,6 +341,23 @@
         return script;
     }
 
+    // Tampermonkey documents GM_addElement for pages whose CSP restricts
+    // script tags, which is what stops inline rules on a strict origin. If it
+    // doesn't get through, the same violation fires and Part 4 falls back as
+    // it always has; if the manager has no such API, this is the old path.
+    function installRules(rules) {
+        const parent = document.head || document.documentElement;
+        if (parent && typeof GM_addElement === 'function') {
+            try {
+                const added = GM_addElement(parent, 'script', { type: 'speculationrules', textContent: JSON.stringify(rules) });
+                if (added) return added;
+            } catch (_) {}
+        }
+        const script = makeRulesScript(rules);
+        parent.appendChild(script);
+        return script;
+    }
+
     // The Prioritized Task Scheduling API exposes `scheduler` as a Window
     // global, not on navigator (navigator.scheduling is a different API with
     // isInputPending), so the previous navigator.scheduler probe never matched
@@ -254,6 +394,12 @@
         if (Number.isFinite(conn.downlink) && conn.downlink > 0 && conn.downlink < 0.7) return TIER_SLOW;
 
         return TIER_FAST;
+    }
+
+    // Chrome blocks speculation outright under Save-Data, so a rule installed
+    // here would parse and do nothing.
+    function saveDataOn() {
+        return Boolean(conn && conn.saveData);
     }
 
     function postBackgroundTask(fn, timeout) {
@@ -407,21 +553,13 @@
     // Part 2: Speculation Rules prefetch/prerender (Chrome, aggressive)
     // =========================================================================
 
-    // Tracking parameters never change the response body, so a prefetch of
-    // /post should still satisfy a click on /post?utm_source=x. Without this
-    // hint every campaign-tagged link discards its own prefetch.
-    const NO_VARY_SEARCH_PARAMS = [
-        'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
-        'gclid', 'gbraid', 'wbraid', 'fbclid', 'msclkid', 'yclid', 'igshid',
-        'mc_cid', 'mc_eid', '_ga', '_gl'
-    ];
-    const EXPECTS_NO_VARY_SEARCH = 'params=(' + NO_VARY_SEARCH_PARAMS.map(p => '"' + p + '"').join(' ') + ')';
-
     let blanketRulesScript = null;
+    let blanketRulesTier = null;
 
     function initSpeculationRules() {
         const tier = getConnectionTier();
-        if (!supportsSpeculationRules || knownSpa) return;
+        blanketRulesTier = tier;
+        if (!supportsSpeculationRules || knownSpa || saveDataOn()) return;
 
         // Path words go through href_matches (segment-anchored, so no
         // href*='order'→border trap); the substring list is deliberately
@@ -458,19 +596,18 @@
         // Since Chrome 143 'eager' on a document rule means 10ms of hover on
         // desktop and a short viewport dwell on mobile, two in flight at most
         // (FIFO). Before 143 it meant "every link on the page, now", so older
-        // builds keep the 200ms hover of 'moderate'. On a slow or data-saver
-        // connection nothing fires on hover, but pointerdown still does: by
-        // then the click is ~100ms away and will spend those bytes anyway.
+        // builds keep the 200ms hover of 'moderate'. On a slow connection
+        // nothing fires on hover, but pointerdown still does: by then the
+        // click is ~100ms away and will spend those bytes anyway.
         const hoverEagerness = tier === TIER_SLOW
             ? 'conservative'
-            : (chromiumMajor >= 143 ? 'eager' : 'moderate');
+            : (chromiumMajor >= EAGER_HOVER_CHROME ? 'eager' : 'moderate');
 
         const rules = {
             prefetch: [
                 {
                     where: sameOriginLinks(prefetchExcludes),
-                    eagerness: hoverEagerness,
-                    expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
+                    eagerness: hoverEagerness
                 },
                 // Cross-origin links on pointerdown: the click is usually on
                 // its way, so this buys the gap before it lands. Cross-site
@@ -497,8 +634,7 @@
             rules.prerender = [
                 {
                     where: sameOriginLinks(prerenderExcludes),
-                    eagerness: 'moderate',
-                    expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
+                    eagerness: 'moderate'
                 },
                 // Speculation rules only ever match <a>/<area> elements, so a
                 // link[rel=next] selector would be dead; ~= handles multi-token
@@ -510,17 +646,25 @@
                             { not: { selector_matches: prerenderExcludes } }
                         ]
                     },
-                    eagerness: 'immediate',
-                    expects_no_vary_search: EXPECTS_NO_VARY_SEARCH
+                    eagerness: 'immediate'
                 }
             ];
         }
 
         try {
-            const script = makeRulesScript(rules);
-            (document.head || document.documentElement).appendChild(script);
-            blanketRulesScript = script;
+            blanketRulesScript = installRules(rules);
         } catch (_) {}
+    }
+
+    // A long-lived tab outlasts the connection it started on, and a bfcached
+    // page misses the change event altogether. The new rules go in before the
+    // old come out, so whatever both keep isn't cancelled and restarted.
+    function refreshSpeculationRules() {
+        if (getConnectionTier() === blanketRulesTier) return;
+        const previous = blanketRulesScript;
+        blanketRulesScript = null;
+        initSpeculationRules();
+        if (previous) previous.remove();
     }
 
     // DOMContentLoaded, not load-then-idle: document rules match links as
@@ -531,7 +675,17 @@
     // One task later than DOMContentLoaded strictly needs: if Tampermonkey
     // injects late, runWhenDomReady calls straight through, before Part 6
     // has read this origin's SPA flag further down.
-    if (isTopFrame) runWhenDomReady(() => setTimeout(initSpeculationRules, 0));
+    if (isTopFrame) {
+        runWhenDomReady(() => setTimeout(() => {
+            initSpeculationRules();
+            if (conn && typeof conn.addEventListener === 'function') {
+                conn.addEventListener('change', refreshSpeculationRules);
+            }
+            window.addEventListener('pageshow', event => {
+                if (event && event.persisted) refreshSpeculationRules();
+            });
+        }, 0));
+    }
 
     // =========================================================================
     // Part 3: preconnect + dns-prefetch on hover/focus
@@ -634,9 +788,10 @@
     }
 
     // Runs on every tier. A pointerdown is ~100ms ahead of the click it
-    // starts, so what it fetches is what the click would have fetched:
-    // almost no waste even on a slow or data-saver connection, where the
-    // hover rules in Part 2 are off.
+    // starts, so what a speculation rule fetches is what the click would have
+    // fetched: almost no waste even on a slow connection, where the hover
+    // rules in Part 2 are off. Under Save-Data, which blocks those rules, and
+    // down the <link> path on a slow link, it warms nothing (see warm()).
     function initPointerdownPrefetch() {
 
         // Deliberately not a growing memo of every link ever warmed: only one
@@ -697,10 +852,9 @@
             const rules = {};
             rules[action] = [rule];
 
-            const script = makeRulesScript(rules);
+            const script = installRules(rules);
 
             if (currentRuleScript) currentRuleScript.remove();
-            (document.head || document.documentElement).appendChild(script);
             currentRuleScript = script;
         }
 
@@ -716,8 +870,14 @@
 
         // A <link rel=prefetch> lands in the HTTP cache, which a new tab on
         // the same site shares, so the hint path serves new-tab links too.
+        // But only the HTTP cache: measured in Chrome 156, a page sent as
+        // no-store, no-cache or max-age=0 is fetched again by the click, so
+        // the hint doubles it. Worth risking on a link that can absorb that,
+        // not on a slow one or under Save-Data.
         function warm(href, newTab) {
+            if (saveDataOn()) return;
             const method = (supportsSpeculationRules && !rulesBlocked) ? 'rules' : 'hint';
+            if (method === 'hint' && getConnectionTier() === TIER_SLOW) return;
             // Re-warming the same href is a no-op only while the mechanism
             // stays the same. Once CSP has ruled speculation rules out, the
             // link that was warmed under the old assumption still needs its
@@ -736,11 +896,23 @@
                 if (method !== 'rules') return;
                 rulesBlocked = true;
                 currentMethod = 'hint';
+                if (getConnectionTier() === TIER_SLOW) return;
                 try {
                     prefetchHint(href);
                 } catch (_) {}
             }
         }
+
+        // Back from the bfcache this document still believes its link is warm,
+        // but the speculation was spent on the navigation that left it, and
+        // warm() would treat another press on that link as a no-op.
+        window.addEventListener('pageshow', event => {
+            if (!event || !event.persisted) return;
+            currentHref = null;
+            currentMethod = null;
+            if (currentRuleScript) currentRuleScript.remove();
+            currentRuleScript = null;
+        });
 
         document.addEventListener('pointerdown', e => {
             // An in-page router answers the click itself; the document we
@@ -1054,6 +1226,9 @@
     const LINK_CLICK_WINDOW_MS = 5000;
     let lastLinkClickAt = 0;
     let lastLinkClickHref = null;
+    // The route the click was made on, so an in-page #anchor (same path) is
+    // never mistaken for a router answering it.
+    let lastLinkClickRoute = null;
 
     function withoutHash(href) {
         const url = toUrl(href);
@@ -1072,13 +1247,12 @@
             if (!link) return;
             lastLinkClickAt = Date.now();
             lastLinkClickHref = withoutHash(link.href);
+            lastLinkClickRoute = pageKey();
         }, { passive: true, capture: true });
 
-        // Deferred a turn: pushState updates location *before* returning, but
-        // the Navigation API's navigate event fires before the new URL is
-        // committed, so reading it fresh on the next task is correct for both.
-        // What kind of change it was is captured now, though, while the click
-        // that caused it is still recent.
+        // Deferred a turn so a route change never runs inside the router's own
+        // pushState call. What kind of change it was is captured now, though,
+        // while the click that caused it is still recent.
         const fire = push => {
             const recent = Date.now() - lastLinkClickAt < LINK_CLICK_WINDOW_MS;
             const info = { push, clickedHref: recent ? lastLinkClickHref : null };
@@ -1093,9 +1267,12 @@
 
         // The Navigation API reports every same-document navigation without
         // touching page globals, so it is strongly preferred over patching
-        // history.pushState.
+        // history.pushState. currententrychange, not navigate: since Chrome
+        // 141 a router's precommitHandler holds the commit for as long as it
+        // likes, so the URL read after navigate was still the old one and the
+        // route change was lost. This one fires after the commit.
         if (window.navigation && typeof window.navigation.addEventListener === 'function') {
-            window.navigation.addEventListener('navigate', event => fire(Boolean(event) && event.navigationType === 'push'));
+            window.navigation.addEventListener('currententrychange', event => fire(Boolean(event) && event.navigationType === 'push'));
             return;
         }
 
@@ -1136,6 +1313,23 @@
         return Boolean(flag) && Date.now() - (Number(flag.at) || 0) < LEARN_MAX_AGE;
     }
 
+    function markSpa() {
+        // Kept alive by use and aged out like everything else, so a site
+        // that drops its client-side router gets speculation back.
+        const flag = readStore(LEARN_SPA_KEY);
+        if (!flag || Date.now() - (Number(flag.at) || 0) > SPA_FLAG_REFRESH) {
+            writeStore(LEARN_SPA_KEY, { at: Date.now() });
+        }
+
+        if (knownSpa) return;
+        knownSpa = true;
+        // Stop paying for this visit too, not only future ones.
+        if (blanketRulesScript) {
+            blanketRulesScript.remove();
+            blanketRulesScript = null;
+        }
+    }
+
     function initSpaDetection() {
         let lastRoute = pageKey();
 
@@ -1145,22 +1339,24 @@
             lastRoute = next;
             if (!info || !info.push || !info.clickedHref) return;
             if (info.clickedHref !== withoutHash(location.href)) return;
-
-            // Kept alive by use and aged out like everything else, so a site
-            // that drops its client-side router gets speculation back.
-            const flag = readStore(LEARN_SPA_KEY);
-            if (!flag || Date.now() - (Number(flag.at) || 0) > SPA_FLAG_REFRESH) {
-                writeStore(LEARN_SPA_KEY, { at: Date.now() });
-            }
-
-            if (knownSpa) return;
-            knownSpa = true;
-            // Stop paying for this visit too, not only future ones.
-            if (blanketRulesScript) {
-                blanketRulesScript.remove();
-                blanketRulesScript = null;
-            }
+            markSpa();
         });
+
+        // Chrome 151+ says so itself: a soft-navigation entry is a URL change
+        // that an interaction caused and that painted. Matched against the
+        // clicked link, it needs no time window, so a router that pushes only
+        // after a slow data fetch (past LINK_CLICK_WINDOW_MS) still counts.
+        // It adds to the heuristic above and never replaces it: the browser
+        // reports nothing for a route whose only change is an image.
+        // replaceState counts as a soft navigation too; the link match is
+        // what keeps a URL rewrite from being read as a router.
+        if (supportsSoftNavigations) {
+            observeEntries('soft-navigation', entry => {
+                if (!lastLinkClickHref || typeof entry.name !== 'string') return;
+                if (routeKeyOf(entry.name) === lastLinkClickRoute) return;
+                if (withoutHash(entry.name) === lastLinkClickHref) markSpa();
+            });
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1211,14 +1407,16 @@
             if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
             const link = getClosestLinkTarget(event.target);
             if (!isSpeculableLink(link)) return;
-            writeStore(PENDING_NAV_KEY, { href: link.href, at: Date.now() });
+            writeStore(PENDING_NAV_KEY, { href: link.href, at: Date.now(), from: pageKey() });
         }, { passive: true, capture: true });
     }
 
-    function recordNavigationOutcome(nav) {
-        const pending = readStore(PENDING_NAV_KEY);
-        if (pending) deleteStore(PENDING_NAV_KEY);
+    function isFreshPendingNav(pending) {
+        return Boolean(pending) && pending.href === location.href
+            && Date.now() - (Number(pending.at) || 0) < PENDING_NAV_MAX_AGE;
+    }
 
+    function recordNavigationOutcome(nav, pending) {
         // activationStart is non-zero only on a prerendered page (the moment
         // the user arrived); deliveryType names a navigation that Chrome
         // answered from a prefetch. Hits count without the marker: a
@@ -1227,9 +1425,7 @@
         if (nav && Number(nav.activationStart) > 0) return bumpStats('nav', 'prerender');
         if (nav && nav.deliveryType === 'navigational-prefetch') return bumpStats('nav', 'prefetch');
 
-        const clicked = pending && pending.href === location.href
-            && Date.now() - (Number(pending.at) || 0) < PENDING_NAV_MAX_AGE;
-        if (clicked) bumpStats('nav', 'miss');
+        if (isFreshPendingNav(pending)) bumpStats('nav', 'miss');
     }
 
     // -------------------------------------------------------------------------
@@ -1242,17 +1438,19 @@
             return;
         }
 
-        const root = document.documentElement;
-        if (!root) return;
-
         // document-start can run before <head> exists. Resource hints are only
         // reliably processed once they are in the document, so wait for it.
+        // Before 4.3.0 this watched documentElement and gave up when there
+        // was none — which is the case for a script injected before the
+        // parser has created <html> (CDP, some userscript managers): the
+        // learned hero preload was silently dropped. The document node
+        // always exists; the subtree watch ends as soon as <head> appears.
         const observer = new MutationObserver(() => {
             if (!document.head) return;
             observer.disconnect();
             document.head.appendChild(node);
         });
-        observer.observe(root, { childList: true });
+        observer.observe(document, { childList: true, subtree: true });
     }
 
     // A different viewport can mean a different layout and so a different
@@ -1282,13 +1480,29 @@
         return { width: Number(record.vw), dpr: Number(record.dpr) };
     }
 
+    // sizes="auto" on a lazy image means "use my layout box". A preload has
+    // none, so imagesizes ignores the keyword and falls back to 100vw: a bigger
+    // candidate than the <img> will take, downloaded as well as the right one.
+    // An author's fallback after "auto," is kept; with nothing after it, false
+    // says the srcset cannot be replayed.
+    function withoutAutoSizes(sizes) {
+        if (typeof sizes !== 'string') return sizes || null;
+        const match = /^\s*auto\s*(?:,|$)/i.exec(sizes);
+        if (!match) return sizes;
+        return sizes.slice(match[0].length).trim() || false;
+    }
+
+    function canReplaySrcset(record) {
+        return Boolean(record.srcset) && withoutAutoSizes(record.sizes) !== false;
+    }
+
     function matchesViewport(record) {
         const bucket = recordBucket(record);
         if (!bucket || bucket.width !== viewportWidthBucket()) return false;
         // With srcset replayed as imagesrcset the browser picks the density
         // itself, so zoom (which changes devicePixelRatio) only invalidates a
         // src-only hero, whose URL was chosen for the old density.
-        return Boolean(record.srcset) || bucket.dpr === currentDpr();
+        return canReplaySrcset(record) || bucket.dpr === currentDpr();
     }
 
     function pageKey() {
@@ -1296,6 +1510,11 @@
         // articles under the same route have different hero images, and
         // preloading the wrong one spends scarce bytes on an unused image.
         return location.pathname.slice(0, 200);
+    }
+
+    function routeKeyOf(href) {
+        const url = toUrl(href);
+        return url ? url.pathname.slice(0, 200) : null;
     }
 
     function capStore(store, limit) {
@@ -1352,9 +1571,10 @@
                 // Replaying srcset/sizes lets the browser resolve the same
                 // candidate the <img> will, instead of us betting on the
                 // viewport bucket still matching.
-                if (record.srcset) {
+                if (canReplaySrcset(record)) {
                     link.setAttribute('imagesrcset', record.srcset);
-                    if (record.sizes) link.setAttribute('imagesizes', record.sizes);
+                    const sizes = withoutAutoSizes(record.sizes);
+                    if (sizes) link.setAttribute('imagesizes', sizes);
                 }
                 // A hero that 404s or was removed should stop being preloaded
                 // rather than cost a request a day for two weeks.
@@ -1415,50 +1635,59 @@
         let currentRoute = pageKey();
         let persistedRoute = null;
 
-        try {
-            const observer = new PerformanceObserver(list => {
-                for (const entry of list.getEntries()) {
-                    // LCP is reported repeatedly as larger candidates appear;
-                    // the final one wins. Text LCP has no url and nothing to
-                    // preload — but it does replace an earlier image: a logo
-                    // that painted first and then lost to a headline is not
-                    // the hero, and used to be recorded as one.
-                    if (!entry) continue;
-                    if (!entry.url) {
-                        pending = null;
-                        continue;
-                    }
+        // LCP is reported repeatedly as larger candidates appear; the final
+        // one wins. Text LCP has no url and nothing to preload — but it does
+        // replace an earlier image: a logo that painted first and then lost
+        // to a headline is not the hero, and used to be recorded as one.
+        observeEntries('largest-contentful-paint', entry => {
+            pending = snapshotCandidate(entry, currentRoute, false);
+        });
 
-                    // Snapshot now, not at persist time: entry.element is null
-                    // once the element leaves the document, which is routine for
-                    // carousels and SPA route changes, and reading crossOrigin
-                    // as null then is exactly the CORS-mode mismatch that turns
-                    // the preload into a second full download.
-                    const element = entry.element;
-                    // Inside <picture>, the browser chose entry.url from a
-                    // <source> (often AVIF or WebP). The <img>'s own srcset is
-                    // only the fallback, so replaying it would preload a JPEG
-                    // the page never uses; preload the exact URL instead.
-                    const inPicture = Boolean(element && element.parentElement
-                        && element.parentElement.tagName === 'PICTURE');
-                    const readAttr = name => (!inPicture && element && element.getAttribute)
-                        ? element.getAttribute(name)
-                        : null;
-                    pending = {
-                        url: entry.url,
-                        startTime: entry.startTime,
-                        cors: (element && element.crossOrigin) || null,
-                        srcset: readAttr('srcset'),
-                        sizes: readAttr('sizes'),
-                        // Bound to the route that was current when the hero
-                        // painted. Reading location.pathname at persist time is
-                        // what used to file an SPA's hero under the wrong page.
-                        route: currentRoute
-                    };
-                }
+        // The LCP API goes quiet after the first interaction, so through
+        // 4.2.0 a route first reached client-side never got a hero record,
+        // and applyLearnedHints(next) on a route change had nothing to
+        // preload. Chrome 151+ reports the largest paint of each interaction
+        // instead. Only the interaction that *was* the soft navigation
+        // counts: in Chrome 153 a later click that opens a modal reports its
+        // paint under the same navigationId, so matching on that alone would
+        // learn the modal's image as the route's hero. The paint can arrive
+        // before its soft-navigation entry does, so it waits briefly, keyed
+        // by interaction.
+        let routeInteraction = null;
+        let unclaimedSoftNav = null;
+        const earlyPaints = new Map();
+        const EARLY_PAINTS_MAX = 8;
+
+        const adoptSoftNav = (route, interactionId) => {
+            routeInteraction = interactionId;
+            if (earlyPaints.has(interactionId)) {
+                const candidate = earlyPaints.get(interactionId);
+                pending = candidate && Object.assign({}, candidate, { route });
+            }
+            earlyPaints.clear();
+        };
+
+        if (supportsInteractionPaint) {
+            observeEntries('soft-navigation', entry => {
+                const route = routeKeyOf(entry.name);
+                if (!route || entry.interactionId == null) return;
+                // Normally the route watcher has already moved currentRoute;
+                // if this entry beats it, the route change claims it below.
+                if (route === currentRoute) adoptSoftNav(route, entry.interactionId);
+                else unclaimedSoftNav = { route, interactionId: entry.interactionId };
             });
-            observer.observe({ type: 'largest-contentful-paint', buffered: true });
-        } catch (_) {}
+
+            observeEntries('interaction-contentful-paint', entry => {
+                const paint = entry.largestContentfulPaint;
+                if (!paint || entry.interactionId == null) return;
+                if (routeInteraction !== null && entry.interactionId === routeInteraction) {
+                    pending = snapshotCandidate(paint, currentRoute, true);
+                    return;
+                }
+                if (earlyPaints.size >= EARLY_PAINTS_MAX) earlyPaints.delete(earlyPaints.keys().next().value);
+                earlyPaints.set(entry.interactionId, snapshotCandidate(paint, currentRoute, true));
+            });
+        }
 
         function persistLcp(route, observed) {
             if (!route || persistedRoute === route) return;
@@ -1506,6 +1735,12 @@
             };
 
             writeStore(LEARN_LCP_KEY, capStore(store, LEARN_LCP_MAX_ENTRIES));
+
+            // The median is a page-load figure. A client-side route's paint
+            // is timed from the click, and a load Chrome itself flags as
+            // slowed by a busy machine (confidence 'low', Chrome 145+) says
+            // more about the machine than the site.
+            if (observed.soft || navigationConfidence() === 'low') return;
 
             const vitals = readStore(LEARN_VITALS_KEY) || {};
             const samples = Array.isArray(vitals.lcp) ? vitals.lcp.filter(Number.isFinite) : [];
@@ -1557,6 +1792,11 @@
             pending = null;
             emittedPreloadFor = null;
             learnedLcpUrl = null;
+            routeInteraction = null;
+            if (unclaimedSoftNav && unclaimedSoftNav.route === next) {
+                adoptSoftNav(next, unclaimedSoftNav.interactionId);
+            }
+            unclaimedSoftNav = null;
 
             applyLearnedHints(next);
             scheduleSettle();
@@ -1580,6 +1820,49 @@
         // Activation of a prerendered document is the moment the user really
         // arrives; the settle clock starts from here. Never fires otherwise.
         document.addEventListener('prerenderingchange', scheduleSettle, { once: true });
+    }
+
+    // Snapshot now, not at persist time: entry.element is null once the
+    // element leaves the document, which is routine for carousels and SPA
+    // route changes, and reading crossOrigin as null then is exactly the
+    // CORS-mode mismatch that turns the preload into a second full download.
+    // Returns null for a text paint, which displaces any earlier image.
+    function snapshotCandidate(entry, route, soft) {
+        if (!entry || !entry.url) return null;
+
+        const element = entry.element;
+        // Inside <picture>, the browser chose entry.url from a <source>
+        // (often AVIF or WebP). The <img>'s own srcset is only the fallback,
+        // so replaying it would preload a JPEG the page never uses; preload
+        // the exact URL instead.
+        const inPicture = Boolean(element && element.parentElement
+            && element.parentElement.tagName === 'PICTURE');
+        const readAttr = name => (!inPicture && element && element.getAttribute)
+            ? element.getAttribute(name)
+            : null;
+        const sizes = withoutAutoSizes(readAttr('sizes'));
+        return {
+            url: entry.url,
+            startTime: entry.startTime,
+            cors: (element && element.crossOrigin) || null,
+            srcset: sizes === false ? null : readAttr('srcset'),
+            sizes: sizes === false ? null : sizes,
+            // Bound to the route that was current when the hero painted.
+            // Reading location.pathname at persist time is what used to file
+            // an SPA's hero under the wrong page.
+            route,
+            soft
+        };
+    }
+
+    function navigationConfidence() {
+        try {
+            const nav = performance.getEntriesByType('navigation')[0];
+            const confidence = nav && nav.confidence;
+            return (confidence && typeof confidence.value === 'string') ? confidence.value : null;
+        } catch (_) {
+            return null;
+        }
     }
 
     function navigationActivationStart() {
@@ -1693,8 +1976,8 @@
     // an app shell with seventeen anchors and client-side routing it has almost
     // nothing to work with — which is the case that motivated this part.
     //
-    // document.referrer already says which page you came from, and same-origin
-    // navigations carry it in full under Chrome's default referrer policy. Two
+    // The browser already says which page you came from (see
+    // navigationSourcePath for how, since no one source covers every site). Two
     // sightings of the same transition is a better prediction than "some link
     // on this page", and costs one prerender instead of dozens of prefetches.
     //
@@ -1835,24 +2118,51 @@
         if (prefetchHrefs.length) rules.prefetch = [{ urls: prefetchHrefs, eagerness: 'immediate' }];
 
         try {
-            const script = makeRulesScript(rules);
+            const script = installRules(rules);
             // One prediction is live at a time. Removing a rules script cancels
             // its speculation, which is what we want when a route change makes
             // the previous prediction obsolete — and without this a long
             // single-page session would accumulate one script per navigation.
             if (currentPredictionScript) currentPredictionScript.remove();
-            (document.head || document.documentElement).appendChild(script);
             currentPredictionScript = script;
         } catch (_) {}
+    }
+
+    // Where this document was navigated from, as a same-origin pathname.
+    // Measured in Chrome 156 on a link click, by the site's Referrer-Policy:
+    //
+    //   policy           document.referrer   activation.from.url
+    //   default          /list/page          /list/page
+    //   strict-origin    /                   /list/page
+    //   origin           /                   null
+    //   no-referrer      (empty)             null
+    //
+    // The '/' is the trap: it is an origin with no path, and read as a path it
+    // files every arrival on the site as a transition from the homepage. So
+    // the referrer is only trusted when there's no activation entry to ask,
+    // as in a new tab. Where Chrome hides the URL on purpose, the click marker
+    // still knows: it never leaves this script's own storage, and Part 9 only
+    // ever stores a same-origin path.
+    function navigationSourcePath(pending) {
+        const activation = window.navigation && window.navigation.activation;
+        const entry = activation && activation.from;
+        const fromUrl = entry && entry.url ? toUrl(entry.url) : null;
+        if (fromUrl && fromUrl.origin === location.origin) return fromUrl.pathname;
+
+        if (isFreshPendingNav(pending) && typeof pending.from === 'string') return pending.from;
+        if (entry) return null;
+
+        const referrer = document.referrer ? toUrl(document.referrer) : null;
+        return referrer && referrer.origin === location.origin ? referrer.pathname : null;
     }
 
     function initTransitionLearning() {
         let previousRoute = pageKey();
 
-        // document.referrer survives reloads and back/forward traversals, so
-        // recording it unconditionally would count /list → /item once per
-        // reload of /item, letting a single real navigation reach the
-        // confidence gate by itself. Only a fresh navigation is a choice.
+        // A reload or back/forward traversal keeps its source, so recording it
+        // unconditionally would count /list → /item once per reload of /item,
+        // letting a single real navigation reach the confidence gate by
+        // itself. Only a fresh navigation is a choice.
         let navType = 'navigate';
         let navEntry = null;
         try {
@@ -1861,20 +2171,20 @@
             if (navEntry && navEntry.type) navType = navEntry.type;
         } catch (_) {}
 
-        // A full navigation: the referrer is the page we came from. Chrome's
-        // default policy sends it in full for same-origin requests, which is
-        // the only case recorded here anyway.
-        if (navType === 'navigate' && document.referrer) {
-            const from = toUrl(document.referrer);
-            if (from && from.origin === location.origin) {
-                recordTransition(from.pathname, previousRoute);
+        if (navType === 'navigate') {
+            const pending = readStore(PENDING_NAV_KEY);
+            if (pending) deleteStore(PENDING_NAV_KEY);
+
+            const source = navigationSourcePath(pending);
+            if (source) {
+                recordTransition(source, previousRoute);
                 // Same-site link navigations are the ones speculation could
                 // have served, so they are the hit-rate denominator. Skipped
-                // where speculation is off on purpose (SPA), so a deliberate
-                // "no" doesn't read as a miss. Slow links count: pointerdown
-                // still speculates there.
-                if (supportsSpeculationRules && !knownSpa) {
-                    recordNavigationOutcome(navEntry);
+                // where speculation is off (an SPA by choice, Save-Data by
+                // Chrome), so a "no" doesn't read as a miss. Slow links count:
+                // pointerdown still speculates there.
+                if (supportsSpeculationRules && !knownSpa && !saveDataOn()) {
+                    recordNavigationOutcome(navEntry, pending);
                 }
             }
         }
@@ -1893,6 +2203,12 @@
         });
 
         runWhenLoadedIdle(speculateOnPrediction);
+
+        // Back from the bfcache: nothing else re-runs, and the prediction that
+        // was live here was spent or cancelled when this page was left.
+        window.addEventListener('pageshow', event => {
+            if (event && event.persisted) speculateOnPrediction();
+        });
     }
 
     if (isTopFrame) {
@@ -1908,152 +2224,82 @@
     }
 
     // =========================================================================
-    // Part 7: priority hints and lazy media
+    // Part 7: lazy hints for media that starts empty
     // =========================================================================
     //
-    // Caveat worth knowing: for images the HTML parser discovers, Chrome's
-    // preload scanner may have already started the fetch before a userscript
-    // can touch the element, and neither loading=lazy nor fetchpriority
-    // retroactively cancels or reorders an in-flight request. The reliable win
-    // is script-inserted media — infinite scroll, SPA route changes, lazy
-    // widgets — which is also where the runaway byte counts usually are.
+    // loading=lazy only does anything if it lands before the fetch starts, and
+    // a userscript is almost always too late. Measured in Chrome 156, against
+    // a control run: images and iframes below the fold, parsed from the HTML
+    // or inserted by script with their source already set, were all requested
+    // exactly as often with the attribute as without it. fetchpriority=low
+    // changed no request's priority either, and script-inserted images start
+    // at Low anyway. Through 4.2.0 this part set both on all of them, and
+    // forced layout at DOMContentLoaded to decide.
+    //
+    // The one shape it did change: an element inserted empty, whose source
+    // arrives in a later task. So those are all it looks at now, and it asks
+    // an IntersectionObserver rather than forcing layout.
+    //
+    // The <video> preload="metadata" hint is gone too: it is Chrome's default.
+    // Chrome 148+ can lazy-load <video>, but not from here: added in a frame,
+    // the attribute lost the race for a parsed <video>, and winning means
+    // setting it in the mutation callback, before layout can say where the
+    // element is. Chrome's guide warns against it above the fold and on any
+    // element that may never intersect, such as a hidden <video> drawn to a
+    // canvas, and it would apply to every site this runs on.
 
-    const MEDIA_SCAN_BUDGET = 300;
     const BELOW_FOLD_FACTOR = 1.5;
 
-    function initMediaPriority() {
-        const tunedImages = new WeakSet();
-        let pending = null;
-
-        function foldLimit() {
-            return (window.innerHeight || document.documentElement.clientHeight || 0) * BELOW_FOLD_FACTOR;
-        }
-
-        // A responsive hero has no resolved currentSrc until layout runs, and
-        // may never expose the learned URL through .src at all, so match on
-        // every candidate the element could resolve to.
-        function isLcpCandidate(img) {
-            if (!learnedLcpUrl) return false;
-            if (img.currentSrc === learnedLcpUrl || img.src === learnedLcpUrl) return true;
-
-            const srcset = img.getAttribute('srcset');
-            if (!srcset) return false;
-
-            return srcset.split(',').some(candidate => {
-                const href = candidate.trim().split(/\s+/)[0];
-                if (!href) return false;
-                const url = toUrl(href);
-                return Boolean(url) && url.href === learnedLcpUrl;
-            });
-        }
-
-        // Every decision here needs layout. Guessing from document order was
-        // tried and is actively harmful: on markup that opens with a logo and
-        // a few nav icons, the hero is image five, and lazy + fetchpriority=low
-        // on the LCP element is the best-documented way to make a page slower.
-        function tuneWithLayout(el, limit) {
-            if (el.hasAttribute('loading') || el.hasAttribute('fetchpriority')) return;
-
-            const rect = el.getBoundingClientRect();
-            // No box yet (display:none, detached, mid-parse): leave it alone
-            // rather than deprioritise something about to become the hero.
-            if (rect.width === 0 && rect.height === 0) return;
-            if (rect.top <= limit) return;
-
-            const isImage = el.tagName === 'IMG';
-            if (isImage && isLcpCandidate(el)) return;
-
-            el.setAttribute('loading', 'lazy');
-            // fetchpriority has no meaning on <iframe>; loading=lazy is the
-            // whole lever there.
-            if (isImage) el.setAttribute('fetchpriority', 'low');
-        }
-
-        function tuneVideo(video) {
-            // rtt >= 270ms lands ordinary 4G in the moderate tier, and
-            // preload="none" leaves duration NaN until play, which breaks
-            // custom players that build their scrubber on loadedmetadata.
-            // "metadata" still avoids downloading the media body.
-            if (getConnectionTier() !== TIER_SLOW) return;
-            if (video.hasAttribute('preload') || video.autoplay) return;
-            if (!video.paused || video.currentTime > 0) return;
-            video.setAttribute('preload', 'metadata');
-        }
-
-        function scanWithLayout() {
-            const limit = foldLimit();
-            let budget = MEDIA_SCAN_BUDGET;
-
-            try {
-                for (const img of document.images) {
-                    if (budget-- <= 0) break;
-                    tuneWithLayout(img, limit);
-                }
-                for (const frame of document.querySelectorAll('iframe')) {
-                    if (budget-- <= 0) break;
-                    tuneWithLayout(frame, limit);
-                }
-                for (const video of document.querySelectorAll('video')) {
-                    if (budget-- <= 0) break;
-                    tuneVideo(video);
-                }
-            } catch (_) {}
-        }
-
-        // Late-inserted media (infinite scroll, SPA routes) is where the real
-        // byte savings are, and by then layout is available. Batching into a
-        // frame also collapses the duplicate delivery a subtree observer sees
-        // for a container and each of its children.
-        function flushPending() {
-            const batch = pending;
-            pending = null;
-            if (!batch) return;
-
-            const limit = foldLimit();
-            for (const el of batch) {
-                try {
-                    if (el.tagName === 'VIDEO') tuneVideo(el);
-                    else tuneWithLayout(el, limit);
-                } catch (_) {}
-            }
-        }
-
-        function enqueue(el) {
-            if (tunedImages.has(el)) return;
-            tunedImages.add(el);
-
-            if (!pending) {
-                pending = new Set();
-                window.requestAnimationFrame(flushPending);
-            }
-            if (pending.size < MEDIA_SCAN_BUDGET) pending.add(el);
-        }
-
-        const root = document.documentElement;
-        if (root) {
-            const observer = new MutationObserver(mutations => {
-                for (const mutation of mutations) {
-                    for (const node of mutation.addedNodes) {
-                        if (!(node instanceof Element)) continue;
-
-                        try {
-                            const tag = node.tagName;
-                            if (tag === 'IMG' || tag === 'VIDEO' || tag === 'IFRAME') enqueue(node);
-                            else if (node.firstElementChild) {
-                                for (const el of node.querySelectorAll('img, video, iframe')) enqueue(el);
-                            }
-                        } catch (_) {}
-                    }
-                }
-            });
-            observer.observe(root, { childList: true, subtree: true });
-        }
-
-        runWhenDomReady(scanWithLayout);
-        runWhenLoadedIdle(scanWithLayout);
+    function hasMediaSource(el) {
+        return el.hasAttribute('src') || el.hasAttribute('srcset') || el.hasAttribute('srcdoc');
     }
 
-    if (isTopFrame) initMediaPriority();
+    function initLazyEmptyMedia() {
+        if (typeof IntersectionObserver === 'undefined') return;
+
+        const sighting = new IntersectionObserver(entries => {
+            for (const entry of entries) {
+                const el = entry.target;
+                sighting.unobserve(el);
+
+                const rect = entry.boundingClientRect;
+                if (entry.isIntersecting || !entry.rootBounds) continue;
+                // No box yet (display:none, detached): leave it alone rather
+                // than defer something about to become the hero.
+                if (rect.width === 0 && rect.height === 0) continue;
+                // Above the viewport also doesn't intersect; only below counts.
+                if (rect.top < entry.rootBounds.bottom) continue;
+                if (hasMediaSource(el) || el.hasAttribute('loading')) continue;
+
+                el.setAttribute('loading', 'lazy');
+            }
+        }, { rootMargin: '0px 0px ' + (BELOW_FOLD_FACTOR - 1) * 100 + '% 0px' });
+
+        const watch = el => {
+            if (!hasMediaSource(el) && !el.hasAttribute('loading')) sighting.observe(el);
+        };
+
+        // The document node, not documentElement, which may not exist yet
+        // at document-start (see appendToHead).
+        const observer = new MutationObserver(mutations => {
+            for (const mutation of mutations) {
+                for (const node of mutation.addedNodes) {
+                    if (!(node instanceof Element)) continue;
+
+                    try {
+                        const tag = node.tagName;
+                        if (tag === 'IMG' || tag === 'IFRAME') watch(node);
+                        else if (node.firstElementChild) {
+                            for (const el of node.querySelectorAll('img, iframe')) watch(el);
+                        }
+                    } catch (_) {}
+                }
+            }
+        });
+        observer.observe(document, { childList: true, subtree: true });
+    }
+
+    if (isTopFrame) initLazyEmptyMedia();
 
     // =========================================================================
     // Part 8: content-visibility (opt-in)
@@ -2141,6 +2387,7 @@
         } catch (_) {}
 
         if (!supportsSpeculationRules) feature('○', 'Link speculation', 'not supported by this Chrome build');
+        else if (saveDataOn()) feature('○', 'Link speculation', SAVE_DATA_OFF_REASON);
         else if (tier === TIER_SLOW) feature('◐', 'Link speculation', 'on pointerdown only — connection is ' + tierName);
         else if (knownSpa) feature('○', 'Link speculation', SPA_OFF_REASON);
         else feature('●', 'Link speculation', anchors + ' eligible links on this page');
@@ -2159,6 +2406,8 @@
 
         if (!supportsSpeculationRules) {
             feature('○', 'Next-page prediction', 'not supported by this Chrome build');
+        } else if (saveDataOn()) {
+            feature('○', 'Next-page prediction', SAVE_DATA_OFF_REASON);
         } else if (tier === TIER_SLOW) {
             feature('○', 'Next-page prediction', 'paused — connection is ' + tierName);
         } else if (knownSpa) {
@@ -2215,14 +2464,15 @@
         if (sample.total >= 10 && sample.served === 0) {
             lines.push('');
             lines.push('  Nothing has been served from a speculation in ' + sample.total + ' navigations.');
-            lines.push('  Check Chrome Settings → Performance → "Preload pages", and Energy');
-            lines.push('  Saver, which switches preloading off.');
+            lines.push('  Check Chrome Settings → Performance → "Preload pages", Energy Saver');
+            lines.push('  and the system\'s data saver, each of which switches preloading off.');
         }
 
         return lines.join('\n');
     }
 
     const SPA_OFF_REASON = 'off — this site answers link clicks in-page, so a prefetched page is never used';
+    const SAVE_DATA_OFF_REASON = 'off — Chrome blocks speculation under Save-Data';
 
     function navCounts(stats) {
         const nav = (stats && stats.nav && typeof stats.nav === 'object') ? stats.nav : {};
