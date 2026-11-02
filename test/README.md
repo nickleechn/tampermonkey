@@ -122,6 +122,32 @@ and Stats for nerds.
 
 No browser required.
 
+## `crystalclear-behaviour.js` — headless, current
+
+```bash
+node test/crystalclear-behaviour.js
+```
+
+Evaluates `CyrstalClear.js` against a stubbed DOM, with a virtual clock behind
+both timers and `Date.now()`, and asserts what 2.0 rests on, read out of YouTube's
+own player (`base.js` 11a45ffb) and checked against it: the two AV1 flags reach
+every player config whichever side of the page's `var ytcfg` the script lands on;
+the pick is pinned under the ceiling on both the API and menu paths, plain over
+Premium while AV1 is forced; a video gets one pin, so a manual pick survives the
+next `playing`; only watch pages are pinned, and never during an ad or while the
+player holds the outgoing video; `yt-player-quality` holds the ceiling in
+YouTube's current shape and never ages out; and the frame and stall guards step
+down one level, measure only what they should, and remember what they should.
+
+`$CC_SCRIPT` runs another build, e.g. 1.1, to see what it fails. Removing each
+guard from the script in turn fails at least one check.
+
+The stubs can't show what the real player does. These came from Chromium 156
+against real YouTube, and are in the 2.0 pull request rather than in a test,
+because a logged-out headless browser only gets about 60 s of media per load:
+the codec at each level, `getAvailableQualityData()` listing the ad's formats
+during a pre-roll, and a pre-roll sometimes sending 4K to VP9.
+
 ## `quicksilver-chrome/run.js` — real Chrome, current
 
 ```bash
