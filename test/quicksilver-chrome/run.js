@@ -159,10 +159,23 @@ async function launchChrome() {
             await page.send('Page.addScriptToEvaluateOnNewDocument', { source: SCRIPT });
             return page;
         },
+        // Resolves once the profile is gone: the caller exits straight after,
+        // which would otherwise leave one behind in the temp directory per run.
+        // Retries because Chrome's helpers keep writing to it (ENOTEMPTY) for a
+        // moment after the browser process exits.
         close() {
             try { ws.close(); } catch (_) {}
-            proc.kill();
-            setTimeout(() => fs.rmSync(profile, { recursive: true, force: true }), 300);
+            return new Promise(resolve => {
+                proc.once('exit', () => {
+                    try {
+                        fs.rmSync(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+                    } catch (error) {
+                        console.log('could not remove ' + profile + ': ' + error.code);
+                    }
+                    resolve();
+                });
+                proc.kill();
+            });
         }
     };
 }
@@ -699,7 +712,7 @@ async function fontDisplay(chrome) {
             }
         }
     } finally {
-        chrome.close();
+        await chrome.close();
     }
     const bad = results.filter(r => !r[1]).length;
     console.log(bad ? `\n${bad} CHECK(S) FAILED` : `\nALL ${results.length} CHECKS PASSED`);
