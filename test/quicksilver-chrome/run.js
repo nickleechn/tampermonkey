@@ -255,9 +255,9 @@ function startServer(routes, headers = {}) {
             res.writeHead(200, { 'content-type': 'text/javascript' });
             return res.end(ROUTER_JS);
         }
-        if (url.pathname === '/hero.png' || url.pathname === '/route-hero.png') {
+        if (url.pathname.startsWith('/hero') || url.pathname === '/route-hero.png') {
             res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'max-age=600' });
-            return res.end(url.pathname === '/hero.png' ? HERO : ROUTE_HERO);
+            return res.end(url.pathname === '/route-hero.png' ? ROUTE_HERO : HERO);
         }
         res.writeHead(200, Object.assign({ 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }, headers));
         res.end(route || doc(`<p>Page ${url.pathname}</p><a href="/">home</a>`));
@@ -511,12 +511,187 @@ async function hardHero(chrome) {
     }
 }
 
+// New in 4.3.0: since Chrome 141 a precommitHandler holds the commit, so the
+// URL read after the navigate event is still the old one.
+async function deferredCommit(chrome) {
+    const app = doc(`<a id=go href="/app/deferred-route">Go</a><div id=root></div><script>
+navigation.addEventListener('navigate', e => {
+    if (!e.canIntercept || !new URL(e.destination.url).pathname.startsWith('/app/')) return;
+    e.intercept({
+        precommitHandler: () => new Promise(r => setTimeout(r, 400)),
+        handler: async () => {
+            document.getElementById('root').innerHTML = '<h2>Route title</h2><img src="/route-hero.png" width=640 height=400>';
+        }
+    });
+});
+</script>`);
+    const srv = await startServer({ '/': app });
+    const page = await chrome.newPage();
+    try {
+        await page.goto(srv.origin + '/');
+        await sleep(300);
+        await page.click('#go');
+        await sleep(1000);
+        const t = await transitions(page);
+        check('precommitHandler: the route change is recorded', Boolean(t['/'] && t['/'].t['/app/deferred-route']), JSON.stringify(t));
+        if (!await page.eval(`PerformanceObserver.supportedEntryTypes.includes('interaction-contentful-paint')`)) return;
+        await sleep(3400);
+        const rec = (await lcpStore(page))['/app/deferred-route'];
+        check('precommitHandler: the route still learns its hero', Boolean(rec) && rec.url.endsWith('/route-hero.png'),
+            JSON.stringify({ rec: rec && rec.url, soft: await page.eval(`performance.getEntriesByType('soft-navigation').map(e => e.name)`) }));
+    } finally {
+        await page.close();
+        srv.close();
+    }
+}
+
+// New in 4.3.0: back from the bfcache, the document still believed its link
+// was warm, so pressing it again did nothing.
+async function bfcacheRewarm(chrome) {
+    const body = ORDINARY_LINKS + `<script>addEventListener('pageshow', e => { window.__persisted = e.persisted; });</script>`;
+    const srv = await startServer({ '/': doc(body) }, { 'cache-control': 'max-age=0' });
+    const page = await chrome.newPage();
+    const rulesFor = action => `[...document.querySelectorAll('script[type=speculationrules]')].filter(s => s.textContent.includes('"${action}":[{"urls"') && s.textContent.includes('/article-1'))`;
+    const warmRules = rulesFor('prerender');
+    try {
+        await page.goto(srv.origin + '/');
+        await sleep(300);
+        await page.pointerdown('#a1');
+        await sleep(100);
+        await page.eval(`${warmRules}.forEach(s => { s.dataset.spent = '1'; })`);
+        const loaded = page.waitForEvent('Page.loadEventFired', 8000);
+        await page.click('#a1');
+        await loaded;
+        await sleep(300);
+        const { currentIndex, entries } = await page.send('Page.getNavigationHistory');
+        await page.send('Page.navigateToHistoryEntry', { entryId: entries[currentIndex - 1].id });
+        await sleep(800);
+        if (!await page.eval('window.__persisted')) {
+            check('bfcache: the link that left the page warms again', true, 'skipped: not restored from the bfcache');
+            return;
+        }
+        await page.pointerdown('#a1');
+        await sleep(200);
+        const rules = await page.eval(`${warmRules}.map(s => s.dataset.spent === '1' ? 'spent' : 'fresh')`);
+        check('bfcache: the link that left the page warms again', rules.length === 1 && rules[0] === 'fresh', JSON.stringify(rules));
+        // The click that left the page taught a transition, so a prediction
+        // for that link is live here too, renewed on the way back.
+        check('bfcache: the prediction learned from that click is live', await page.eval(`${rulesFor('prefetch')}.length`) === 1);
+    } finally {
+        await page.close();
+        srv.close();
+    }
+}
+
+const transitions = page => page.eval(`JSON.parse(localStorage.getItem('tm-qs-transitions') || '{}')`);
+
+// New in 4.3.0: a bare-origin referrer filed every arrival under the
+// homepage, and no referrer at all taught nothing.
+async function referrerPolicies(chrome) {
+    for (const policy of ['strict-origin-when-cross-origin', 'strict-origin', 'origin', 'no-referrer']) {
+        const pages = { '/list/page': doc(`<a id=a1 href="/dest">Go</a>`), '/dest': doc('<p>dest</p>') };
+        const srv = await startServer(pages, { 'referrer-policy': policy });
+        const page = await chrome.newPage();
+        try {
+            await page.goto(srv.origin + '/list/page');
+            await sleep(200);
+            const loaded = page.waitForEvent('Page.loadEventFired', 8000);
+            await page.click('#a1');
+            await loaded;
+            await sleep(100);
+            const t = await transitions(page);
+            check(`Referrer-Policy ${policy}: transition filed under the page it came from`,
+                Boolean(t['/list/page'] && t['/list/page'].t['/dest']) && !t['/'], Object.keys(t).join(',') || 'none');
+        } finally {
+            await page.close();
+            srv.close();
+        }
+    }
+}
+
+// New in 4.3.0: Part 7 only touches media that starts empty, the one shape
+// where a late loading=lazy keeps a request from happening.
+async function lazyEmptyMedia(chrome) {
+    const body = `<div style="height:5000px">spacer</div><div id=root></div><script>
+addEventListener('load', () => setTimeout(() => {
+    const root = document.getElementById('root');
+    const make = (tag, id) => { const el = document.createElement(tag); el.id = id; el.width = 300; el.height = 200; return el; };
+    const empty = make('img', 'empty'), frame = make('iframe', 'frame'), sourced = make('img', 'sourced');
+    sourced.src = '/img/sourced.png';
+    root.append(empty, frame, sourced);
+    setTimeout(() => { empty.src = '/img/late.png'; frame.src = '/frame/late'; }, 300);
+}, 300));
+</script>`;
+    const srv = await startServer({ '/': doc(body) });
+    const page = await chrome.newPage();
+    const attr = (id, name) => `document.getElementById('${id}').getAttribute('${name}')`;
+    try {
+        await page.goto(srv.origin + '/');
+        await sleep(1500);
+        const before = srv.hits('/img/late.png').length + srv.hits('/frame/late').length;
+        check('media inserted empty below the fold: no request until it is near',
+            before === 0 && await page.eval(attr('empty', 'loading')) === 'lazy', before + ' request(s)');
+        check('media that already has a source is left alone',
+            await page.eval(attr('sourced', 'loading')) === null && await page.eval(attr('sourced', 'fetchpriority')) === null);
+        await page.eval('window.scrollTo(0, document.body.scrollHeight)');
+        await sleep(800);
+        check('lazy media still loads when scrolled to', srv.hits('/img/late.png').length === 1 && srv.hits('/frame/late').length === 1,
+            srv.hits('/img/late.png').length + ' image, ' + srv.hits('/frame/late').length + ' frame');
+    } finally {
+        await page.close();
+        srv.close();
+    }
+}
+
+// New in 4.3.0: imagesizes="auto" falls back to 100vw, a bigger candidate
+// than the <img> takes, downloaded as well as the right one.
+async function sizesAutoHero(chrome) {
+    const srv = await startServer({ '/': doc(`<p>Story</p><img id=hero src="/hero-small.png" loading=lazy sizes=auto
+        srcset="/hero-small.png 640w, /hero-big.png 1600w" width=640 height=400>`) });
+    const page = await chrome.newPage();
+    try {
+        for (let visit = 1; visit <= 2; visit++) {
+            await page.goto(srv.origin + '/');
+            await sleep(3500);
+        }
+        await page.goto(srv.origin + '/');
+        await sleep(500);
+        const links = await page.eval(`[...document.querySelectorAll('link[rel=preload][as=image]')].map(l => ({ href: l.getAttribute('href'), sizes: l.getAttribute('imagesizes') }))`);
+        check('sizes="auto" hero: preloaded by exact URL, no bigger candidate fetched',
+            links.length === 1 && links[0].sizes === null && srv.hits('/hero-big.png').length === 0,
+            JSON.stringify(links) + ' big: ' + srv.hits('/hero-big.png').length);
+    } finally {
+        await page.close();
+        srv.close();
+    }
+}
+
+// Pinned in 4.3.0: the headless suite stubs rule.style, so only a browser can
+// say that the assignment reaches the rule and the FontFace it made.
+async function fontDisplay(chrome) {
+    const srv = await startServer({ '/': doc(`<style>
+@font-face { font-family: Body; src: url(/f/body.woff2) }
+@font-face { font-family: FontAwesome; src: url(/f/icons.woff2) }
+</style><p style="font-family: Body">text</p><p style="font-family: FontAwesome">icon</p>`) });
+    const page = await chrome.newPage();
+    try {
+        await page.goto(srv.origin + '/');
+        await sleep(400);
+        const faces = await page.eval(`Object.fromEntries([...document.fonts].map(f => [f.family, f.display]))`);
+        check('font-display reaches text fonts and spares icon fonts', faces.Body === 'swap' && faces.FontAwesome === 'auto', JSON.stringify(faces));
+    } finally {
+        await page.close();
+        srv.close();
+    }
+}
+
 (async () => {
     const chrome = await launchChrome();
     console.log(`Quicksilver ${VERSION} on ${chrome.browser}\n`);
     try {
         for (const run of [rulesParse, sensitiveRefused, hoverServesNavigation, pointerdownPrerenders,
-            trustedTypes, strictCspFallback, spaDetection, slowRouterSoftNav, softRouteHero, hardHero]) {
+            trustedTypes, strictCspFallback, spaDetection, slowRouterSoftNav, softRouteHero, hardHero,
+            deferredCommit, bfcacheRewarm, referrerPolicies, lazyEmptyMedia, sizesAutoHero, fontDisplay]) {
             try {
                 await run(chrome);
             } catch (error) {

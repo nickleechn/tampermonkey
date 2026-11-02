@@ -41,14 +41,17 @@ function makeEl(tag) {
 
 const FAST = { effectiveType: '4g', rtt: 80, downlink: 10, saveData: false };
 const MODERATE = { effectiveType: '3g', rtt: 300, downlink: 1.5, saveData: false };
-const SLOW = { effectiveType: '4g', rtt: 80, downlink: 10, saveData: true };
+const SLOW = { effectiveType: '2g', rtt: 900, downlink: 0.2, saveData: false };
+const SAVE_DATA = { effectiveType: '4g', rtt: 80, downlink: 10, saveData: true };
 const SCRIPT_VERSION = (fs.readFileSync(path.join(__dirname, '..', 'Quicksilver.js'), 'utf8')
     .match(/@version\s+(\S+)/) || [])[1];
 
-function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = true, anchors = 17, navEntries = [], prerendering = false, speculation = true, localStorageSeed = {}, connection = FAST, topFrame = true, viewport = { width: 1280, dpr: 2 }, trustedTypesEnforced = false, chromeVersion = 154, softNav = false, bareDocument = false } = {}) {
+function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = true, anchors = 17, navEntries = [], prerendering = false, speculation = true, localStorageSeed = {}, connection = FAST, topFrame = true, viewport = { width: 1280, dpr: 2 }, trustedTypesEnforced = false, chromeVersion = 154, softNav = false, bareDocument = false, activation = null, gmAddElement = null } = {}) {
     const winListeners = new Map();
     const docListeners = new Map();
     const navListeners = new Map();
+    const connListeners = new Map();
+    const sightings = [];
     const head = makeEl('head');
     const store = new Map(Object.entries(gm));
     const menu = new Map();
@@ -105,7 +108,7 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
             userAgent: 'Mozilla/5.0 Chrome/' + chromeVersion + '.0.0.0 Safari/537.36',
             userAgentData: { brands: [{ brand: 'Google Chrome', version: String(chromeVersion) }] },
             onLine: true,
-            connection: Object.assign({}, connection),
+            connection: Object.assign({ addEventListener: (t, f) => add(connListeners, t, f) }, connection),
             serviceWorker: { controller: null, addEventListener() {} }
         },
         performance: { getEntriesByType: t => (t === 'navigation' ? navEntries : []) },
@@ -122,6 +125,12 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
             disconnect() {}
         }, { supportedEntryTypes: ['largest-contentful-paint', 'navigation', 'resource']
             .concat(softNav ? ['soft-navigation', 'interaction-contentful-paint'] : []) }),
+        IntersectionObserver: class {
+            constructor(cb, options) { this.cb = cb; this.options = options; this.targets = new Set(); sightings.push(this); }
+            observe(el) { this.targets.add(el); }
+            unobserve(el) { this.targets.delete(el); }
+            disconnect() {}
+        },
         HTMLScriptElement: { supports: () => speculation },
         CSSFontFaceRule: class {}, CSS: { supports: () => true },
         URL, Element: class {},
@@ -135,6 +144,7 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
         GM_setValue: (k, v) => store.set(k, String(v)),
         GM_deleteValue: k => store.delete(k),
         GM_registerMenuCommand: (label, fn) => menu.set(label, fn),
+        GM_addElement: gmAddElement || undefined,
         GM_info: { script: { version: SCRIPT_VERSION } },
         trustedTypes: trustedTypesEnforced
             ? { createPolicy: () => ({ createScript: s => ({ trusted: s, toString: () => s }) }) }
@@ -147,7 +157,7 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
     sandbox.window.addEventListener = (t, f) => add(winListeners, t, f);
     sandbox.window.removeEventListener = () => {};
     if (navigationApi) {
-        sandbox.navigation = { addEventListener: (t, f) => add(navListeners, t, f) };
+        sandbox.navigation = { addEventListener: (t, f) => add(navListeners, t, f), activation };
     }
 
     vm.createContext(sandbox);
@@ -185,11 +195,46 @@ function build({ gm = {}, referrer = '', pathname = '/article', navigationApi = 
                 const target = Object.assign(Object.create(sandbox.Element.prototype), { closest: () => link });
                 fire(docListeners, 'click', { target });
             }
+            const navigationType = push ? 'push' : 'replace';
+            // As in Chrome: navigate before the URL commits, then
+            // currententrychange after it.
+            if (navigationApi) fire(navListeners, 'navigate', { navigationType });
             sandbox.location.pathname = p;
             sandbox.location.href = 'https://site.test' + p;
-            if (navigationApi) fire(navListeners, 'navigate', { navigationType: push ? 'push' : 'replace' });
+            if (navigationApi) fire(navListeners, 'currententrychange', { navigationType });
             else if (push) sandbox.history.pushState({}, '', p);
             else sandbox.history.replaceState({}, '', p);
+        },
+        // A router's precommitHandler: navigate fires now, the URL commits
+        // when the returned function is called.
+        deferredNavigateTo(p) {
+            fire(navListeners, 'navigate', { navigationType: 'push' });
+            return () => {
+                sandbox.location.pathname = p;
+                sandbox.location.href = 'https://site.test' + p;
+                fire(navListeners, 'currententrychange', { navigationType: 'push' });
+            };
+        },
+        fireWin: (type, ev) => fire(winListeners, type, ev),
+        setConnection(next, { silent = false } = {}) {
+            Object.assign(sandbox.navigator.connection, next);
+            if (!silent) fire(connListeners, 'change');
+        },
+        mediaEl: (tag, attrs = {}) => {
+            const el = Object.assign(Object.create(sandbox.Element.prototype), makeEl(tag));
+            for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+            return el;
+        },
+        addNodes(nodes) {
+            for (const o of mutationCallbacks.slice()) if (o.live) o.cb([{ addedNodes: nodes }], o);
+        },
+        isWatched: el => sightings.some(io => io.targets.has(el)),
+        sight(el, { isIntersecting = false, top = 5000, width = 300, height = 200 } = {}) {
+            for (const io of sightings.slice()) {
+                if (io.targets.has(el)) {
+                    io.cb([{ target: el, isIntersecting, boundingClientRect: { top, width, height }, rootBounds: { bottom: 1350 } }], io);
+                }
+            }
         },
         activatePrerender() {
             document.prerendering = false;
@@ -1002,6 +1047,279 @@ const transOf = h => JSON.parse(h.store.get('tm-qs-transitions::https://site.tes
     bare.growHead();
     check('hero preload waits for <head> when injected before <html> exists',
         earlyEmpty && bare.head.children.some(c => c.rel === 'preload' && c.href === 'https://cdn.site.test/hero.jpg'));
+
+
+    // A block of their own: these names are taken higher up.
+    {
+    // ---- 4.3.0: route changes come from the commit, not the navigate event --
+    const deferred = build({ pathname: '/app' });
+    deferred.load();
+    await wait(10);
+    const commit = deferred.deferredNavigateTo('/app/route');
+    await wait(20);
+    check('a deferred commit records nothing before the URL changes', !transOf(deferred)['/app']);
+    commit();
+    await wait(20);
+    check('a precommitHandler route change is still recorded',
+        Boolean(transOf(deferred)['/app'] && transOf(deferred)['/app'].t['/app/route']),
+        Object.keys(transOf(deferred)).join(',') || 'nothing stored');
+
+    const deferredHero = build({ softNav: true });
+    deferredHero.domReady();
+    await wait(10);
+    deferredHero.load();
+    await wait(10);
+    deferredHero.clickLink('/spa-route');
+    const commitHero = deferredHero.deferredNavigateTo('/spa-route');
+    await wait(20);
+    commitHero();
+    await wait(10);
+    softNavTo(deferredHero, '/spa-route', 41);
+    icp(deferredHero, 41, ROUTE_HERO);
+    deferredHero.fireWin('pagehide');
+    check('a precommitHandler route still learns its hero',
+        lcpOf(deferredHero)['/spa-route'] && lcpOf(deferredHero)['/spa-route'].url === ROUTE_HERO,
+        JSON.stringify(Object.keys(lcpOf(deferredHero))));
+
+    // ---- 4.3.0: bfcache ----------------------------------------------------
+    const bf = build({ pathname: '/news' });
+    bf.domReady();
+    await wait(20);
+    const bfRules = () => bf.head.children.filter(c => c.type === 'speculationrules' && String(c.textContent).includes('item?id=7'));
+    bf.pointerdown('/item?id=7');
+    const firstWarm = bfRules()[0];
+    bf.pointerdown('/item?id=7');
+    check('pressing the same link twice keeps one rule', bfRules().length === 1 && bfRules()[0] === firstWarm);
+    bf.fireWin('pageshow', { persisted: false });
+    check('an ordinary pageshow leaves the warm link alone', bfRules()[0] === firstWarm);
+    bf.fireWin('pageshow', { persisted: true });
+    check('bfcache restore drops the spent rule', bfRules().length === 0);
+    bf.pointerdown('/item?id=7');
+    check('the link that left the page warms again after a bfcache restore',
+        bfRules().length === 1 && bfRules()[0] !== firstWarm);
+
+    const bfPredict = build({ gm: seeded({ '/next': 4 }) });
+    bfPredict.load();
+    await wait(80);
+    const predictedRule = () => bfPredict.head.children.find(c => c.type === 'speculationrules' && String(c.textContent).includes('/next'));
+    const predictedBefore = predictedRule();
+    bfPredict.fireWin('pageshow', { persisted: true });
+    check('a bfcache restore renews the prediction', Boolean(predictedRule()) && predictedRule() !== predictedBefore);
+
+    // ---- 4.3.0: blanket rules follow the connection -------------------------
+    const tierTab = build({ pathname: '/news' });
+    tierTab.domReady();
+    await wait(20);
+    const blanketScripts = h => h.head.children.filter(c => c.type === 'speculationrules' && String(c.textContent).includes('"where"'));
+    check('fast link starts with hover prerender', Boolean(tierTab.blanketRules().prerender));
+    const fastScript = blanketScripts(tierTab)[0];
+    tierTab.setConnection(FAST);
+    check('a change within the tier keeps the rules', blanketScripts(tierTab)[0] === fastScript);
+    tierTab.setConnection(SLOW);
+    check('moving to a slow link drops hover prerender and hover prefetch',
+        blanketScripts(tierTab).length === 1 && !tierTab.blanketRules().prerender
+        && tierTab.blanketRules().prefetch.every(r => r.eagerness === 'conservative'));
+    tierTab.setConnection(FAST);
+    check('moving back restores hover prerender', blanketScripts(tierTab).length === 1 && Boolean(tierTab.blanketRules().prerender));
+    tierTab.setConnection(SLOW, { silent: true });
+    tierTab.fireWin('pageshow', { persisted: true });
+    check('a change missed in the bfcache is picked up on restore', !tierTab.blanketRules().prerender);
+
+    const tierSpa = build({ gm: { 'tm-qs-spa::https://site.test': JSON.stringify({ at: Date.now() }) } });
+    tierSpa.domReady();
+    await wait(20);
+    tierSpa.setConnection(SLOW);
+    check('a connection change does not bring rules back on a known SPA', tierSpa.blanketRules() === null);
+
+    // ---- 4.3.0: the no-vary hint is gone -------------------------------------
+    const noVary = build({ pathname: '/news' });
+    noVary.domReady();
+    await wait(20);
+    check('no rule claims expects_no_vary_search', noVary.specRules() !== '' && !noVary.specRules().includes('expects_no_vary_search'));
+
+    // ---- 4.3.0: Save-Data blocks speculation --------------------------------
+    const hintOf = h => h.head.children.find(c => c.rel === 'prefetch');
+    const saver = build({ connection: SAVE_DATA, pathname: '/news' });
+    saver.domReady();
+    await wait(20);
+    check('Save-Data: no blanket rules', saver.specRules() === '');
+    saver.pointerdown('/item?id=9');
+    check('Save-Data: a press warms nothing, by rule or by hint', saver.specRules() === '' && !hintOf(saver));
+    saver.menu.get('Quicksilver: Status')();
+    check('Save-Data: status says Chrome blocks it', (saver.alerts[0] || '').includes('blocks speculation under Save-Data'));
+
+    const saverArrival = build({ connection: SAVE_DATA, referrer: 'https://site.test/list', navEntries: [{ type: 'navigate', activationStart: 0, deliveryType: '' }],
+        gm: { 'tm-qs-pending-nav::https://site.test': JSON.stringify({ href: 'https://site.test/article', at: Date.now(), from: '/list' }) } });
+    await wait(20);
+    check('Save-Data: a click is not scored as a miss', !saverArrival.store.has('tm-qs-stats::https://site.test'));
+    check('Save-Data: the transition is still learned, and the marker consumed',
+        Boolean(transOf(saverArrival)['/list']) && !saverArrival.store.has('tm-qs-pending-nav::https://site.test'));
+
+    // ---- 4.3.0: the prefetch fallback can double a page; not on a slow link --
+    const blockInline = h => h.fireDoc('securitypolicyviolation', { disposition: 'enforce', violatedDirective: 'script-src-elem', blockedURI: 'inline' });
+    const slowCsp = build({ connection: SLOW, pathname: '/news' });
+    slowCsp.domReady();
+    await wait(20);
+    slowCsp.head.children.length = 0;
+    blockInline(slowCsp);
+    slowCsp.pointerdown('/item?id=3');
+    check('strict CSP on a slow link: no prefetch fallback', !hintOf(slowCsp));
+    const fastCsp = build({ pathname: '/news' });
+    fastCsp.domReady();
+    await wait(20);
+    blockInline(fastCsp);
+    fastCsp.pointerdown('/item?id=3');
+    check('strict CSP on a fast link: prefetch fallback stays', Boolean(hintOf(fastCsp)));
+
+    // ---- 4.3.0: sizes="auto" is never replayed into a preload -----------------
+    const heroWith = (sizes) => {
+        const el = makeEl('img');
+        el.setAttribute('srcset', 'small.jpg 400w, big.jpg 1600w');
+        el.setAttribute('sizes', sizes);
+        return el;
+    };
+    const learnedSizes = async sizes => {
+        const h = build();
+        h.domReady();
+        await wait(5);
+        h.emitLcp({ url: 'https://cdn.site.test/small.jpg', startTime: 900, element: heroWith(sizes) });
+        h.load();
+        h.fireWin('pagehide');
+        return lcpOf(h)['/article'];
+    };
+    const autoOnly = await learnedSizes('auto');
+    check('sizes="auto" alone: learned as the exact URL, no srcset', Boolean(autoOnly) && !autoOnly.srcset && !autoOnly.sizes, JSON.stringify(autoOnly));
+    const autoFallback = await learnedSizes('auto, 50vw');
+    check('sizes="auto, 50vw": the author fallback is kept',
+        Boolean(autoFallback) && autoFallback.sizes === '50vw' && Boolean(autoFallback.srcset), JSON.stringify(autoFallback));
+    const plainSizes = await learnedSizes('(min-width: 800px) 50vw, 100vw');
+    check('ordinary sizes are untouched', Boolean(plainSizes) && plainSizes.sizes === '(min-width: 800px) 50vw, 100vw');
+
+    const oldAuto = build({ gm: lcpSeed({ vw: 1280, dpr: 2, srcset: 'small.jpg 400w, big.jpg 1600w', sizes: 'auto' }) });
+    await wait(10);
+    const oldAutoLink = oldAuto.head.children.find(c => c.rel === 'preload');
+    check('a stored sizes="auto" record preloads the exact URL',
+        Boolean(oldAutoLink) && oldAutoLink.getAttribute('imagesizes') === null && oldAutoLink.getAttribute('imagesrcset') === null);
+    const oldAutoFallback = build({ gm: lcpSeed({ vw: 1280, dpr: 2, srcset: 'small.jpg 400w, big.jpg 1600w', sizes: 'auto, 50vw' }) });
+    await wait(10);
+    const oldFallbackLink = oldAutoFallback.head.children.find(c => c.rel === 'preload');
+    check('a stored "auto, 50vw" record replays only the fallback', Boolean(oldFallbackLink) && oldFallbackLink.getAttribute('imagesizes') === '50vw');
+    const zoomedAuto = build({ gm: lcpSeed({ vw: 1280, dpr: 1, srcset: 'small.jpg 400w, big.jpg 1600w', sizes: 'auto' }) });
+    await wait(10);
+    check('a sizes="auto" record is a src-only hero when the density changed', !hasPreload(zoomedAuto));
+
+    // ---- 4.3.0: where a navigation came from, by Referrer-Policy --------------
+    const arrival = (referrer, activationValue, gm = {}) => build({ referrer, pathname: '/dest', activation: activationValue, gm,
+        navEntries: [{ type: 'navigate', activationStart: 0, deliveryType: '' }] });
+    const marker = (extra = {}) => ({ 'tm-qs-pending-nav::https://site.test': JSON.stringify(
+        Object.assign({ href: 'https://site.test/dest', at: Date.now(), from: '/list/page' }, extra)) });
+
+    const strictOrigin = arrival('https://site.test/', { from: { url: 'https://site.test/list/page' }, navigationType: 'push' });
+    await wait(10);
+    check('strict-origin: activation.from beats the bare-origin referrer',
+        Boolean(transOf(strictOrigin)['/list/page']) && !transOf(strictOrigin)['/'], Object.keys(transOf(strictOrigin)).join(','));
+
+    const originOnly = arrival('https://site.test/', { from: { url: null }, navigationType: 'push' });
+    await wait(10);
+    check('origin: a hidden source is not filed under the homepage', Object.keys(transOf(originOnly)).length === 0, Object.keys(transOf(originOnly)).join(','));
+
+    const noReferrer = arrival('', { from: { url: null }, navigationType: 'push' }, marker());
+    await wait(10);
+    check('no-referrer: the click marker supplies the source',
+        Boolean(transOf(noReferrer)['/list/page'] && transOf(noReferrer)['/list/page'].t['/dest']));
+    check('no-referrer: the click is scored', (statsOf(noReferrer).nav || {}).miss === 1);
+
+    const staleMarker = arrival('', { from: { url: null }, navigationType: 'push' }, marker({ at: Date.now() - 2 * 60 * 1000 }));
+    const wrongMarker = arrival('', { from: { url: null }, navigationType: 'push' }, marker({ href: 'https://site.test/other' }));
+    await wait(10);
+    check('a stale or mismatched marker supplies nothing',
+        Object.keys(transOf(staleMarker)).length === 0 && Object.keys(transOf(wrongMarker)).length === 0);
+    check('a stale marker is still consumed', !staleMarker.store.has('tm-qs-pending-nav::https://site.test'));
+
+    const newTabArrival = arrival('https://site.test/list', { from: null, navigationType: 'push' });
+    await wait(10);
+    check('new tab: with no activation entry the referrer still counts', Boolean(transOf(newTabArrival)['/list']));
+
+    const reloadArrival = build({ referrer: 'https://site.test/list', pathname: '/dest', navEntries: [{ type: 'reload' }],
+        activation: { from: { url: 'https://site.test/dest' }, navigationType: 'reload' } });
+    await wait(10);
+    check('a reload still records nothing', Object.keys(transOf(reloadArrival)).length === 0);
+
+    const pressed = build({ pathname: '/list/page' });
+    pressed.load();
+    await wait(10);
+    clickOn(pressed, '/dest');
+    check('the click marker records where it was pressed',
+        (pressed.store.get('tm-qs-pending-nav::https://site.test') || '').includes('"from":"/list/page"'));
+
+    // ---- 4.3.0: rules try GM_addElement first ---------------------------------
+    const added = [];
+    const viaGm = build({ pathname: '/news', gmAddElement: (parent, tag, attrs) => {
+        const el = Object.assign(makeEl(tag), attrs);
+        parent.appendChild(el);
+        added.push(el);
+        return el;
+    } });
+    viaGm.domReady();
+    await wait(20);
+    check('blanket rules go through GM_addElement', added.length === 1 && Boolean(viaGm.blanketRules()));
+    viaGm.pointerdown('/item?id=1');
+    viaGm.pointerdown('/item?id=2');
+    check('a press goes through GM_addElement and replaces the last',
+        added.length === 3 && viaGm.specRules().includes('id=2') && !viaGm.specRules().includes('id=1'));
+
+    const gmNull = build({ pathname: '/news', gmAddElement: () => null });
+    const gmThrows = build({ pathname: '/news', gmAddElement: () => { throw new Error('refused'); } });
+    gmNull.domReady();
+    gmThrows.domReady();
+    await wait(20);
+    check('GM_addElement returning null falls back', Boolean(gmNull.blanketRules()));
+    check('GM_addElement throwing falls back', Boolean(gmThrows.blanketRules()));
+
+    // ---- 4.3.0: Part 7 only touches media that starts empty ---------------------
+    const media = build({ pathname: '/feed' });
+    await wait(5);
+    const emptyImg = media.mediaEl('img');
+    const emptyFrame = media.mediaEl('iframe');
+    const sourced = media.mediaEl('img', { src: '/a.jpg' });
+    const sourcedSet = media.mediaEl('img', { srcset: '/a.jpg 1x' });
+    const authored = media.mediaEl('img', { loading: 'eager' });
+    media.addNodes([emptyImg, emptyFrame, sourced, sourcedSet, authored]);
+    check('media with a source, or an author loading attribute, is never watched',
+        !media.isWatched(sourced) && !media.isWatched(sourcedSet) && !media.isWatched(authored));
+    check('sourced media gets no attributes', sourced.getAttribute('loading') === null && sourced.getAttribute('fetchpriority') === null);
+    check('empty media is watched', media.isWatched(emptyImg) && media.isWatched(emptyFrame));
+    media.sight(emptyImg);
+    media.sight(emptyFrame);
+    check('empty media below the fold goes lazy', emptyImg.getAttribute('loading') === 'lazy' && emptyFrame.getAttribute('loading') === 'lazy');
+    check('no fetchpriority hint any more', emptyImg.getAttribute('fetchpriority') === null);
+    check('a sighting ends the watch', !media.isWatched(emptyImg));
+
+    const near = media.mediaEl('img');
+    const above = media.mediaEl('img');
+    const boxless = media.mediaEl('img');
+    const filled = media.mediaEl('img');
+    media.addNodes([near, above, boxless, filled]);
+    media.sight(near, { isIntersecting: true, top: 1000 });
+    media.sight(above, { top: -3000 });
+    media.sight(boxless, { width: 0, height: 0 });
+    filled.setAttribute('src', '/late.jpg');
+    media.sight(filled);
+    check('near the viewport, above it, boxless, or filled by now: left alone',
+        [near, above, boxless, filled].every(el => el.getAttribute('loading') === null));
+
+    const noLayout = build({ pathname: '/feed' });
+    let layoutReads = 0;
+    const measured = noLayout.mediaEl('img');
+    measured.getBoundingClientRect = () => { layoutReads++; return { top: 5000, width: 300, height: 200 }; };
+    noLayout.sandbox.document.images = [measured];
+    noLayout.domReady();
+    noLayout.load();
+    noLayout.addNodes([measured]);
+    await wait(60);
+    check('Part 7 forces no layout', layoutReads === 0, layoutReads + ' reads');
+
+    }
 
     const bad = results.filter(r => !r[1]).length;
     console.log(bad ? `\n${bad} CHECK(S) FAILED` : `\nALL ${results.length} CHECKS PASSED`);

@@ -28,6 +28,19 @@ when the script runs before `<html>` exists. 9 of those 19 checks fail
 against 4.2.0; the rest assert refusals and fallbacks 4.2.0 already had. Each
 new guard was also mutation-checked: removing it fails its own check.
 
+The rest of 4.3.0 splits `SLOW` into a real 2g link and a separate `SAVE_DATA`,
+and has the Navigation API stub fire `navigate` before the URL commits and
+`currententrychange` after it, as Chrome does. 49 more checks cover: a route
+change held by a `precommitHandler`, soft-route hero included; a bfcache restore
+re-warming the pressed link and renewing the prediction; blanket rules following
+the connection tier, including a change missed in the bfcache; no
+`expects_no_vary_search`; Save-Data warming nothing and scoring nothing; no
+`<link rel=prefetch>` fallback on a slow link; `sizes="auto"` never reaching a
+preload, in new and stored records; where a navigation came from under each
+`Referrer-Policy`; `GM_addElement` used when present, with a fallback when it
+returns null or throws; and Part 7 watching only media that starts empty, with no
+forced layout. 29 of those 49 fail against the first 4.3.0 commit (`9b66f859`).
+
 No browser required.
 
 ## `quicksilver-safari-behaviour.js` — headless, current
@@ -146,9 +159,22 @@ as an SPA, and a client-side route's hero is learned from the navigating
 interaction (a later modal paint on the same route is ignored) and preloaded
 on the third visit. Both skip with a note on a Chrome without the API.
 
-15 checks, all passing on Chrome 153. Run against 4.2.0, 4 fail: the three
-Soft Navigations checks, and the page-load hero, which 4.2.0 dropped when
-injected before `<html>` existed (as CDP does).
+The rest of 4.3.0 adds 13 checks, on what only a real browser can settle: a
+`precommitHandler` route is recorded and learns its hero; a bfcache restore warms
+the pressed link again; each `Referrer-Policy` files a transition under the page
+it came from; media inserted empty stays unrequested until it is near, and media
+with a source is left alone; a `sizes="auto"` hero fetches no bigger candidate;
+and `font-display` reaches the `FontFace`. 9 of the 13 fail against the first
+4.3.0 commit (`9b66f859`).
+
+28 checks, all passing on Chromium 156. The first 15 also pass on Chrome 153, and
+4 of those fail against 4.2.0: the three Soft Navigations checks, and the
+page-load hero, which 4.2.0 dropped when injected before `<html>` existed (as
+CDP does).
+
+`GM_*` APIs are absent here, so `GM_addElement` getting past a strict CSP needs
+checking in real Tampermonkey: on a strict-CSP site that isn't an SPA, DevTools >
+Application > Speculative loads should list the rules.
 
 This replaces the 3.x harness (`index.html`, `harness_server.py`,
 `run_system_chrome.py`), which mostly tested the fetch cache 4.0.0 removed
